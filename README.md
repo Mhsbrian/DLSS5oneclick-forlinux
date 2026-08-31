@@ -18,13 +18,13 @@ Every file is downloaded fresh from its upstream at install time. Nothing third-
 ## Use
 
 1. Run `dlss5oneclick.exe` (single native binary, no runtime needed).
-2. Browse to the game's `.exe`. The list shows what is already present.
+2. Pick the game's **folder** (or its `.exe`) - the game exe is detected automatically (Unity crash handlers, Unreal helpers and redist installers are skipped; Unreal `Binaries\Win64\*-Shipping.exe` is preferred). If several candidates remain, a dropdown lets you choose. The list shows what is already present.
 3. **Install DLSS 5**.
 4. In game: **Home** opens ReShade. In the **DLSS 5 Neural Rendering** panel, enable it. Keep the game's MSAA/SSAA off.
 
 `dlss5-feed.log` next to the game exe should show `feature ready … DLAA` and `DLSS5_MV_PROVIDER=3 (LumeniteFX Kernel) -> Lumenite_Kernel (enabled)`.
 
-CLI: `dlss5oneclick.exe "C:\Games\Foo\Foo.exe"` / `--remove` (headless, prints progress).
+CLI: `dlss5oneclick.exe "C:\Games\Foo"` (folder or exe) / `--remove` (headless, prints progress).
 
 ## Not handled
 

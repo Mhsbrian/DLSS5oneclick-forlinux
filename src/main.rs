@@ -9,7 +9,7 @@ mod reshade_ini;
 use std::io::Write;
 use std::path::PathBuf;
 
-/// `dlss5oneclick <GAME.exe> [--remove]` runs headless; no args opens the GUI.
+/// `dlss5oneclick <GAME.exe | game folder> [--remove]` runs headless; no args opens the GUI.
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(first) = args.first().filter(|a| !a.starts_with('-')) {
@@ -23,7 +23,23 @@ fn main() {
     }
 }
 
-fn cli(exe: PathBuf, remove: bool) -> i32 {
+fn cli(target: PathBuf, remove: bool) -> i32 {
+    let (exe, candidates) = match game::resolve_target(&target) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            return 1;
+        }
+    };
+    if candidates.len() > 1 {
+        let others: Vec<String> = candidates[1..]
+            .iter()
+            .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
+            .collect();
+        println!("using {} (other candidates: {})", exe.display(), others.join(", "));
+    } else if !candidates.is_empty() {
+        println!("using {}", exe.display());
+    }
     if remove {
         return match installer::uninstall(&exe) {
             Ok(list) => {

@@ -112,6 +112,89 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     })
 }
 
+/// Helper/launcher executables that are never the game.
+const NOT_GAME: [&str; 14] = [
+    "unitycrashhandler", "unrealcefsubprocess", "crashreportclient", "easyanticheat",
+    "vcredist", "vc_redist", "dxwebsetup", "dxsetup", "oalinst", "ue4prereqsetup",
+    "ueprereqsetup", "installer", "uninstall", "unins",
+];
+
+fn is_helper_name(stem_lower: &str) -> bool {
+    NOT_GAME.iter().any(|n| stem_lower.contains(n))
+}
+
+fn norm(s: &str) -> String {
+    s.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase()
+}
+
+/// Candidate game executables in `dir`, best first.
+///
+/// Looks in the folder itself and in any `*/Binaries/Win64/` (Unreal layout,
+/// where ReShade must sit next to the `-Shipping.exe`, not the root launcher).
+/// Keeps 64-bit PEs only, drops known helpers, then ranks: name matches the
+/// folder name > Unreal shipping exe > larger file.
+pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    let mut push_dir = |d: &Path| {
+        if let Ok(rd) = fs::read_dir(d) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("exe")) && p.is_file() {
+                    found.push(p);
+                }
+            }
+        }
+    };
+    push_dir(dir);
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let sub = e.path().join("Binaries").join("Win64");
+            if sub.is_dir() {
+                push_dir(&sub);
+            }
+        }
+    }
+    let folder = norm(dir.file_name().and_then(|n| n.to_str()).unwrap_or(""));
+    let mut scored: Vec<(i64, PathBuf)> = found
+        .into_iter()
+        .filter_map(|p| {
+            let stem = p.file_stem()?.to_str()?.to_ascii_lowercase();
+            if is_helper_name(&stem) || exe_bitness(&p).ok()? != 64 {
+                return None;
+            }
+            let size = fs::metadata(&p).map(|m| m.len()).unwrap_or(0) as i64;
+            let mut score: i64 = 0;
+            let n = norm(&stem);
+            if !folder.is_empty() && (n == folder || n.starts_with(&folder) || folder.starts_with(&n)) {
+                score += 1_000_000_000;
+            }
+            if stem.ends_with("-shipping") {
+                score += 500_000_000;
+            }
+            score += size.min(400_000_000);
+            Some((score, p))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Accepts either a game exe or a game folder; returns the exe to use plus
+/// every candidate found (empty when the input was already an exe).
+pub fn resolve_target(input: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
+    if input.is_file() {
+        return Ok((input.to_path_buf(), Vec::new()));
+    }
+    if input.is_dir() {
+        let c = find_game_exes(input);
+        return match c.first() {
+            Some(first) => Ok((first.clone(), c)),
+            None => bail!("no 64-bit game executable found in {}", input.display()),
+        };
+    }
+    bail!("not found: {}", input.display())
+}
+
 #[cfg(test)]
 pub mod testutil {
     use super::*;
@@ -178,6 +261,39 @@ mod tests {
 
         let st = inspect(&make_pe(&t.path().join("g32.exe"), PE_X86)).unwrap();
         assert!(st.problems.iter().any(|p| p.contains("32-bit")));
+    }
+
+    #[test]
+    fn find_game_exes_skips_helpers_and_prefers_folder_name() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("Fell & Sell");
+        fs::create_dir_all(&d).unwrap();
+        make_pe(&d.join("UnityCrashHandler64.exe"), PE_X64);
+        make_pe(&d.join("tool32.exe"), PE_X86);
+        make_pe(&d.join("Fell & Sell.exe"), PE_X64);
+        let c = find_game_exes(&d);
+        assert_eq!(c, vec![d.join("Fell & Sell.exe")]);
+        let (exe, all) = resolve_target(&d).unwrap();
+        assert_eq!(exe, d.join("Fell & Sell.exe"));
+        assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn find_game_exes_unreal_layout_prefers_shipping() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("SomeGame");
+        let bin = d.join("SomeGame").join("Binaries").join("Win64");
+        fs::create_dir_all(&bin).unwrap();
+        make_pe(&d.join("SomeGame.exe"), PE_X64);
+        make_pe(&bin.join("SomeGame-Win64-Shipping.exe"), PE_X64);
+        make_pe(&bin.join("CrashReportClient.exe"), PE_X64);
+        let c = find_game_exes(&d);
+        assert_eq!(c[0], bin.join("SomeGame-Win64-Shipping.exe"));
+        assert_eq!(c.len(), 2);
+        assert!(resolve_target(&t.path().join("nope")).is_err());
+        let empty = t.path().join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        assert!(resolve_target(&empty).is_err());
     }
 
     #[test]

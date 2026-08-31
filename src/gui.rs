@@ -23,6 +23,8 @@ pub struct App {
     rx: Option<Receiver<Msg>>,
     confirm_remove: bool,
     last_error: Option<String>,
+    candidates: Vec<PathBuf>,
+    resolved_exe: Option<PathBuf>,
 }
 
 impl App {
@@ -41,18 +43,48 @@ impl App {
             rx: None,
             confirm_remove: false,
             last_error: None,
+            candidates: Vec::new(),
+            resolved_exe: None,
         };
         app.refresh();
         app
     }
 
     fn exe(&self) -> Option<PathBuf> {
-        let t = self.exe_text.trim();
-        (!t.is_empty()).then(|| PathBuf::from(t))
+        self.resolved_exe.clone()
     }
 
+    fn input_path(&self) -> PathBuf {
+        PathBuf::from(self.exe_text.trim().trim_matches('"'))
+    }
+
+    /// Text box accepts an exe or a game folder; a folder is resolved to its game exe.
     fn refresh(&mut self) {
-        self.status = self.exe().filter(|p| p.is_file()).map(|p| game::inspect(&p).map_err(|e| format!("{e:#}")));
+        let input = self.input_path();
+        let prev = self.resolved_exe.take();
+        self.candidates.clear();
+        if input.as_os_str().is_empty() {
+            self.status = None;
+            return;
+        }
+        match game::resolve_target(&input) {
+            Ok((exe, cands)) => {
+                self.resolved_exe = Some(match prev {
+                    Some(p) if cands.len() > 1 && cands.contains(&p) => p,
+                    _ => exe,
+                });
+                self.candidates = cands;
+            }
+            Err(e) => {
+                self.status = Some(Err(format!("{e:#}")));
+                return;
+            }
+        }
+        self.inspect_resolved();
+    }
+
+    fn inspect_resolved(&mut self) {
+        self.status = self.resolved_exe.as_ref().map(|p| game::inspect(p).map_err(|e| format!("{e:#}")));
     }
 
     fn start(&mut self, remove: bool) {
@@ -138,16 +170,27 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut self.exe_text)
-                        .hint_text("Game executable (the .exe you launch)")
+                        .hint_text("Game folder or the game's .exe")
                         .desired_width(f32::INFINITY),
                 );
                 if r.changed() {
                     self.refresh();
                 }
-                if ui.button("Browse…").clicked() {
+                let start_dir = self.exe().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+                if ui.button("Game folder…").clicked() {
+                    let mut dlg = rfd::FileDialog::new().set_title("Pick the game's install folder");
+                    if let Some(d) = &start_dir {
+                        dlg = dlg.set_directory(d);
+                    }
+                    if let Some(p) = dlg.pick_folder() {
+                        self.exe_text = p.to_string_lossy().into_owned();
+                        self.refresh();
+                    }
+                }
+                if ui.button("Exe…").clicked() {
                     let mut dlg = rfd::FileDialog::new().add_filter("Executables", &["exe"]);
-                    if let Some(dir) = self.exe().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
-                        dlg = dlg.set_directory(dir);
+                    if let Some(d) = &start_dir {
+                        dlg = dlg.set_directory(d);
                     }
                     if let Some(p) = dlg.pick_file() {
                         self.exe_text = p.to_string_lossy().into_owned();
@@ -155,6 +198,32 @@ impl eframe::App for App {
                     }
                 }
             });
+            if let Some(exe) = self.resolved_exe.clone() {
+                let short = |p: &PathBuf| -> String {
+                    p.strip_prefix(self.input_path())
+                        .map(|r| r.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+                };
+                if self.candidates.len() > 1 {
+                    let mut pick = exe.clone();
+                    ui.horizontal(|ui| {
+                        ui.label("Game exe:");
+                        egui::ComboBox::from_id_salt("exe_pick")
+                            .selected_text(short(&pick))
+                            .show_ui(ui, |ui| {
+                                for c in &self.candidates {
+                                    ui.selectable_value(&mut pick, c.clone(), short(c));
+                                }
+                            });
+                    });
+                    if pick != exe {
+                        self.resolved_exe = Some(pick);
+                        self.inspect_resolved();
+                    }
+                } else if !self.candidates.is_empty() {
+                    ui.small(format!("Game exe: {}", short(&exe)));
+                }
+            }
             ui.add_space(6.0);
 
             let (ok_status, problems, complete) = match &self.status {
