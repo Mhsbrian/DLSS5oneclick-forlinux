@@ -225,9 +225,9 @@ const TILES_FEEDER: [Tile; 6] = [
     },
     Tile {
         title: "nvngx_dlss.dll",
-        detail: "optional · driver copy used when absent",
+        detail: "DLSS runtime · the Feeder's NGX session needs it",
         ok: |s| s.dlss,
-        optional: true,
+        optional: false,
     },
 ];
 

@@ -3,7 +3,7 @@
 Single native Windows exe (Rust), no runtime, nothing to configure. Open source: [url=https://github.com/faisalkindi/DLSS5oneclick]github.com/faisalkindi/DLSS5oneclick[/url]
 
 [size=4][b]What it does[/b][/size]
-Pick the game folder, press [b]Install DLSS 5[/b]. The tool detects the game exe (Unity / Unreal helpers skipped), works out whether the game already ships DLSS and whether it renders with D3D11 or D3D12, then installs exactly what that case needs — every file downloaded fresh from its upstream, nothing third-party bundled.
+Pick the game folder, press [b]Install DLSS 5[/b]. The tool detects the game exe (Unity / Unreal helpers skipped), works out whether the game already ships DLSS and whether it renders with D3D11 or D3D12, then installs exactly what that case needs — every file downloaded from its upstream at install time; the only third-party content inside the exe is three SIL-OFL fonts.
 
 [list]
 [*][b]Game already has DLSS[/b] → ReShade (add-on build, as dxgi.dll) + the DLSS 5 add-on (renodx-dlss5.addon64 + nvngx_dlssnr.dll). The add-on hooks the game's own DLSS calls. [b]DX11 games[/b] also get NIGos' dlss5-dx11-bridge.
@@ -25,12 +25,14 @@ Command line: [font=Courier New]dlss5oneclick.exe "C:\Games\Foo"[/font] · [font
 [*]32-bit games (the Feeder's host64 setup is not automated — the tool refuses rather than half-install)
 [*]DirectX 9 and Vulkan games
 [*]Online games — ReShade with add-ons trips anti-cheat
+[*]API detection can come back unknown on monolithic Unreal exes; DX12 is then assumed (shown in the status line) — a DX11 game in that state would miss the bridge
 [/list]
 
 [size=4][b]Known issues[/b][/size]
 [list]
 [*]Feeder path + exclusive fullscreen: every focus change recreates the swapchain and DLSS5-Feeder can crash on the rebuild (Feeder issue #16, upstream). Use borderless/windowed. Raising create_delay in dlss5-feed.cfg helps.
 [*]Neural rendering at native 4K costs several ms; with v-sync on at 60 Hz that shows as a drop to 30 fps. Turn v-sync off or lower work_resolution in dlss5-feed.cfg.
+[*]The DLSS 5 add-on and its model are a leaked, closed-source build hosted by a third party; this tool downloads them as-is and cannot vouch for them.
 [/list]
 
 [size=4][b]Credits[/b][/size]
