@@ -1,0 +1,50 @@
+[size=5][b]DLSS5oneclick[/b][/size]
+[b]One click. The leaked DLSS 5 neural-rendering build in any DirectX 11/12 game, with or without DLSS of its own.[/b]
+Single native Windows exe (Rust), no runtime, nothing to configure. Open source: [url=https://github.com/faisalkindi/DLSS5oneclick]github.com/faisalkindi/DLSS5oneclick[/url]
+
+[size=4][b]What it does[/b][/size]
+Pick the game folder, press [b]Install DLSS 5[/b]. The tool detects the game exe (Unity / Unreal helpers skipped), works out whether the game already ships DLSS and whether it renders with D3D11 or D3D12, then installs exactly what that case needs — every file downloaded fresh from its upstream, nothing third-party bundled.
+
+[list]
+[*][b]Game already has DLSS[/b] → ReShade (add-on build, as dxgi.dll) + the DLSS 5 add-on (renodx-dlss5.addon64 + nvngx_dlssnr.dll). The add-on hooks the game's own DLSS calls. [b]DX11 games[/b] also get NIGos' dlss5-dx11-bridge.
+[*][b]Game has no DLSS[/b] → ReShade + shader headers + DLSS5-Feeder + LumeniteFX motion vectors + the DLSS 5 add-on, and ReShade.ini / ReShadePreset.ini written so LumeniteFX Kernel feeds DLSS5_Feed with DLSS5_MV_PROVIDER=3. This is the DSOGaming guide, automated.
+[/list]
+Re-running only fetches what is missing. [b]Remove[/b] takes it all out again (ReShade and the game's own nvngx_dlss.dll stay).
+
+[size=4][b]Use[/b][/size]
+[list=1]
+[*]Run dlss5oneclick.exe
+[*][b]Game folder…[/b] → pick the game's install folder
+[*][b]Install DLSS 5[/b]
+[*]In game: [b]Home[/b] opens ReShade → [b]DLSS 5 Neural Rendering[/b] panel → enable. [b]F6[/b] toggles neural rendering, [b]F5[/b] takes its screenshot. Keep the game's MSAA/SSAA off.
+[/list]
+Command line: [font=Courier New]dlss5oneclick.exe "C:\Games\Foo"[/font] · [font=Courier New]--check[/font] shows what it detected without installing · [font=Courier New]--remove[/font] uninstalls.
+
+[size=4][b]Not handled[/b][/size]
+[list]
+[*]32-bit games (the Feeder's host64 setup is not automated — the tool refuses rather than half-install)
+[*]DirectX 9 and Vulkan games
+[*]Online games — ReShade with add-ons trips anti-cheat
+[/list]
+
+[size=4][b]Known issues[/b][/size]
+[list]
+[*]Feeder path + exclusive fullscreen: every focus change recreates the swapchain and DLSS5-Feeder can crash on the rebuild (Feeder issue #16, upstream). Use borderless/windowed. Raising create_delay in dlss5-feed.cfg helps.
+[*]Neural rendering at native 4K costs several ms; with v-sync on at 60 Hz that shows as a drop to 30 fps. Turn v-sync off or lower work_resolution in dlss5-feed.cfg.
+[/list]
+
+[size=4][b]Credits[/b][/size]
+This tool only automates other people's work:
+[list]
+[*][url=https://reshade.me]crosire[/url] — ReShade and reshade-shaders
+[*][url=https://github.com/jlrouzies-fr/DLSS5-Feeder]jlrouzies-fr[/url] — DLSS5-Feeder and its install guide
+[*][url=https://github.com/umar-afzaal/LumeniteFX]Afzaal (Kaidō)[/url] — LumeniteFX
+[*][url=https://github.com/clshortfuse/renodx]clshortfuse[/url] and the RenoDX community — RenoDX, base of the DLSS 5 add-on
+[*][url=https://github.com/RankFTW/RHI]RankFTW[/url] — RHI and the rhi-repo releases hosting the add-on and runtimes
+[*][url=https://github.com/NIGos/dlss5-dx11-bridge]NIGos[/url] — dlss5-dx11-bridge
+[*]NVIDIA — DLSS 5
+[*]DSOGaming — the article that put the pieces together
+[*][url=https://github.com/emilk/egui]emilk[/url] — egui / eframe
+[*]Fonts: Sora, IBM Plex Sans, JetBrains Mono (SIL OFL)
+[/list]
+MIT licensed. Source, issues and releases on GitHub.
