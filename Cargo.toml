@@ -1,0 +1,28 @@
+[package]
+name = "dlss5oneclick"
+version = "0.2.0"
+edition = "2021"
+description = "One-click DLSS 5 neural rendering setup for DX11/DX12 games that ship without DLSS"
+license = "MIT"
+repository = "https://github.com/faisalkindi/DLSS5oneclick"
+
+[dependencies]
+eframe = "0.36"
+rfd = "0.17"
+reqwest = { version = "0.13", features = ["blocking", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
+regex = "1"
+anyhow = "1"
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61"
+features = ["Win32_System_Console"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

@@ -16,14 +16,14 @@ Every file is downloaded fresh from its upstream at install time. Nothing third-
 
 ## Use
 
-1. Run `DLSS5oneclick.exe` (or `python -m dlss5oneclick`).
+1. Run `dlss5oneclick.exe` (single native binary, no runtime needed).
 2. Browse to the game's `.exe`. The list shows what is already present.
 3. **Install DLSS 5**.
 4. In game: **Home** opens ReShade. In the **DLSS 5 Neural Rendering** panel, enable it. Keep the game's MSAA/SSAA off.
 
 `dlss5-feed.log` next to the game exe should show `feature ready … DLAA` and `DLSS5_MV_PROVIDER=3 (LumeniteFX Kernel) -> Lumenite_Kernel (enabled)`.
 
-CLI: `python -m dlss5oneclick "C:\Games\Foo\Foo.exe"` / `--remove`.
+CLI: `dlss5oneclick.exe "C:\Games\Foo\Foo.exe"` / `--remove` (headless, prints progress).
 
 ## Not handled
 
@@ -34,18 +34,14 @@ CLI: `python -m dlss5oneclick "C:\Games\Foo\Foo.exe"` / `--remove`.
 
 ## Development
 
-```
-python -m pip install -e .[dev]
-python -m pytest
-```
-
-Tests use local fakes only; no network.
-
-Build a single exe:
+Rust 2021, single crate. GUI is egui/eframe; HTTP is reqwest (rustls); archives via the `zip` crate.
 
 ```
-pyinstaller --noconfirm --onefile --windowed --name DLSS5oneclick -p src src/dlss5oneclick/__main__.py
+cargo test
+cargo build --release   # target/release/dlss5oneclick.exe
 ```
+
+Tests use local fakes only; no network. Verified end-to-end against a dummy 64-bit exe 2026-08-31.
 
 ## License
 
