@@ -6,10 +6,10 @@ Single native Windows exe (Rust), no runtime, nothing to configure. Open source:
 Pick the game folder, press [b]Install DLSS 5[/b]. The tool detects the game exe (Unity / Unreal helpers skipped), works out whether the game already ships DLSS and whether it renders with D3D11 or D3D12, then installs exactly what that case needs — every file downloaded from its upstream at install time; the only third-party content inside the exe is three SIL-OFL fonts.
 
 [list]
-[*][b]Game already has DLSS[/b] → ReShade (add-on build, as dxgi.dll) + the DLSS 5 add-on (renodx-dlss5.addon64 + nvngx_dlssnr.dll). The add-on hooks the game's own DLSS calls. [b]DX11 games[/b] also get NIGos' dlss5-dx11-bridge.
+[*][b]Game already has DLSS[/b] → ReShade (add-on build, as dxgi.dll) + the DLSS 5 add-on (renodx-dlss5.addon64 + nvngx_dlssnr.dll). The add-on hooks the game's own DLSS calls. [b]DX11 games[/b] also get NIGos' dlss5-bridge.
 [*][b]Game has no DLSS[/b] → ReShade + shader headers + DLSS5-Feeder + LumeniteFX motion vectors + the DLSS 5 add-on, and ReShade.ini / ReShadePreset.ini written so LumeniteFX Kernel feeds DLSS5_Feed with DLSS5_MV_PROVIDER=3. This is the DSOGaming guide, automated.
 [/list]
-Re-running only fetches what is missing.
+Re-running only fetches what is missing. Since 0.5.1 downloads no longer go through the GitHub API, so the 60-per-hour cap that caused [i]HTTP 403 Forbidden[/i] after a few installs is gone; github.com itself must be reachable (some countries block it — a proxy/VPN is the only way).
 
 [b]New in 0.5.0 — engine choice for games with native DLSS:[/b] besides the default ReShade + RenoDX add-on, you can pick [url=https://github.com/Dagherbou/OptiScaler_DLSSNR]Dagherbou's OptiScaler_DLSSNR[/url] (OptiScaler with a built-in Neural Rendering pass). The tool extracts it as dxgi.dll, adds the DLSS 5 model, and Remove takes it out via a manifest. In game: [b]Insert[/b] opens the OptiScaler overlay, enable Neural Rendering there. The two engines cannot share one game. [b]Remove[/b] takes it all out again (ReShade and the game's own nvngx_dlss.dll stay).
 
@@ -25,7 +25,7 @@ Command line: [font=Courier New]dlss5oneclick.exe "C:\Games\Foo"[/font] · [font
 [size=4][b]Not handled[/b][/size]
 [list]
 [*]32-bit games (the Feeder's host64 setup is not automated — the tool refuses rather than half-install)
-[*]DirectX 9 and Vulkan games
+[*]DirectX 9 and Vulkan games — the Feeder and NIGos' bridge do support them by hand, this tool does not automate those setups yet
 [*]Online games — ReShade with add-ons trips anti-cheat
 [*]API detection can come back unknown on monolithic Unreal exes; DX12 is then assumed (shown in the status line) — a DX11 game in that state would miss the bridge
 [/list]

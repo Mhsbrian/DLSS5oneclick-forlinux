@@ -1,6 +1,6 @@
 //! HTTP helpers: GitHub JSON, streamed downloads with progress, zip member extraction.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use reqwest::blocking::Client;
 use std::fs;
 use std::io::{Read, Seek, Write};
@@ -17,16 +17,109 @@ pub fn client() -> Result<Client> {
         .context("cannot build HTTP client")
 }
 
-pub fn get_json(client: &Client, url: &str) -> Result<serde_json::Value> {
-    let resp = client
+/// GitHub API calls are capped at 60/hour per IP without a token. Honour
+/// `GITHUB_TOKEN` when a user sets one; otherwise callers fall back to the
+/// HTML release pages, which have no such cap.
+pub fn get_json_github(client: &Client, url: &str) -> Result<serde_json::Value> {
+    let mut req = client
         .get(url)
-        .header("Accept", "application/vnd.github+json")
+        .header("Accept", "application/vnd.github+json");
+    if let Ok(tok) = std::env::var("GITHUB_TOKEN") {
+        if !tok.trim().is_empty() {
+            req = req.bearer_auth(tok.trim());
+        }
+    }
+    if std::env::var("DLSS5ONECLICK_NO_API").is_ok() {
+        bail!("API disabled by DLSS5ONECLICK_NO_API");
+    }
+    let resp = req
         .send()
         .with_context(|| format!("request failed: {url}"))?;
     if !resp.status().is_success() {
         bail!("{url}: HTTP {}", resp.status());
     }
     resp.json().with_context(|| format!("bad JSON from {url}"))
+}
+
+/// Release tags of `owner/repo` starting with `prefix`, read from the HTML
+/// releases pages (newest first, up to `pages` pages of 10). No API, no cap.
+pub fn github_release_tags_html(
+    client: &Client,
+    repo: &str,
+    prefix: &str,
+    pages: usize,
+) -> Result<Vec<String>> {
+    let re = regex::Regex::new(&format!(
+        r#"/{}/releases/tag/({}[A-Za-z0-9._-]*)"#,
+        regex::escape(repo),
+        regex::escape(prefix)
+    ))
+    .unwrap();
+    let mut tags: Vec<String> = Vec::new();
+    for page in 1..=pages {
+        let html = get_text(
+            client,
+            &format!("https://github.com/{repo}/releases?page={page}"),
+        )?;
+        let mut found_any = false;
+        for c in re.captures_iter(&html) {
+            let t = c[1].to_string();
+            if !tags.contains(&t) {
+                tags.push(t);
+            }
+            found_any = true;
+        }
+        // Stop once a page had matches and the next one would be older releases,
+        // or when the page lists nothing at all.
+        if found_any || !html.contains("/releases/tag/") {
+            if found_any && page >= 1 {
+                // one more page catches prefixes split across the boundary
+                if page == pages {
+                    break;
+                }
+                let html2 = get_text(
+                    client,
+                    &format!("https://github.com/{repo}/releases?page={}", page + 1),
+                )?;
+                for c in re.captures_iter(&html2) {
+                    let t = c[1].to_string();
+                    if !tags.contains(&t) {
+                        tags.push(t);
+                    }
+                }
+            }
+            break;
+        }
+    }
+    Ok(tags)
+}
+
+/// Download URL of the first asset of `tag` whose file name matches `name_re`,
+/// read from GitHub's expanded-assets HTML fragment. No API.
+pub fn github_asset_url_html(
+    client: &Client,
+    repo: &str,
+    tag: &str,
+    name_re: &str,
+) -> Result<String> {
+    let html = get_text(
+        client,
+        &format!("https://github.com/{repo}/releases/expanded_assets/{tag}"),
+    )?;
+    let re = regex::Regex::new(&format!(
+        r#"/{}/releases/download/{}/({})"#,
+        regex::escape(repo),
+        regex::escape(tag),
+        name_re
+    ))
+    .unwrap();
+    let m = re
+        .captures(&html)
+        .ok_or_else(|| anyhow!("no asset matching {name_re} in {repo} {tag}"))?;
+    Ok(format!(
+        "https://github.com/{repo}/releases/download/{tag}/{}",
+        &m[1]
+    ))
 }
 
 pub fn get_text(client: &Client, url: &str) -> Result<String> {

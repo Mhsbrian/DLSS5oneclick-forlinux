@@ -8,7 +8,7 @@ Download: [latest release](https://github.com/faisalkindi/DLSS5oneclick/releases
 
 | The game | What gets installed |
 |---|---|
-| **Ships its own DLSS** (an `nvngx_dlss.dll` this tool did not place, or Streamline `sl.*.dll`, `nvngx_dlssg/dlssd.dll`, anywhere up to four folders deep) | ReShade add-on build + the DLSS 5 add-on (`renodx-dlss5.addon64`, `nvngx_dlssnr.dll`). The add-on hooks the game's own NGX calls directly. **DX11 games** also get [dlss5-dx11-bridge](https://github.com/NIGos/dlss5-dx11-bridge), which replays the D3D11 DLSS calls on a private D3D12 device so the add-on can see them. No Feeder, no LumeniteFX; a Feeder left over from an earlier run is removed. |
+| **Ships its own DLSS** (an `nvngx_dlss.dll` this tool did not place, or Streamline `sl.*.dll`, `nvngx_dlssg/dlssd.dll`, anywhere up to four folders deep) | ReShade add-on build + the DLSS 5 add-on (`renodx-dlss5.addon64`, `nvngx_dlssnr.dll`). The add-on hooks the game's own NGX calls directly. **DX11 games** also get [dlss5-bridge](https://github.com/NIGos/dlss5-bridge), which replays the D3D11 DLSS calls on a private D3D12 device so the add-on can see them. No Feeder, no LumeniteFX; a Feeder left over from an earlier run is removed. |
 | **Has no DLSS** | The full Feeder path below: ReShade + shader headers + DLSS5-Feeder + LumeniteFX + the DLSS 5 add-on + config. |
 
 **Engine choice for games with native DLSS**: the default engine is ReShade + the RenoDX add-on. A second engine — [Dagherbou's OptiScaler_DLSSNR fork](https://github.com/Dagherbou/OptiScaler_DLSSNR) (OptiScaler with a built-in Neural Rendering pass, colour composition from RenoDX under MIT) — can be picked in the GUI or with `--engine=opti`: the tool extracts the fork's release into the game as `dxgi.dll`, adds `nvngx_dlssnr.dll`, and records a manifest so Remove takes it out cleanly. In game, Insert opens the OptiScaler overlay; Neural Rendering is off by default there. The two engines cannot share a game (both load as dxgi.dll). Note the fork targets the unpatched model: on the driver's own DLL that means RTX 50; with the `310.8.SF` model this tool installs, older RTX generations may work but are untested there.
@@ -40,6 +40,10 @@ Every file is downloaded from its upstream at install time; a re-run only fetche
 **F6** toggles neural rendering on/off, **F5** saves the add-on's screenshot (both are the add-on's own hotkeys). On the Feeder path, `dlss5-feed.log` next to the game exe should show `feature ready … DLAA` and `DLSS5_MV_PROVIDER=3 (LumeniteFX Kernel) -> Lumenite_Kernel (enabled)`.
 
 CLI: `dlss5oneclick.exe "C:\Games\Foo"` (folder or exe) / `--check` (detect only) / `--remove` (headless, prints progress).
+
+## Downloads and GitHub
+
+Every component comes from GitHub releases. Since 0.5.1 the tool reads the public release **pages** (no API), so it is not subject to GitHub's 60-requests-per-hour API cap that caused `HTTP 403 Forbidden` for people installing into many games. If you set a `GITHUB_TOKEN` environment variable it is used for the API path first. Where github.com itself is unreachable (some countries block it), a proxy or VPN is the only way — the files exist nowhere else this tool trusts.
 
 ## Known issues
 
@@ -77,10 +81,10 @@ This tool only automates other people's work. The credit belongs to:
 - **NVIDIA** — DLSS 5 itself and the `nvngx_dlssnr.dll` / `nvngx_dlss.dll` runtimes.
 - **DSOGaming** — the [article](https://www.dsogaming.com/articles/heres-how-you-can-install-dlss-5-to-all-dx9-dx10-dx11-dx12-and-vulkan-games/) that put the pieces together and started this.
 - **[Dagherbou](https://github.com/Dagherbou)** — [OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR), the OptiScaler fork with the built-in Neural Rendering pass, and the **[OptiScaler team](https://github.com/optiscaler/OptiScaler)** it builds on (GPL-3).
-- **[NIGos](https://github.com/NIGos)** — [dlss5-dx11-bridge](https://github.com/NIGos/dlss5-dx11-bridge), which lets the DLSS 5 add-on work in D3D11 games that have their own DLSS.
+- **[NIGos](https://github.com/NIGos)** — [dlss5-bridge](https://github.com/NIGos/dlss5-bridge), which lets the DLSS 5 add-on work in D3D11 games that have their own DLSS.
 - **[emilk](https://github.com/emilk)** — [egui / eframe](https://github.com/emilk/egui), the UI toolkit.
 - Fonts: [Sora](https://github.com/sora-xor/sora-font) by the Sora project, [IBM Plex Sans](https://github.com/IBM/plex) by IBM, [JetBrains Mono](https://github.com/JetBrains/JetBrainsMono) by JetBrains — all SIL OFL.
 
 ## License
 
-MIT for this tool. Each downloaded component keeps its own license: ReShade BSD-3; DLSS5-Feeder — see its repo; LumeniteFX — AGNYA; dlss5-dx11-bridge MIT; the DLSS 5 add-on (`renodx-dlss5.addon64`) — closed source, no license published; NVIDIA runtimes — NVIDIA's terms.
+MIT for this tool. Each downloaded component keeps its own license: ReShade BSD-3; DLSS5-Feeder — see its repo; LumeniteFX — AGNYA; dlss5-bridge MIT; the DLSS 5 add-on (`renodx-dlss5.addon64`) — closed source, no license published; NVIDIA runtimes — NVIDIA's terms.

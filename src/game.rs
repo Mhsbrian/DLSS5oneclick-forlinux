@@ -15,7 +15,7 @@ pub const DLSSNR_DLL: &str = "nvngx_dlssnr.dll";
 pub const DLSS_DLL: &str = "nvngx_dlss.dll";
 pub const LUMENITE_KERNEL_FX: &str = "lumenite_Kernel.fx";
 pub const LUMENITE_BLUENOISE: &str = "lumenite_bluenoise256.png";
-pub const BRIDGE_ADDON: &str = "dlss5-dx11-bridge.addon64";
+pub const BRIDGE_ADDON: &str = "dlss5-bridge.addon64";
 /// Files this tool wrote for an OptiScaler install, one path per line.
 pub const OPTI_MANIFEST: &str = ".dlss5oneclick-optiscaler-manifest";
 /// Sidecar written next to an `nvngx_dlss.dll` this tool placed, so it is never mistaken for the game's own.
@@ -333,7 +333,7 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     Ok(GameStatus {
         mode,
         api,
-        bridge: d.join(BRIDGE_ADDON).is_file(),
+        bridge: d.join(BRIDGE_ADDON).is_file() || d.join("dlss5-dx11-bridge.addon64").is_file(),
         opti: d.join(OPTI_MANIFEST).is_file(),
         exe: exe.to_path_buf(),
         bitness,

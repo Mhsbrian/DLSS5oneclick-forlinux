@@ -276,7 +276,7 @@ const TILES_NATIVE: [Tile; 4] = [
     },
     Tile {
         title: "DX11 bridge",
-        detail: "dlss5-dx11-bridge.addon64 · only for D3D11 games",
+        detail: "dlss5-bridge.addon64 (NIGos) · D3D11 games",
         ok: |s| s.bridge,
         optional: true,
     },

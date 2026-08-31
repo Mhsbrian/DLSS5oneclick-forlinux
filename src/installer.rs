@@ -26,8 +26,8 @@ use std::path::{Path, PathBuf};
 pub const RESHADE_HOME: &str = "https://reshade.me";
 pub const RESHADE_SHADERS_RAW: &str =
     "https://raw.githubusercontent.com/crosire/reshade-shaders/slim/Shaders/";
-pub const FEEDER_LATEST: &str =
-    "https://api.github.com/repos/jlrouzies-fr/DLSS5-Feeder/releases/latest";
+pub const FEEDER_DOWNLOAD: &str =
+    "https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest/download/";
 pub const LUMENITE_ZIP: &str =
     "https://codeload.github.com/umar-afzaal/LumeniteFX/zip/refs/heads/mainline";
 
@@ -70,16 +70,26 @@ fn step_opti(
         );
     }
     progress(0, "Looking up latest OptiScaler DLSS-NR release");
-    let releases = net::get_json(client, OPTI_RELEASES)?;
-    let asset = releases
-        .as_array()
-        .and_then(|a| a.first())
-        .and_then(|r| r.get("assets"))
-        .and_then(Value::as_array)
-        .and_then(|a| a.first())
-        .and_then(|a| a.get("browser_download_url"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("OptiScaler_DLSSNR has no release asset"))?;
+    let asset: String = match net::get_json_github(client, OPTI_RELEASES) {
+        Ok(releases) => releases
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|r| r.get("assets"))
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+            .and_then(|a| a.get("browser_download_url"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow!("OptiScaler_DLSSNR has no release asset"))?,
+        Err(_) => {
+            let tags = net::github_release_tags_html(client, OPTI_REPO, "v", 2)?;
+            let tag = tags
+                .first()
+                .ok_or_else(|| anyhow!("no OptiScaler_DLSSNR release found"))?;
+            net::github_asset_url_html(client, OPTI_REPO, tag, r#"[^"]+\.zip"#)?
+        }
+    };
+    let asset = asset.as_str();
     let zip_path = work.join("optiscaler-dlssnr.zip");
     net::download(client, asset, &zip_path, "OptiScaler DLSS-NR", progress)?;
 
@@ -157,10 +167,12 @@ fn uninstall_opti(d: &Path, removed: &mut Vec<String>) -> Result<()> {
     Ok(())
 }
 
-pub const BRIDGE_LATEST: &str =
-    "https://api.github.com/repos/NIGos/dlss5-dx11-bridge/releases/latest";
+pub const BRIDGE_DOWNLOAD: &str =
+    "https://github.com/NIGos/dlss5-bridge/releases/latest/download/dlss5-bridge.addon64";
 pub const RHI_RELEASES: &str =
     "https://api.github.com/repos/RankFTW/rhi-repo/releases?per_page=100";
+pub const RHI_REPO: &str = "RankFTW/rhi-repo";
+pub const OPTI_REPO: &str = "Dagherbou/OptiScaler_DLSSNR";
 
 #[derive(Clone, Copy)]
 pub struct Step {
@@ -253,7 +265,7 @@ fn ver_key(tag: &str, prefix: &str) -> Vec<u64> {
 
 /// Newest rhi-repo release whose tag is `prefix` + digits; returns (tag, first asset URL).
 pub fn pick_latest_asset(releases: &[Value], prefix: &str) -> Result<(String, String)> {
-    let mut cands: Vec<(Vec<u64>, String, String)> = releases
+    let cands: Vec<(Vec<u64>, String, String)> = releases
         .iter()
         .filter_map(|r| {
             let tag = r.get("tag_name")?.as_str()?;
@@ -273,53 +285,50 @@ pub fn pick_latest_asset(releases: &[Value], prefix: &str) -> Result<(String, St
     if cands.is_empty() {
         bail!("no release with tag prefix '{prefix}' found");
     }
-    cands.sort();
-    let (_, tag, url) = cands.pop().unwrap();
-    Ok((tag, url))
+    Ok(best_tag(cands))
 }
 
-/// Required loose Feeder assets -> URL.
-pub fn pick_feeder_assets(release: &Value) -> Result<(String, String)> {
-    let mut addon = None;
-    let mut fx = None;
-    for a in release
-        .get("assets")
-        .and_then(Value::as_array)
+/// Newest by version; for the DLSS 5 model prefer ShortFuse's multi-generation
+/// `.SF` builds over NVIDIA's RTX-50-only originals or single-generation ports.
+fn best_tag(mut cands: Vec<(Vec<u64>, String, String)>) -> (String, String) {
+    let any_sf = cands
+        .iter()
+        .any(|(_, t, _)| t.starts_with("dlssnr-") && t.contains(".SF"));
+    if any_sf {
+        cands.retain(|(_, t, _)| t.contains(".SF"));
+    }
+    cands.sort();
+    let (_, tag, url) = cands.pop().unwrap();
+    (tag, url)
+}
+
+/// rhi-repo lookup that never needs the API: HTML releases pages for the tag,
+/// the expanded-assets fragment for the file.
+pub fn rhi_latest(client: &Client, prefix: &str) -> Result<(String, String)> {
+    if let Ok(releases) = net::get_json_github(client, RHI_RELEASES) {
+        if let Some(arr) = releases.as_array() {
+            if let Ok(r) = pick_latest_asset(arr, prefix) {
+                return Ok(r);
+            }
+        }
+    }
+    let tags = net::github_release_tags_html(client, RHI_REPO, prefix, 6)?;
+    let cands: Vec<(Vec<u64>, String, String)> = tags
         .into_iter()
-        .flatten()
-    {
-        let (Some(name), Some(url)) = (
-            a.get("name").and_then(Value::as_str),
-            a.get("browser_download_url").and_then(Value::as_str),
-        ) else {
-            continue;
-        };
-        if name.eq_ignore_ascii_case(game::FEEDER_ADDON) {
-            addon = Some(url.to_owned());
-        } else if name.eq_ignore_ascii_case(game::FEEDER_FX) {
-            fx = Some(url.to_owned());
-        }
+        .filter(|t| {
+            t[prefix.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
+        })
+        .map(|t| (ver_key(&t, prefix), t, String::new()))
+        .collect();
+    if cands.is_empty() {
+        bail!("no release with tag prefix '{prefix}' found on github.com/{RHI_REPO}/releases");
     }
-    let tag = release
-        .get("tag_name")
-        .and_then(Value::as_str)
-        .unwrap_or("?");
-    match (addon, fx) {
-        (Some(a), Some(f)) => Ok((a, f)),
-        (a, f) => {
-            let mut missing = Vec::new();
-            if a.is_none() {
-                missing.push(game::FEEDER_ADDON);
-            }
-            if f.is_none() {
-                missing.push(game::FEEDER_FX);
-            }
-            bail!(
-                "DLSS5-Feeder release {tag} is missing: {}",
-                missing.join(", ")
-            )
-        }
-    }
+    let (tag, _) = best_tag(cands);
+    let url = net::github_asset_url_html(client, RHI_REPO, &tag, r#"[^"]+\.zip"#)?;
+    Ok((tag, url))
 }
 
 // ── step 1: ReShade ────────────────────────────────────────────────
@@ -416,9 +425,9 @@ fn step_feeder(
         progress(100, "DLSS5-Feeder already installed");
         return Ok(vec![]);
     }
-    progress(0, "Looking up latest DLSS5-Feeder");
-    let release = net::get_json(client, FEEDER_LATEST)?;
-    let (addon_url, fx_url) = pick_feeder_assets(&release)?;
+    progress(0, "Fetching latest DLSS5-Feeder");
+    let addon_url = format!("{FEEDER_DOWNLOAD}{}", game::FEEDER_ADDON);
+    let fx_url = format!("{FEEDER_DOWNLOAD}{}", game::FEEDER_FX);
     let d = st.game_dir();
     let shaders = d.join("reshade-shaders").join("Shaders");
     net::download(
@@ -529,16 +538,12 @@ fn step_dlss5(
         return Ok(vec![]);
     }
     progress(0, "Looking up DLSS 5 add-on releases");
-    let releases = net::get_json(client, RHI_RELEASES)?;
-    let releases = releases
-        .as_array()
-        .ok_or_else(|| anyhow!("unexpected response from GitHub for rhi-repo"))?;
     let mut installed = Vec::new();
     for (prefix, fname, present) in plan {
         if present {
             continue;
         }
-        let (tag, url) = pick_latest_asset(releases, prefix)?;
+        let (tag, url) = rhi_latest(client, prefix)?;
         let z = work.join(format!("{tag}.zip"));
         net::download(client, &url, &z, fname, progress)?;
         install_single_from_zip(&z, fname, &st.game_dir().join(fname))?;
@@ -563,11 +568,7 @@ fn step_dlssnr_only(
         return Ok(vec![]);
     }
     progress(0, "Looking up DLSS 5 model releases");
-    let releases = net::get_json(client, RHI_RELEASES)?;
-    let releases = releases
-        .as_array()
-        .ok_or_else(|| anyhow!("unexpected response from GitHub for rhi-repo"))?;
-    let (tag, url) = pick_latest_asset(releases, "dlssnr-")?;
+    let (tag, url) = rhi_latest(client, "dlssnr-")?;
     let z = work.join(format!("{tag}.zip"));
     net::download(client, &url, &z, game::DLSSNR_DLL, progress)?;
     install_single_from_zip(&z, game::DLSSNR_DLL, &st.game_dir().join(game::DLSSNR_DLL))?;
@@ -620,23 +621,10 @@ fn step_bridge(
         progress(100, "DX11 bridge already installed");
         return Ok(vec![]);
     }
-    progress(0, "Looking up latest dlss5-dx11-bridge");
-    let release = net::get_json(client, BRIDGE_LATEST)?;
-    let url = release
-        .get("assets")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .find(|a| {
-            a.get("name")
-                .and_then(Value::as_str)
-                .is_some_and(|n| n.eq_ignore_ascii_case(game::BRIDGE_ADDON))
-        })
-        .and_then(|a| a.get("browser_download_url").and_then(Value::as_str))
-        .ok_or_else(|| anyhow!("dlss5-dx11-bridge release has no {}", game::BRIDGE_ADDON))?;
+    progress(0, "Fetching latest dlss5-bridge");
     net::download(
         client,
-        url,
+        BRIDGE_DOWNLOAD,
         &st.game_dir().join(game::BRIDGE_ADDON),
         game::BRIDGE_ADDON,
         progress,
@@ -725,6 +713,7 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
         d.join(game::DLSS5_ADDON),
         d.join(game::DLSSNR_DLL),
         d.join(game::BRIDGE_ADDON),
+        d.join("dlss5-dx11-bridge.addon64"),
         shaders.join(game::FEEDER_FX),
         d.join("reshade-shaders")
             .join("Textures")
@@ -857,17 +846,6 @@ mod tests {
     use std::io::Write;
     use zip::write::SimpleFileOptions;
 
-    fn feeder_release() -> Value {
-        let names = [
-            "dlss5-feed-host64.exe",
-            "dlss5-feed.addon32",
-            "dlss5-feed.addon64",
-            "DLSS5_Feed.fx",
-            "feed-vk-layer.zip",
-        ];
-        json!({"tag_name": "v0.6.0-beta.1", "assets": names.iter().map(|n| json!({"name": n, "browser_download_url": format!("https://x/{n}")})).collect::<Vec<_>>()})
-    }
-
     fn rhi_releases() -> Vec<Value> {
         ["streamline-2.13.0.0", "renodx-dlss5-4.55", "renodx-dlss5-4.5", "renodx-dlss5-3.3.4",
          "dlssnr-310.8.SF-v2", "dlssnr-310.8.SF", "dlssg-310.8.0", "dlssd-310.7.129",
@@ -878,15 +856,16 @@ mod tests {
     }
 
     #[test]
-    fn feeder_assets_are_loose_files_not_vk_zip() {
-        let (a, f) = pick_feeder_assets(&feeder_release()).unwrap();
-        assert_eq!(a, "https://x/dlss5-feed.addon64");
-        assert_eq!(f, "https://x/DLSS5_Feed.fx");
-        let bad = json!({"tag_name": "v9", "assets": [{"name": "feed-vk-layer.zip", "browser_download_url": "u"}]});
-        assert!(pick_feeder_assets(&bad)
-            .unwrap_err()
-            .to_string()
-            .contains("missing"));
+    fn dlssnr_prefers_multi_generation_sf_build() {
+        let r: Vec<Value> = ["dlssnr-310.8.0", "dlssnr-310.8.0-RTX40", "dlssnr-310.8.SF", "dlssnr-310.8.SF-v2", "dlssnr-310.9.0"]
+            .iter()
+            .map(|t| json!({"tag_name": t, "assets": [{"browser_download_url": format!("https://x/{t}.zip")}]}))
+            .collect();
+        assert_eq!(
+            pick_latest_asset(&r, "dlssnr-").unwrap().0,
+            "dlssnr-310.8.SF-v2"
+        );
+        assert!(pick_latest_asset(&r, "renodx-dlss5-").is_err());
     }
 
     #[test]
