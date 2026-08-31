@@ -20,11 +20,12 @@ zip = { version = "8.6", default-features = false, features = ["deflate"] }
 regex = "1"
 anyhow = "1"
 tempfile = "3"
+raw-window-handle = "0.6"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.61"
-features = ["Win32_System_Console"]
+features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"]
 
 [profile.release]
 opt-level = "z"

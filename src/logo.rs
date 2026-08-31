@@ -58,3 +58,33 @@ pub fn icon_data() -> Option<egui::IconData> {
         height: h,
     })
 }
+
+/// winit only sets the title-bar (`ICON_SMALL`) icon from `with_icon`; the taskbar
+/// reads `ICON_BIG`, which otherwise falls back to Explorer's cached generic icon.
+/// Load the icon resource winresource embedded (id 1) and hand it to the window.
+#[cfg(windows)]
+pub fn set_taskbar_icon(window: &dyn raw_window_handle::HasWindowHandle) {
+    use raw_window_handle::RawWindowHandle;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        LoadImageW, SendMessageW, ICON_BIG, IMAGE_ICON, LR_DEFAULTSIZE, WM_SETICON,
+    };
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(h) = handle.as_raw() else {
+        return;
+    };
+    let hwnd = h.hwnd.get() as *mut core::ffi::c_void;
+    unsafe {
+        let hinst = GetModuleHandleW(core::ptr::null());
+        // MAKEINTRESOURCE(1)
+        let hicon = LoadImageW(hinst, 1 as _, IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
+        if !hicon.is_null() {
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, hicon as isize);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn set_taskbar_icon(_window: &dyn raw_window_handle::HasWindowHandle) {}

@@ -840,6 +840,7 @@ dependencies = [
  "anyhow",
  "eframe",
  "image",
+ "raw-window-handle",
  "regex",
  "reqwest",
  "rfd",

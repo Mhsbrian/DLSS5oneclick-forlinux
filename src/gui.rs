@@ -43,6 +43,7 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         t::install(&cc.egui_ctx);
+        logo::set_taskbar_icon(cc);
         let exe_text = cc
             .storage
             .and_then(|s| s.get_string("exe"))
