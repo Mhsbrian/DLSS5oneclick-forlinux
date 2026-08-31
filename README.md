@@ -1,6 +1,8 @@
 # DLSS5oneclick
 
-One button that sets up **DLSS 5 neural rendering** in a DirectX 11/12 game that has no DLSS of its own.
+One button that sets up the **leaked DLSS 5 neural-rendering build** in a DirectX 11/12 game that has no DLSS of its own. Single native Windows exe, no runtime.
+
+Download: [latest release](https://github.com/faisalkindi/DLSS5oneclick/releases/latest) → `dlss5oneclick.exe`.
 
 It does, in order, exactly what the [DLSS5-Feeder README](https://github.com/jlrouzies-fr/DLSS5-Feeder#install-for-a-64-bit-game) tells you to do by hand:
 
@@ -10,7 +12,7 @@ It does, in order, exactly what the [DLSS5-Feeder README](https://github.com/jlr
 | 1b | `ReShade.fxh`, `ReShadeUI.fxh`, `DrawText.fxh` into `reshade-shaders\Shaders` (the setup exe has only the DLLs; every shader below includes `ReShade.fxh`) | [crosire/reshade-shaders](https://github.com/crosire/reshade-shaders/tree/slim/Shaders) (`slim` branch) |
 | 2 | `dlss5-feed.addon64` + `DLSS5_Feed.fx` | [jlrouzies-fr/DLSS5-Feeder](https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest) |
 | 3 | Motion-vector provider: `lumenite_*.fx`, `include\*.fxh`, `lumenite_bluenoise256.png` | [umar-afzaal/LumeniteFX](https://github.com/umar-afzaal/LumeniteFX) (`mainline` branch) |
-| 4 | `renodx-dlss5.addon64`, `nvngx_dlssnr.dll`, `nvngx_dlss.dll` | [RankFTW/rhi-repo](https://github.com/RankFTW/rhi-repo/releases) releases (`renodx-dlss5-*`, `dlssnr-*`, `dlss-*`) |
+| 4 | `renodx-dlss5.addon64` (the leaked DLSS 5 add-on), `nvngx_dlssnr.dll`, `nvngx_dlss.dll` | [RankFTW/rhi-repo](https://github.com/RankFTW/rhi-repo/releases) releases (`renodx-dlss5-*`, `dlssnr-*`, `dlss-*`) |
 | 5 | `ReShade.ini` gets `PreprocessorDefinitions=DLSS5_MV_PROVIDER=3`; `ReShadePreset.ini` enables `Lumenite_Kernel` **above** `DLSS5_Feed` | written by this tool, existing keys preserved |
 
 Every file is downloaded fresh from its upstream at install time. Nothing third-party is bundled.
