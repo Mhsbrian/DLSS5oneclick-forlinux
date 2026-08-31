@@ -6,7 +6,7 @@ use crate::installer::{self, StepState, STEPS};
 use crate::logo;
 use crate::theme::{self as t};
 use eframe::egui::{
-    self, Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, Stroke, Vec2,
+    self, Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, Stroke, StrokeKind, Vec2,
 };
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
