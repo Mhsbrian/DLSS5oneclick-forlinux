@@ -259,41 +259,41 @@ fn paint_check(ui: &mut egui::Ui, ok: bool, optional: bool) {
     }
 }
 
-fn tile(ui: &mut egui::Ui, width: f32, tl: &Tile, st: Option<&GameStatus>) {
+fn tile(ui: &mut egui::Ui, rect: egui::Rect, tl: &Tile, st: Option<&GameStatus>) {
     let ok = st.map(tl.ok).unwrap_or(false);
     let dashed = tl.optional && !ok;
-    ui.allocate_ui_with_layout(Vec2::new(width, 0.0), Layout::top_down(Align::Min), |ui| {
-        ui.set_width(width);
-        Frame::new()
-            .fill(t::TILE)
-            .stroke(Stroke::new(
-                1.0,
-                if dashed { t::BORDER_DASH } else { t::BORDER },
-            ))
-            .corner_radius(CornerRadius::same(8))
-            .inner_margin(Margin::symmetric(11, 9))
-            .show(ui, |ui| {
-                ui.set_width(width - 22.0);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 10.0;
-                    paint_check(ui, ok, tl.optional);
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 1.0;
-                        let title_color = if dashed { t::TEXT_OFF } else { t::TEXT };
-                        ui.label(
-                            RichText::new(tl.title)
-                                .font(t::plex_medium(13.0))
-                                .color(title_color),
-                        );
-                        ui.label(
-                            RichText::new(tl.detail)
-                                .font(t::plex(11.0))
-                                .color(if dashed { t::TEXT_DIM } else { t::TEXT_MUTED }),
-                        );
-                    });
-                });
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(8), t::TILE);
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(8),
+        Stroke::new(1.0, if dashed { t::BORDER_DASH } else { t::BORDER }),
+        StrokeKind::Inside,
+    );
+    let inner = rect.shrink2(Vec2::new(11.0, 9.0));
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(inner)
+            .layout(Layout::left_to_right(Align::Center)),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            paint_check(ui, ok, tl.optional);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                let title_color = if dashed { t::TEXT_OFF } else { t::TEXT };
+                ui.label(
+                    RichText::new(tl.title)
+                        .font(t::plex_medium(13.0))
+                        .color(title_color),
+                );
+                ui.label(
+                    RichText::new(tl.detail)
+                        .font(t::plex(11.0))
+                        .color(if dashed { t::TEXT_DIM } else { t::TEXT_MUTED }),
+                );
             });
-    });
+        },
+    );
 }
 
 impl eframe::App for App {
@@ -424,18 +424,20 @@ impl eframe::App for App {
 
                 // ── tiles ─────────────────────────────────────────
                 let gap = 8.0;
-                let col_w = ((ui.available_width() - gap) / 2.0).floor();
+                let tile_h = 58.0;
+                let row_w = ui.available_width();
+                let col_w = ((row_w - gap) / 2.0).floor();
                 for row in TILES.chunks(2) {
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(ui.available_width(), 0.0),
-                        Layout::left_to_right(Align::Min),
-                        |ui| {
-                            ui.spacing_mut().item_spacing.x = gap;
-                            for tl in row {
-                                tile(ui, col_w, tl, ok_status.as_ref());
-                            }
-                        },
-                    );
+                    let (row_rect, _) =
+                        ui.allocate_exact_size(Vec2::new(row_w, tile_h), egui::Sense::hover());
+                    for (i, tl) in row.iter().enumerate() {
+                        let x = row_rect.left() + i as f32 * (col_w + gap);
+                        let rect = egui::Rect::from_min_size(
+                            egui::pos2(x, row_rect.top()),
+                            Vec2::new(col_w, tile_h),
+                        );
+                        tile(ui, rect, tl, ok_status.as_ref());
+                    }
                 }
 
                 // ── actions ───────────────────────────────────────
