@@ -30,7 +30,10 @@ pub fn get_json(client: &Client, url: &str) -> Result<serde_json::Value> {
 }
 
 pub fn get_text(client: &Client, url: &str) -> Result<String> {
-    let resp = client.get(url).send().with_context(|| format!("request failed: {url}"))?;
+    let resp = client
+        .get(url)
+        .send()
+        .with_context(|| format!("request failed: {url}"))?;
     if !resp.status().is_success() {
         bail!("{url}: HTTP {}", resp.status());
     }
@@ -46,8 +49,17 @@ fn fmt_bytes(n: u64) -> String {
 }
 
 /// Stream `url` to `dest` (via a `.part` file), reporting progress.
-pub fn download(client: &Client, url: &str, dest: &Path, label: &str, progress: Progress) -> Result<()> {
-    let mut resp = client.get(url).send().with_context(|| format!("download failed: {label}"))?;
+pub fn download(
+    client: &Client,
+    url: &str,
+    dest: &Path,
+    label: &str,
+    progress: Progress,
+) -> Result<()> {
+    let mut resp = client
+        .get(url)
+        .send()
+        .with_context(|| format!("download failed: {label}"))?;
     if !resp.status().is_success() {
         bail!("{label}: HTTP {}", resp.status());
     }
@@ -72,7 +84,10 @@ pub fn download(client: &Client, url: &str, dest: &Path, label: &str, progress: 
             done += n as u64;
             if total > 0 {
                 let pct = (done as f64 / total as f64 * 100.0).min(99.0) as u8;
-                progress(pct, &format!("{label}: {} / {}", fmt_bytes(done), fmt_bytes(total)));
+                progress(
+                    pct,
+                    &format!("{label}: {} / {}", fmt_bytes(done), fmt_bytes(total)),
+                );
             } else {
                 progress(0, &format!("{label}: {}", fmt_bytes(done)));
             }
@@ -97,14 +112,19 @@ pub fn extract_member<R: Read + Seek>(
     if let Some(p) = dest.parent() {
         fs::create_dir_all(p)?;
     }
-    let mut f = zip.by_name(member).with_context(|| format!("zip member missing: {member}"))?;
+    let mut f = zip
+        .by_name(member)
+        .with_context(|| format!("zip member missing: {member}"))?;
     let mut out = fs::File::create(dest)?;
     std::io::copy(&mut f, &mut out)?;
     Ok(())
 }
 
 /// File members whose name matches `re`.
-pub fn members_matching<R: Read + Seek>(zip: &zip::ZipArchive<R>, re: &regex::Regex) -> Vec<String> {
+pub fn members_matching<R: Read + Seek>(
+    zip: &zip::ZipArchive<R>,
+    re: &regex::Regex,
+) -> Vec<String> {
     zip.file_names()
         .filter(|n| !n.ends_with('/') && re.is_match(n))
         .map(str::to_owned)

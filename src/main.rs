@@ -3,8 +3,10 @@
 mod game;
 mod gui;
 mod installer;
+mod logo;
 mod net;
 mod reshade_ini;
+mod theme;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -34,9 +36,18 @@ fn cli(target: PathBuf, remove: bool) -> i32 {
     if candidates.len() > 1 {
         let others: Vec<String> = candidates[1..]
             .iter()
-            .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
+            .map(|p| {
+                p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .collect();
-        println!("using {} (other candidates: {})", exe.display(), others.join(", "));
+        println!(
+            "using {} (other candidates: {})",
+            exe.display(),
+            others.join(", ")
+        );
     } else if !candidates.is_empty() {
         println!("using {}", exe.display());
     }

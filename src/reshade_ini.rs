@@ -25,7 +25,9 @@ pub struct Ini {
 
 impl Ini {
     pub fn parse(text: &str) -> Self {
-        let mut ini = Ini { sections: vec![(String::new(), Vec::new())] };
+        let mut ini = Ini {
+            sections: vec![(String::new(), Vec::new())],
+        };
         let mut cur = 0usize;
         for line in text.lines() {
             let s = line.trim();
@@ -37,14 +39,20 @@ impl Ini {
                 continue;
             }
             if let Some((k, v)) = s.split_once('=') {
-                ini.sections[cur].1.push((k.trim().to_owned(), v.trim().to_owned()));
+                ini.sections[cur]
+                    .1
+                    .push((k.trim().to_owned(), v.trim().to_owned()));
             }
         }
         ini
     }
 
     fn section_index(&mut self, name: &str) -> usize {
-        if let Some(i) = self.sections.iter().position(|(n, _)| n.eq_ignore_ascii_case(name)) {
+        if let Some(i) = self
+            .sections
+            .iter()
+            .position(|(n, _)| n.eq_ignore_ascii_case(name))
+        {
             return i;
         }
         self.sections.push((name.to_owned(), Vec::new()));
@@ -132,7 +140,11 @@ pub fn split_list(raw: &str) -> Vec<String> {
 }
 
 pub fn join_list(items: &[String]) -> String {
-    items.iter().map(|s| s.replace(',', ",,")).collect::<Vec<_>>().join(",")
+    items
+        .iter()
+        .map(|s| s.replace(',', ",,"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn ensure_define(raw: &str, define: &str) -> String {
@@ -149,10 +161,21 @@ fn ensure_define(raw: &str, define: &str) -> String {
 pub fn write_reshade_ini(game_dir: &Path) -> Result<()> {
     let p = game_dir.join("ReShade.ini");
     let mut ini = Ini::load(&p);
-    ini.set_default("GENERAL", "EffectSearchPaths", r".\reshade-shaders\Shaders\**");
-    ini.set_default("GENERAL", "TextureSearchPaths", r".\reshade-shaders\Textures\**");
+    ini.set_default(
+        "GENERAL",
+        "EffectSearchPaths",
+        r".\reshade-shaders\Shaders\**",
+    );
+    ini.set_default(
+        "GENERAL",
+        "TextureSearchPaths",
+        r".\reshade-shaders\Textures\**",
+    );
     ini.set_default("GENERAL", "PresetPath", r".\ReShadePreset.ini");
-    let defs = ensure_define(ini.get("GENERAL", "PreprocessorDefinitions").unwrap_or(""), MV_PROVIDER_DEFINE);
+    let defs = ensure_define(
+        ini.get("GENERAL", "PreprocessorDefinitions").unwrap_or(""),
+        MV_PROVIDER_DEFINE,
+    );
     ini.set("GENERAL", "PreprocessorDefinitions", defs);
     ini.save(&p)
 }
@@ -168,10 +191,17 @@ pub fn write_preset(game_dir: &Path) -> Result<()> {
             continue;
         }
         let mut list = ours.clone();
-        list.extend(split_list(ini.get("", key).unwrap_or("")).into_iter().filter(|t| !ours.contains(t)));
+        list.extend(
+            split_list(ini.get("", key).unwrap_or(""))
+                .into_iter()
+                .filter(|t| !ours.contains(t)),
+        );
         ini.set("", key, join_list(&list));
     }
-    let defs = ensure_define(ini.get("", "PreprocessorDefinitions").unwrap_or(""), MV_PROVIDER_DEFINE);
+    let defs = ensure_define(
+        ini.get("", "PreprocessorDefinitions").unwrap_or(""),
+        MV_PROVIDER_DEFINE,
+    );
     ini.set("", "PreprocessorDefinitions", defs);
     ini.save(&p)
 }
@@ -193,10 +223,22 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         write_reshade_ini(t.path()).unwrap();
         let ini = Ini::load(&t.path().join("ReShade.ini"));
-        assert_eq!(ini.get("GENERAL", "EffectSearchPaths"), Some(r".\reshade-shaders\Shaders\**"));
-        assert_eq!(ini.get("GENERAL", "TextureSearchPaths"), Some(r".\reshade-shaders\Textures\**"));
-        assert_eq!(ini.get("GENERAL", "PresetPath"), Some(r".\ReShadePreset.ini"));
-        assert_eq!(ini.get("GENERAL", "PreprocessorDefinitions"), Some("DLSS5_MV_PROVIDER=3"));
+        assert_eq!(
+            ini.get("GENERAL", "EffectSearchPaths"),
+            Some(r".\reshade-shaders\Shaders\**")
+        );
+        assert_eq!(
+            ini.get("GENERAL", "TextureSearchPaths"),
+            Some(r".\reshade-shaders\Textures\**")
+        );
+        assert_eq!(
+            ini.get("GENERAL", "PresetPath"),
+            Some(r".\ReShadePreset.ini")
+        );
+        assert_eq!(
+            ini.get("GENERAL", "PreprocessorDefinitions"),
+            Some("DLSS5_MV_PROVIDER=3")
+        );
     }
 
     #[test]
@@ -209,8 +251,14 @@ mod tests {
         .unwrap();
         write_reshade_ini(t.path()).unwrap();
         let ini = Ini::load(&t.path().join("ReShade.ini"));
-        assert_eq!(ini.get("GENERAL", "EffectSearchPaths"), Some(".\\custom\\**"));
-        assert_eq!(split_list(ini.get("GENERAL", "PreprocessorDefinitions").unwrap()), vec!["FOO=1", "DLSS5_MV_PROVIDER=3"]);
+        assert_eq!(
+            ini.get("GENERAL", "EffectSearchPaths"),
+            Some(".\\custom\\**")
+        );
+        assert_eq!(
+            split_list(ini.get("GENERAL", "PreprocessorDefinitions").unwrap()),
+            vec!["FOO=1", "DLSS5_MV_PROVIDER=3"]
+        );
         assert_eq!(ini.get("INPUT", "KeyOverlay"), Some("36,0,0,0"));
     }
 
@@ -219,8 +267,14 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         write_preset(t.path()).unwrap();
         let ini = Ini::load(&t.path().join("ReShadePreset.ini"));
-        assert_eq!(split_list(ini.get("", "Techniques").unwrap()), TECHNIQUES_ORDERED);
-        assert_eq!(ini.get("", "PreprocessorDefinitions"), Some("DLSS5_MV_PROVIDER=3"));
+        assert_eq!(
+            split_list(ini.get("", "Techniques").unwrap()),
+            TECHNIQUES_ORDERED
+        );
+        assert_eq!(
+            ini.get("", "PreprocessorDefinitions"),
+            Some("DLSS5_MV_PROVIDER=3")
+        );
         assert!(ini.get("", "TechniqueSorting").is_none());
     }
 
@@ -236,11 +290,21 @@ mod tests {
         let ini = Ini::load(&t.path().join("ReShadePreset.ini"));
         assert_eq!(
             split_list(ini.get("", "Techniques").unwrap()),
-            vec!["Lumenite_Kernel@lumenite_Kernel.fx", "DLSS5_Feed@DLSS5_Feed.fx", "Clarity@Clarity.fx"]
+            vec![
+                "Lumenite_Kernel@lumenite_Kernel.fx",
+                "DLSS5_Feed@DLSS5_Feed.fx",
+                "Clarity@Clarity.fx"
+            ]
         );
-        assert_eq!(&split_list(ini.get("", "TechniqueSorting").unwrap())[..2], TECHNIQUES_ORDERED);
+        assert_eq!(
+            &split_list(ini.get("", "TechniqueSorting").unwrap())[..2],
+            TECHNIQUES_ORDERED
+        );
         assert_eq!(ini.get("Clarity.fx", "Strength"), Some("0.5"));
         let text = fs::read_to_string(t.path().join("ReShadePreset.ini")).unwrap();
-        assert!(text.starts_with("Techniques="), "root keys must precede sections: {text}");
+        assert!(
+            text.starts_with("Techniques="),
+            "root keys must precede sections: {text}"
+        );
     }
 }

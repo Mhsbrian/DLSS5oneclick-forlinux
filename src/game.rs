@@ -49,7 +49,9 @@ pub fn exe_bitness(exe: &Path) -> Result<u8> {
 
 /// A ReShade proxy DLL carries a literal "ReShade" string and is >1 MB.
 pub fn is_reshade_dll(path: &Path) -> bool {
-    let Ok(meta) = fs::metadata(path) else { return false };
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
     if !meta.is_file() || meta.len() < (1 << 20) {
         return false;
     }
@@ -78,7 +80,13 @@ impl GameStatus {
         self.exe.parent().expect("exe has a parent")
     }
     pub fn complete(&self) -> bool {
-        self.reshade && self.headers && self.feeder && self.lumenite && self.dlss5_addon && self.dlssnr && self.dlss
+        self.reshade
+            && self.headers
+            && self.feeder
+            && self.lumenite
+            && self.dlss5_addon
+            && self.dlssnr
+            && self.dlss
     }
 }
 
@@ -95,7 +103,8 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         problems.push("32-bit game: DLSS5-Feeder needs the host64 setup, which this tool does not automate yet.".into());
     }
     if d.join("d3d9.dll").is_file() && !d.join(RESHADE_PROXY).is_file() {
-        problems.push("A d3d9.dll proxy is present; DirectX 9 games are not supported here.".into());
+        problems
+            .push("A d3d9.dll proxy is present; DirectX 9 games are not supported here.".into());
     }
     Ok(GameStatus {
         exe: exe.to_path_buf(),
@@ -114,9 +123,20 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
 
 /// Helper/launcher executables that are never the game.
 const NOT_GAME: [&str; 14] = [
-    "unitycrashhandler", "unrealcefsubprocess", "crashreportclient", "easyanticheat",
-    "vcredist", "vc_redist", "dxwebsetup", "dxsetup", "oalinst", "ue4prereqsetup",
-    "ueprereqsetup", "installer", "uninstall", "unins",
+    "unitycrashhandler",
+    "unrealcefsubprocess",
+    "crashreportclient",
+    "easyanticheat",
+    "vcredist",
+    "vc_redist",
+    "dxwebsetup",
+    "dxsetup",
+    "oalinst",
+    "ue4prereqsetup",
+    "ueprereqsetup",
+    "installer",
+    "uninstall",
+    "unins",
 ];
 
 fn is_helper_name(stem_lower: &str) -> bool {
@@ -124,7 +144,10 @@ fn is_helper_name(stem_lower: &str) -> bool {
 }
 
 fn norm(s: &str) -> String {
-    s.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase()
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase()
 }
 
 /// Candidate game executables in `dir`, best first.
@@ -165,7 +188,9 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
             let size = fs::metadata(&p).map(|m| m.len()).unwrap_or(0) as i64;
             let mut score: i64 = 0;
             let n = norm(&stem);
-            if !folder.is_empty() && (n == folder || n.starts_with(&folder) || folder.starts_with(&n)) {
+            if !folder.is_empty()
+                && (n == folder || n.starts_with(&folder) || folder.starts_with(&n))
+            {
                 score += 1_000_000_000;
             }
             if stem.ends_with("-shipping") {
@@ -229,8 +254,14 @@ mod tests {
     #[test]
     fn bitness_x64_and_x86() {
         let t = tempfile::tempdir().unwrap();
-        assert_eq!(exe_bitness(&make_pe(&t.path().join("a.exe"), PE_X64)).unwrap(), 64);
-        assert_eq!(exe_bitness(&make_pe(&t.path().join("b.exe"), PE_X86)).unwrap(), 32);
+        assert_eq!(
+            exe_bitness(&make_pe(&t.path().join("a.exe"), PE_X64)).unwrap(),
+            64
+        );
+        assert_eq!(
+            exe_bitness(&make_pe(&t.path().join("b.exe"), PE_X86)).unwrap(),
+            32
+        );
     }
 
     #[test]
@@ -247,7 +278,9 @@ mod tests {
         let small = t.path().join("dxgi.dll");
         fs::write(&small, b"ReShade").unwrap();
         assert!(!is_reshade_dll(&small));
-        assert!(is_reshade_dll(&make_reshade_dll(&t.path().join("real.dll"))));
+        assert!(is_reshade_dll(&make_reshade_dll(
+            &t.path().join("real.dll")
+        )));
     }
 
     #[test]
@@ -255,7 +288,15 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let st = inspect(&make_pe(&t.path().join("game.exe"), PE_X64)).unwrap();
         assert_eq!(st.bitness, 64);
-        assert!(!st.reshade && !st.headers && !st.feeder && !st.lumenite && !st.dlss5_addon && !st.dlssnr && !st.dlss);
+        assert!(
+            !st.reshade
+                && !st.headers
+                && !st.feeder
+                && !st.lumenite
+                && !st.dlss5_addon
+                && !st.dlssnr
+                && !st.dlss
+        );
         assert!(!st.complete());
         assert!(st.problems.is_empty());
 

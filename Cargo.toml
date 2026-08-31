@@ -5,6 +5,10 @@ edition = "2021"
 description = "One-click DLSS 5 neural rendering setup for DX11/DX12 games that ship without DLSS"
 license = "MIT"
 repository = "https://github.com/faisalkindi/DLSS5oneclick"
+build = "build.rs"
+
+[build-dependencies]
+winresource = "0.1"
 
 [dependencies]
 eframe = "0.36"
@@ -16,6 +20,7 @@ zip = { version = "8.6", default-features = false, features = ["deflate"] }
 regex = "1"
 anyhow = "1"
 tempfile = "3"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.61"
