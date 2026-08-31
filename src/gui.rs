@@ -114,8 +114,9 @@ impl App {
 }
 
 type RowFn = fn(&GameStatus) -> bool;
-const ROWS: [(&str, RowFn); 6] = [
+const ROWS: [(&str, RowFn); 7] = [
     ("ReShade (add-on build) as dxgi.dll", |s| s.reshade),
+    ("ReShade shader headers (ReShade.fxh …)", |s| s.headers),
     ("DLSS5-Feeder add-on + DLSS5_Feed.fx", |s| s.feeder),
     ("LumeniteFX motion vectors", |s| s.lumenite),
     ("renodx-dlss5.addon64", |s| s.dlss5_addon),

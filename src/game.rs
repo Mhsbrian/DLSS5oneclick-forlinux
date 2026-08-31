@@ -16,6 +16,10 @@ pub const DLSS_DLL: &str = "nvngx_dlss.dll";
 pub const LUMENITE_KERNEL_FX: &str = "lumenite_Kernel.fx";
 pub const LUMENITE_BLUENOISE: &str = "lumenite_bluenoise256.png";
 pub const RESHADE_PROXY: &str = "dxgi.dll";
+/// Shader headers the official installer fetches from crosire/reshade-shaders (branch `slim`).
+/// Not inside the setup exe. DLSS5_Feed.fx and every lumenite_*.fx include ReShade.fxh;
+/// DLSS5_Feed.fx also includes DrawText.fxh; ReShadeUI.fxh is the standard companion.
+pub const RESHADE_HEADERS: [&str; 3] = ["ReShade.fxh", "ReShadeUI.fxh", "DrawText.fxh"];
 pub const RESHADE_INI: &str = "ReShade.ini";
 pub const RESHADE_PRESET: &str = "ReShadePreset.ini";
 
@@ -60,6 +64,7 @@ pub struct GameStatus {
     pub exe: PathBuf,
     pub bitness: u8,
     pub reshade: bool,
+    pub headers: bool,
     pub feeder: bool,
     pub lumenite: bool,
     pub dlss5_addon: bool,
@@ -73,7 +78,7 @@ impl GameStatus {
         self.exe.parent().expect("exe has a parent")
     }
     pub fn complete(&self) -> bool {
-        self.reshade && self.feeder && self.lumenite && self.dlss5_addon && self.dlssnr && self.dlss
+        self.reshade && self.headers && self.feeder && self.lumenite && self.dlss5_addon && self.dlssnr && self.dlss
     }
 }
 
@@ -96,6 +101,7 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         exe: exe.to_path_buf(),
         bitness,
         reshade: is_reshade_dll(&d.join(RESHADE_PROXY)),
+        headers: RESHADE_HEADERS.iter().all(|h| shaders.join(h).is_file()),
         feeder: d.join(FEEDER_ADDON).is_file() && shaders.join(FEEDER_FX).is_file(),
         lumenite: shaders.join(LUMENITE_KERNEL_FX).is_file()
             && textures.join(LUMENITE_BLUENOISE).is_file(),
@@ -166,7 +172,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let st = inspect(&make_pe(&t.path().join("game.exe"), PE_X64)).unwrap();
         assert_eq!(st.bitness, 64);
-        assert!(!st.reshade && !st.feeder && !st.lumenite && !st.dlss5_addon && !st.dlssnr && !st.dlss);
+        assert!(!st.reshade && !st.headers && !st.feeder && !st.lumenite && !st.dlss5_addon && !st.dlssnr && !st.dlss);
         assert!(!st.complete());
         assert!(st.problems.is_empty());
 
@@ -186,6 +192,9 @@ mod tests {
         fs::create_dir_all(&tx).unwrap();
         for f in [FEEDER_ADDON, DLSS5_ADDON, DLSSNR_DLL, DLSS_DLL] {
             fs::write(d.join(f), b"x").unwrap();
+        }
+        for h in RESHADE_HEADERS {
+            fs::write(sh.join(h), "// header").unwrap();
         }
         fs::write(sh.join(FEEDER_FX), "technique DLSS5_Feed {}").unwrap();
         fs::write(sh.join(LUMENITE_KERNEL_FX), "technique Lumenite_Kernel {}").unwrap();

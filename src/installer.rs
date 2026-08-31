@@ -1,15 +1,17 @@
-//! The five install steps, in the order the DLSS5-Feeder README lists them.
+//! The six install steps, in the order the DLSS5-Feeder README lists them.
 //!
 //! Sources (verified 2026-08-31):
 //! 1. ReShade add-on build — https://reshade.me links `/downloads/ReShade_Setup_<ver>_Addon.exe`;
 //!    that exe has an appended ZIP with ReShade64.dll / ReShade32.dll. Dropped as dxgi.dll.
-//! 2. DLSS5-Feeder — jlrouzies-fr/DLSS5-Feeder latest release, loose assets
+//! 2. ReShade shader headers — raw.githubusercontent.com/crosire/reshade-shaders/slim/Shaders/
+//!    {ReShade.fxh, ReShadeUI.fxh, DrawText.fxh}; the setup exe only carries the DLLs.
+//! 3. DLSS5-Feeder — jlrouzies-fr/DLSS5-Feeder latest release, loose assets
 //!    `dlss5-feed.addon64` + `DLSS5_Feed.fx` (the `feed-vk-layer.zip` is Vulkan-only, unused).
-//! 3. LumeniteFX — umar-afzaal/LumeniteFX branch `mainline` (no releases):
+//! 4. LumeniteFX — umar-afzaal/LumeniteFX branch `mainline` (no releases):
 //!    Shaders/lumenite_*.fx, Shaders/include/*.fxh, Textures/lumenite_bluenoise256.png.
-//! 4. DLSS 5 add-on — RankFTW/rhi-repo releases: `renodx-dlss5-*` (renodx-dlss5.addon64),
+//! 5. DLSS 5 add-on — RankFTW/rhi-repo releases: `renodx-dlss5-*` (renodx-dlss5.addon64),
 //!    `dlssnr-*` (nvngx_dlssnr.dll), `dlss-*` (nvngx_dlss.dll; not dlssg-/dlssd-).
-//! 5. ReShade.ini + ReShadePreset.ini: DLSS5_MV_PROVIDER=3, Lumenite_Kernel above DLSS5_Feed.
+//! 6. ReShade.ini + ReShadePreset.ini: DLSS5_MV_PROVIDER=3, Lumenite_Kernel above DLSS5_Feed.
 
 use crate::game::{self, GameStatus};
 use crate::net::{self, Progress};
@@ -22,6 +24,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const RESHADE_HOME: &str = "https://reshade.me";
+pub const RESHADE_SHADERS_RAW: &str = "https://raw.githubusercontent.com/crosire/reshade-shaders/slim/Shaders/";
 pub const FEEDER_LATEST: &str = "https://api.github.com/repos/jlrouzies-fr/DLSS5-Feeder/releases/latest";
 pub const LUMENITE_ZIP: &str = "https://codeload.github.com/umar-afzaal/LumeniteFX/zip/refs/heads/mainline";
 pub const RHI_RELEASES: &str = "https://api.github.com/repos/RankFTW/rhi-repo/releases?per_page=100";
@@ -31,8 +34,9 @@ pub struct Step {
     pub run: fn(&Client, &GameStatus, &Path, Progress) -> Result<Vec<String>>,
 }
 
-pub const STEPS: [Step; 5] = [
+pub const STEPS: [Step; 6] = [
     Step { name: "ReShade (add-on build)", run: step_reshade },
+    Step { name: "ReShade shader headers", run: step_headers },
     Step { name: "DLSS5-Feeder", run: step_feeder },
     Step { name: "LumeniteFX motion vectors", run: step_lumenite },
     Step { name: "DLSS 5 add-on + models", run: step_dlss5 },
@@ -133,7 +137,26 @@ fn step_reshade(client: &Client, st: &GameStatus, work: &Path, progress: Progres
     install_reshade_from_setup(&setup, st.game_dir(), st.bitness)
 }
 
-// ── step 2: DLSS5-Feeder ───────────────────────────────────────────
+// ── step 2: ReShade shader headers ────────────────────────────────
+
+fn step_headers(client: &Client, st: &GameStatus, _work: &Path, progress: Progress) -> Result<Vec<String>> {
+    let shaders = st.game_dir().join("reshade-shaders").join("Shaders");
+    let mut installed = Vec::new();
+    for h in game::RESHADE_HEADERS {
+        let dest = shaders.join(h);
+        if dest.is_file() {
+            continue;
+        }
+        net::download(client, &format!("{RESHADE_SHADERS_RAW}{h}"), &dest, h, progress)?;
+        installed.push(format!("reshade-shaders/Shaders/{h}"));
+    }
+    if installed.is_empty() {
+        progress(100, "ReShade shader headers already present");
+    }
+    Ok(installed)
+}
+
+// ── step 3: DLSS5-Feeder ───────────────────────────────────────────
 
 fn step_feeder(client: &Client, st: &GameStatus, _work: &Path, progress: Progress) -> Result<Vec<String>> {
     if st.feeder {
@@ -150,7 +173,7 @@ fn step_feeder(client: &Client, st: &GameStatus, _work: &Path, progress: Progres
     Ok(vec![game::FEEDER_ADDON.into(), format!("reshade-shaders/Shaders/{}", game::FEEDER_FX)])
 }
 
-// ── step 3: LumeniteFX ─────────────────────────────────────────────
+// ── step 4: LumeniteFX ─────────────────────────────────────────────
 
 pub fn install_lumenite_from_zip(zip_path: &Path, game_dir: &Path) -> Result<Vec<String>> {
     let shaders = game_dir.join("reshade-shaders").join("Shaders");
@@ -188,7 +211,7 @@ fn step_lumenite(client: &Client, st: &GameStatus, work: &Path, progress: Progre
     install_lumenite_from_zip(&z, st.game_dir())
 }
 
-// ── step 4: DLSS 5 add-on + models ─────────────────────────────────
+// ── step 5: DLSS 5 add-on + models ─────────────────────────────────
 
 pub fn install_single_from_zip(zip_path: &Path, member_name: &str, dest: &Path) -> Result<()> {
     let f = fs::File::open(zip_path)?;
@@ -228,7 +251,7 @@ fn step_dlss5(client: &Client, st: &GameStatus, work: &Path, progress: Progress)
     Ok(installed)
 }
 
-// ── step 5: config ─────────────────────────────────────────────────
+// ── step 6: config ─────────────────────────────────────────────────
 
 fn step_config(_c: &Client, st: &GameStatus, _w: &Path, progress: Progress) -> Result<Vec<String>> {
     reshade_ini::write_reshade_ini(st.game_dir())?;
@@ -285,6 +308,7 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
         shaders.join(game::FEEDER_FX),
         d.join("reshade-shaders").join("Textures").join(game::LUMENITE_BLUENOISE),
     ];
+    targets.extend(game::RESHADE_HEADERS.iter().map(|h| shaders.join(h)));
     for (dir, ext) in [(&shaders, "fx"), (&include, "fxh")] {
         if let Ok(rd) = fs::read_dir(dir) {
             for e in rd.flatten() {

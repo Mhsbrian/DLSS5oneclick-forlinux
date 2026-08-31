@@ -7,6 +7,7 @@ It does, in order, exactly what the [DLSS5-Feeder README](https://github.com/jlr
 | Step | What | From |
 |---|---|---|
 | 1 | ReShade **with add-on support**, dropped as `dxgi.dll` | `ReShade_Setup_<ver>_Addon.exe` on [reshade.me](https://reshade.me) (DLL pulled straight out of the installer, nothing is run) |
+| 1b | `ReShade.fxh`, `ReShadeUI.fxh`, `DrawText.fxh` into `reshade-shaders\Shaders` (the setup exe has only the DLLs; every shader below includes `ReShade.fxh`) | [crosire/reshade-shaders](https://github.com/crosire/reshade-shaders/tree/slim/Shaders) (`slim` branch) |
 | 2 | `dlss5-feed.addon64` + `DLSS5_Feed.fx` | [jlrouzies-fr/DLSS5-Feeder](https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest) |
 | 3 | Motion-vector provider: `lumenite_*.fx`, `include\*.fxh`, `lumenite_bluenoise256.png` | [umar-afzaal/LumeniteFX](https://github.com/umar-afzaal/LumeniteFX) (`mainline` branch) |
 | 4 | `renodx-dlss5.addon64`, `nvngx_dlssnr.dll`, `nvngx_dlss.dll` | [RankFTW/rhi-repo](https://github.com/RankFTW/rhi-repo/releases) releases (`renodx-dlss5-*`, `dlssnr-*`, `dlss-*`) |
