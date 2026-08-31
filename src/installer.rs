@@ -30,40 +30,75 @@ pub const FEEDER_LATEST: &str =
     "https://api.github.com/repos/jlrouzies-fr/DLSS5-Feeder/releases/latest";
 pub const LUMENITE_ZIP: &str =
     "https://codeload.github.com/umar-afzaal/LumeniteFX/zip/refs/heads/mainline";
+pub const BRIDGE_LATEST: &str =
+    "https://api.github.com/repos/NIGos/dlss5-dx11-bridge/releases/latest";
 pub const RHI_RELEASES: &str =
     "https://api.github.com/repos/RankFTW/rhi-repo/releases?per_page=100";
 
+#[derive(Clone, Copy)]
 pub struct Step {
     pub name: &'static str,
     pub run: fn(&Client, &GameStatus, &Path, Progress) -> Result<Vec<String>>,
 }
 
-pub const STEPS: [Step; 6] = [
-    Step {
-        name: "ReShade (add-on build)",
-        run: step_reshade,
-    },
-    Step {
-        name: "ReShade shader headers",
-        run: step_headers,
-    },
-    Step {
-        name: "DLSS5-Feeder",
-        run: step_feeder,
-    },
-    Step {
-        name: "LumeniteFX motion vectors",
-        run: step_lumenite,
-    },
-    Step {
-        name: "DLSS 5 add-on + models",
-        run: step_dlss5,
-    },
-    Step {
-        name: "ReShade config",
-        run: step_config,
-    },
-];
+const STEP_RESHADE: Step = Step {
+    name: "ReShade (add-on build)",
+    run: step_reshade,
+};
+const STEP_HEADERS: Step = Step {
+    name: "ReShade shader headers",
+    run: step_headers,
+};
+const STEP_FEEDER: Step = Step {
+    name: "DLSS5-Feeder",
+    run: step_feeder,
+};
+const STEP_LUMENITE: Step = Step {
+    name: "LumeniteFX motion vectors",
+    run: step_lumenite,
+};
+const STEP_DLSS5: Step = Step {
+    name: "DLSS 5 add-on + models",
+    run: step_dlss5,
+};
+const STEP_BRIDGE: Step = Step {
+    name: "DLSS 5 DX11 bridge",
+    run: step_bridge,
+};
+const STEP_CONFIG: Step = Step {
+    name: "ReShade config",
+    run: step_config,
+};
+const STEP_FEEDER_CLEANUP: Step = Step {
+    name: "Remove DLSS5-Feeder (game has native DLSS)",
+    run: step_feeder_cleanup,
+};
+
+/// Steps for a game, by install path.
+pub fn plan(st: &GameStatus) -> Vec<Step> {
+    match st.mode {
+        game::Mode::Feeder => vec![
+            STEP_RESHADE,
+            STEP_HEADERS,
+            STEP_FEEDER,
+            STEP_LUMENITE,
+            STEP_DLSS5,
+            STEP_CONFIG,
+        ],
+        game::Mode::Native => {
+            let mut v = vec![STEP_RESHADE];
+            if st.feeder {
+                v.push(STEP_FEEDER_CLEANUP);
+            }
+            v.push(STEP_DLSS5);
+            if st.needs_bridge() {
+                v.push(STEP_BRIDGE);
+            }
+            v.push(STEP_CONFIG);
+            v
+        }
+    }
+}
 
 // ── release picking ────────────────────────────────────────────────
 
@@ -341,10 +376,12 @@ fn step_dlss5(
     work: &Path,
     progress: Progress,
 ) -> Result<Vec<String>> {
+    // A game with its own DLSS keeps its own nvngx_dlss.dll.
+    let dlss_present = st.dlss || st.mode == game::Mode::Native;
     let plan = [
         ("renodx-dlss5-", game::DLSS5_ADDON, st.dlss5_addon),
         ("dlssnr-", game::DLSSNR_DLL, st.dlssnr),
-        ("dlss-", game::DLSS_DLL, st.dlss),
+        ("dlss-", game::DLSS_DLL, dlss_present),
     ];
     if plan.iter().all(|(_, _, present)| *present) {
         progress(100, "DLSS 5 add-on already present");
@@ -364,15 +401,92 @@ fn step_dlss5(
         let z = work.join(format!("{tag}.zip"));
         net::download(client, &url, &z, fname, progress)?;
         install_single_from_zip(&z, fname, &st.game_dir().join(fname))?;
+        if fname == game::DLSS_DLL {
+            fs::write(st.game_dir().join(game::DLSS_MARKER), tag.as_bytes())?;
+        }
         installed.push(format!("{fname} ({tag})"));
     }
     Ok(installed)
+}
+
+// ── native mode: a Feeder left over from an earlier install must go ─
+
+fn step_feeder_cleanup(
+    _c: &Client,
+    st: &GameStatus,
+    _w: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    let d = st.game_dir();
+    let mut removed = Vec::new();
+    for f in [
+        d.join(game::FEEDER_ADDON),
+        d.join("reshade-shaders")
+            .join("Shaders")
+            .join(game::FEEDER_FX),
+    ] {
+        if f.is_file() {
+            fs::remove_file(&f)?;
+            removed.push(
+                f.strip_prefix(d)
+                    .unwrap_or(&f)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
+        }
+    }
+    reshade_ini::remove_our_techniques(d)?;
+    progress(
+        100,
+        "DLSS5-Feeder removed; the add-on hooks the game's own DLSS",
+    );
+    Ok(removed)
+}
+
+// ── step 5b: DX11 bridge (native-DLSS games rendering with D3D11) ──
+
+fn step_bridge(
+    client: &Client,
+    st: &GameStatus,
+    _work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    if st.bridge {
+        progress(100, "DX11 bridge already installed");
+        return Ok(vec![]);
+    }
+    progress(0, "Looking up latest dlss5-dx11-bridge");
+    let release = net::get_json(client, BRIDGE_LATEST)?;
+    let url = release
+        .get("assets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|a| {
+            a.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| n.eq_ignore_ascii_case(game::BRIDGE_ADDON))
+        })
+        .and_then(|a| a.get("browser_download_url").and_then(Value::as_str))
+        .ok_or_else(|| anyhow!("dlss5-dx11-bridge release has no {}", game::BRIDGE_ADDON))?;
+    net::download(
+        client,
+        url,
+        &st.game_dir().join(game::BRIDGE_ADDON),
+        game::BRIDGE_ADDON,
+        progress,
+    )?;
+    Ok(vec![game::BRIDGE_ADDON.into()])
 }
 
 // ── step 6: config ─────────────────────────────────────────────────
 
 fn step_config(_c: &Client, st: &GameStatus, _w: &Path, progress: Progress) -> Result<Vec<String>> {
     reshade_ini::write_reshade_ini(st.game_dir())?;
+    if st.mode == game::Mode::Native {
+        progress(100, "ReShade.ini written");
+        return Ok(vec![game::RESHADE_INI.into()]);
+    }
     reshade_ini::write_preset(st.game_dir())?;
     progress(100, "ReShade.ini + ReShadePreset.ini written");
     Ok(vec![game::RESHADE_INI.into(), game::RESHADE_PRESET.into()])
@@ -390,7 +504,7 @@ pub enum StepState {
 pub fn run_all(
     exe: &Path,
     progress: Progress,
-    step_cb: &(dyn Fn(usize, &str, StepState, &str) + Sync),
+    step_cb: &(dyn Fn(usize, usize, &str, StepState, &str) + Sync),
 ) -> Result<Vec<(String, Vec<String>)>> {
     let mut st = game::inspect(exe)?;
     if !st.problems.is_empty() {
@@ -400,9 +514,11 @@ pub fn run_all(
     let work = tempfile::Builder::new()
         .prefix("dlss5oneclick-")
         .tempdir()?;
+    let steps = plan(&st);
+    let n = steps.len();
     let mut results = Vec::new();
-    for (i, step) in STEPS.iter().enumerate() {
-        step_cb(i, step.name, StepState::Start, "");
+    for (i, step) in steps.iter().enumerate() {
+        step_cb(i, n, step.name, StepState::Start, "");
         match (step.run)(&client, &st, work.path(), progress) {
             Ok(files) => {
                 let detail = if files.is_empty() {
@@ -410,12 +526,12 @@ pub fn run_all(
                 } else {
                     files.join(", ")
                 };
-                step_cb(i, step.name, StepState::Done, &detail);
+                step_cb(i, n, step.name, StepState::Done, &detail);
                 results.push((step.name.to_owned(), files));
             }
             Err(e) => {
                 let msg = format!("{e:#}");
-                step_cb(i, step.name, StepState::Error, &msg);
+                step_cb(i, n, step.name, StepState::Error, &msg);
                 return Err(anyhow!("{}: {msg}", step.name));
             }
         }
@@ -430,9 +546,11 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
     let shaders = d.join("reshade-shaders").join("Shaders");
     let include = shaders.join("include");
     let mut targets: Vec<PathBuf> = vec![
+        d.join(game::DLSS_MARKER),
         d.join(game::FEEDER_ADDON),
         d.join(game::DLSS5_ADDON),
         d.join(game::DLSSNR_DLL),
+        d.join(game::BRIDGE_ADDON),
         shaders.join(game::FEEDER_FX),
         d.join("reshade-shaders")
             .join("Textures")
@@ -448,6 +566,9 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
                 }
             }
         }
+    }
+    if d.join(game::DLSS_MARKER).is_file() {
+        targets.push(d.join(game::DLSS_DLL));
     }
     let mut removed = Vec::new();
     for t in targets {
@@ -621,10 +742,34 @@ mod tests {
     }
 
     #[test]
+    fn plan_follows_mode_and_api() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe(&t.path().join("game.exe"), game::PE_X64);
+        let mut st = game::inspect(&exe).unwrap();
+        let names: Vec<&str> = plan(&st).iter().map(|s| s.name).collect();
+        assert_eq!(names.len(), 6);
+        assert_eq!(names[2], "DLSS5-Feeder");
+        st.mode = game::Mode::Native;
+        st.api = game::Api::Dx12;
+        let names: Vec<&str> = plan(&st).iter().map(|s| s.name).collect();
+        assert_eq!(
+            names,
+            [
+                "ReShade (add-on build)",
+                "DLSS 5 add-on + models",
+                "ReShade config"
+            ]
+        );
+        st.api = game::Api::Dx11;
+        let names: Vec<&str> = plan(&st).iter().map(|s| s.name).collect();
+        assert_eq!(names[2], "DLSS 5 DX11 bridge");
+    }
+
+    #[test]
     fn run_all_refuses_32bit_before_network() {
         let t = tempfile::tempdir().unwrap();
         let exe = make_pe(&t.path().join("game.exe"), game::PE_X86);
-        let err = run_all(&exe, &|_, _| {}, &|_, _, _, _| {}).unwrap_err();
+        let err = run_all(&exe, &|_, _| {}, &|_, _, _, _, _| {}).unwrap_err();
         assert!(err.to_string().contains("32-bit"));
     }
 }

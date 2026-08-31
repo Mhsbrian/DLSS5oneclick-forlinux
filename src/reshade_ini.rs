@@ -206,6 +206,25 @@ pub fn write_preset(game_dir: &Path) -> Result<()> {
     ini.save(&p)
 }
 
+/// Drop Lumenite_Kernel / DLSS5_Feed from an existing preset (native-DLSS games do not use them).
+pub fn remove_our_techniques(game_dir: &Path) -> Result<()> {
+    let p = game_dir.join("ReShadePreset.ini");
+    if !p.is_file() {
+        return Ok(());
+    }
+    let mut ini = Ini::load(&p);
+    for key in ["Techniques", "TechniqueSorting"] {
+        if let Some(raw) = ini.get("", key) {
+            let kept: Vec<String> = split_list(raw)
+                .into_iter()
+                .filter(|t| !TECHNIQUES_ORDERED.contains(&t.as_str()))
+                .collect();
+            ini.set("", key, join_list(&kept));
+        }
+    }
+    ini.save(&p)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,6 +279,25 @@ mod tests {
             vec!["FOO=1", "DLSS5_MV_PROVIDER=3"]
         );
         assert_eq!(ini.get("INPUT", "KeyOverlay"), Some("36,0,0,0"));
+    }
+
+    #[test]
+    fn remove_our_techniques_keeps_user_ones() {
+        let t = tempfile::tempdir().unwrap();
+        write_preset(t.path()).unwrap();
+        let p = t.path().join("ReShadePreset.ini");
+        let mut ini = Ini::load(&p);
+        ini.set(
+            "",
+            "Techniques",
+            "Lumenite_Kernel@lumenite_Kernel.fx,DLSS5_Feed@DLSS5_Feed.fx,Clarity@Clarity.fx",
+        );
+        ini.save(&p).unwrap();
+        remove_our_techniques(t.path()).unwrap();
+        assert_eq!(
+            Ini::load(&p).get("", "Techniques"),
+            Some("Clarity@Clarity.fx")
+        );
     }
 
     #[test]

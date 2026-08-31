@@ -1,8 +1,19 @@
 # DLSS5oneclick
 
-One button that sets up the **leaked DLSS 5 neural-rendering build** in a DirectX 11/12 game that has no DLSS of its own. Single native Windows exe, no runtime.
+One button that sets up the **leaked DLSS 5 neural-rendering build** in any DirectX 11/12 game, with or without DLSS of its own. Single native Windows exe, no runtime.
 
 Download: [latest release](https://github.com/faisalkindi/DLSS5oneclick/releases/latest) → `dlss5oneclick.exe`.
+
+## Two paths, picked automatically
+
+| The game | What gets installed |
+|---|---|
+| **Ships its own DLSS** (any `nvngx_dlss.dll`, Streamline `sl.*.dll`, `nvngx_dlssg/dlssd.dll` in its tree) | ReShade add-on build + the DLSS 5 add-on (`renodx-dlss5.addon64`, `nvngx_dlssnr.dll`). The add-on hooks the game's own NGX calls directly. **DX11 games** also get [dlss5-dx11-bridge](https://github.com/NIGos/dlss5-dx11-bridge), which replays the D3D11 DLSS calls on a private D3D12 device so the add-on can see them. No Feeder, no LumeniteFX; a Feeder left over from an earlier run is removed. |
+| **Has no DLSS** | The full Feeder path below: ReShade + shader headers + DLSS5-Feeder + LumeniteFX + the DLSS 5 add-on + config. |
+
+DX11 vs DX12 is read from the exe's import table, then from the engine DLLs next to it (`UnityPlayer.dll`, ...). When neither says, DX12 is assumed and the status line says so. `dlss5oneclick.exe "<game folder>" --check` prints the detected mode, API and plan without installing anything.
+
+### The no-DLSS path
 
 It does, in order, exactly what the [DLSS5-Feeder README](https://github.com/jlrouzies-fr/DLSS5-Feeder#install-for-a-64-bit-game) tells you to do by hand:
 
@@ -26,13 +37,12 @@ Every file is downloaded fresh from its upstream at install time. Nothing third-
 
 `dlss5-feed.log` next to the game exe should show `feature ready … DLAA` and `DLSS5_MV_PROVIDER=3 (LumeniteFX Kernel) -> Lumenite_Kernel (enabled)`.
 
-CLI: `dlss5oneclick.exe "C:\Games\Foo"` (folder or exe) / `--remove` (headless, prints progress).
+CLI: `dlss5oneclick.exe "C:\Games\Foo"` (folder or exe) / `--check` (detect only) / `--remove` (headless, prints progress).
 
 ## Not handled
 
 - **32-bit games** — need the `host64` helper setup (see Feeder README); the tool refuses rather than half-install.
 - **DirectX 9** and **Vulkan** games — different proxy / a Vulkan layer; refused.
-- Games that already have DLSS — use [dlss5-dx11-bridge](https://github.com/NIGos/dlss5-dx11-bridge) instead, not this.
 - Online games — ReShade with add-ons trips anti-cheat.
 
 ## Development
@@ -57,6 +67,7 @@ This tool only automates other people's work. The credit belongs to:
 - **[RankFTW](https://github.com/RankFTW)** — [RHI](https://github.com/RankFTW/RHI) and the [rhi-repo](https://github.com/RankFTW/rhi-repo) releases that host the DLSS 5 add-on and the NVIDIA runtimes.
 - **NVIDIA** — DLSS 5 itself and the `nvngx_dlssnr.dll` / `nvngx_dlss.dll` runtimes.
 - **DSOGaming** — the [article](https://www.dsogaming.com/articles/heres-how-you-can-install-dlss-5-to-all-dx9-dx10-dx11-dx12-and-vulkan-games/) that put the pieces together and started this.
+- **[NIGos](https://github.com/NIGos)** — [dlss5-dx11-bridge](https://github.com/NIGos/dlss5-dx11-bridge), which lets the DLSS 5 add-on work in D3D11 games that have their own DLSS.
 - **[emilk](https://github.com/emilk)** — [egui / eframe](https://github.com/emilk/egui), the UI toolkit.
 - Fonts: [Sora](https://github.com/sora-xor/sora-font) by the Sora project, [IBM Plex Sans](https://github.com/IBM/plex) by IBM, [JetBrains Mono](https://github.com/JetBrains/JetBrainsMono) by JetBrains — all SIL OFL.
 

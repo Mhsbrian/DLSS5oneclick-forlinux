@@ -11,12 +11,16 @@ mod theme;
 use std::io::Write;
 use std::path::PathBuf;
 
-/// `dlss5oneclick <GAME.exe | game folder> [--remove]` runs headless; no args opens the GUI.
+/// `dlss5oneclick <GAME.exe | game folder> [--remove | --check]` runs headless; no args opens the GUI.
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(first) = args.first().filter(|a| !a.starts_with('-')) {
         attach_parent_console();
-        let code = cli(PathBuf::from(first), args.iter().any(|a| a == "--remove"));
+        let code = cli(
+            PathBuf::from(first),
+            args.iter().any(|a| a == "--remove"),
+            args.iter().any(|a| a == "--check"),
+        );
         std::process::exit(code);
     }
     if let Err(e) = gui::run() {
@@ -25,7 +29,7 @@ fn main() {
     }
 }
 
-fn cli(target: PathBuf, remove: bool) -> i32 {
+fn cli(target: PathBuf, remove: bool, check: bool) -> i32 {
     let (exe, candidates) = match game::resolve_target(&target) {
         Ok(v) => v,
         Err(e) => {
@@ -51,6 +55,27 @@ fn cli(target: PathBuf, remove: bool) -> i32 {
     } else if !candidates.is_empty() {
         println!("using {}", exe.display());
     }
+    if check {
+        return match game::inspect(&exe) {
+            Ok(st) => {
+                println!(
+                    "{} | {}-bit | {} | mode={:?} | reshade={} headers={} feeder={} lumenite={} dlss5={} dlssnr={} dlss={} bridge={} | complete={}",
+                    exe.display(), st.bitness, st.api.label(), st.mode, st.reshade, st.headers, st.feeder,
+                    st.lumenite, st.dlss5_addon, st.dlssnr, st.dlss, st.bridge, st.complete()
+                );
+                for p in &st.problems {
+                    println!("  ! {p}");
+                }
+                let names: Vec<&str> = installer::plan(&st).iter().map(|s| s.name).collect();
+                println!("  plan: {}", names.join(" -> "));
+                0
+            }
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                1
+            }
+        };
+    }
     if remove {
         return match installer::uninstall(&exe) {
             Ok(list) => {
@@ -69,8 +94,7 @@ fn cli(target: PathBuf, remove: bool) -> i32 {
         print!("\r{pct:3}% {msg:<72}");
         let _ = std::io::stdout().flush();
     };
-    let n = installer::STEPS.len();
-    let step = move |i: usize, name: &str, state: installer::StepState, detail: &str| {
+    let step = move |i: usize, n: usize, name: &str, state: installer::StepState, detail: &str| {
         use installer::StepState::*;
         match state {
             Start => println!("\n[{}/{n}] {name}", i + 1),

@@ -2,7 +2,7 @@
 //! tiles, one Install button, progress, log.
 
 use crate::game::{self, GameStatus};
-use crate::installer::{self, StepState, STEPS};
+use crate::installer::{self, StepState};
 use crate::logo;
 use crate::theme::{self as t};
 use eframe::egui::{
@@ -129,7 +129,6 @@ impl App {
                     })
                     .map_err(|e| format!("{e:#}"))
             } else {
-                let n = STEPS.len();
                 let p_tx = tx.clone();
                 let s_tx = tx.clone();
                 installer::run_all(
@@ -137,7 +136,7 @@ impl App {
                     &move |pct, msg| {
                         let _ = p_tx.send(Msg::Progress(pct, msg.to_owned()));
                     },
-                    &move |i, name, state, detail| {
+                    &move |i, n, name, state, detail| {
                         let line = match state {
                             StepState::Start => LogLine::Step(format!("[{}/{n}] {name}", i + 1)),
                             StepState::Done => LogLine::Ok(format!("ok: {detail}")),
@@ -193,7 +192,7 @@ struct Tile {
     optional: bool,
 }
 
-const TILES: [Tile; 6] = [
+const TILES_FEEDER: [Tile; 6] = [
     Tile {
         title: "ReShade",
         detail: "add-on build · dxgi.dll",
@@ -231,6 +230,46 @@ const TILES: [Tile; 6] = [
         optional: true,
     },
 ];
+
+const TILES_NATIVE: [Tile; 4] = [
+    Tile {
+        title: "Game DLSS",
+        detail: "nvngx_dlss.dll shipped by the game · add-on hooks it directly",
+        ok: |_| true,
+        optional: false,
+    },
+    Tile {
+        title: "ReShade",
+        detail: "add-on build · dxgi.dll",
+        ok: |s| s.reshade,
+        optional: false,
+    },
+    Tile {
+        title: "DLSS 5 add-on · leaked",
+        detail: "renodx-dlss5.addon64 · nvngx_dlssnr.dll",
+        ok: |s| s.dlss5_addon && s.dlssnr,
+        optional: false,
+    },
+    Tile {
+        title: "DX11 bridge",
+        detail: "dlss5-dx11-bridge.addon64 · only for D3D11 games",
+        ok: |s| s.bridge,
+        optional: true,
+    },
+];
+
+fn tiles_for(st: Option<&GameStatus>) -> Vec<&'static Tile> {
+    match st.map(|s| s.mode) {
+        Some(game::Mode::Native) => {
+            let needs_bridge = st.is_some_and(|s| s.needs_bridge());
+            TILES_NATIVE
+                .iter()
+                .filter(|t| t.title != "DX11 bridge" || needs_bridge)
+                .collect()
+        }
+        _ => TILES_FEEDER.iter().collect(),
+    }
+}
 
 fn chip(ui: &mut egui::Ui, text: &str, color: Color32, outlined: bool) {
     Frame::new()
@@ -326,7 +365,7 @@ impl eframe::App for App {
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 1.0;
                         ui.label(RichText::new("DLSS5oneclick").font(t::sora(15.0)).color(t::TEXT));
-                        ui.label(RichText::new("Sets up the leaked DLSS 5 neural-rendering build in games that ship without DLSS")
+                        ui.label(RichText::new("Sets up the leaked DLSS 5 neural-rendering build in any DX11/DX12 game, with or without DLSS")
                             .font(t::plex(11.0)).color(t::TEXT_MUTED));
                     });
                     chip(ui, "LEAKED BUILD", t::ACCENT, true);
@@ -420,7 +459,15 @@ impl eframe::App for App {
                             chip(ui, &short(&exe), t::TEXT_SOFT, false);
                         }
                         if let Some(s) = &ok_status {
-                            ui.label(RichText::new(format!("{}-bit", s.bitness)).font(t::plex(12.0)).color(t::TEXT_DIM));
+                            let mode = match s.mode {
+                                game::Mode::Native => "native DLSS · add-on hooks the game",
+                                game::Mode::Feeder => "no DLSS · Feeder path",
+                            };
+                            ui.label(
+                                RichText::new(format!("{}-bit · {} · {mode}", s.bitness, s.api.label()))
+                                    .font(t::plex(12.0))
+                                    .color(t::TEXT_DIM),
+                            );
                         }
                     });
                 }
@@ -433,7 +480,8 @@ impl eframe::App for App {
                 let tile_h = 58.0;
                 let row_w = ui.available_width();
                 let col_w = ((row_w - gap) / 2.0).floor();
-                for row in TILES.chunks(2) {
+                let tiles = tiles_for(ok_status.as_ref());
+                for row in tiles.chunks(2) {
                     let (row_rect, _) =
                         ui.allocate_exact_size(Vec2::new(row_w, tile_h), egui::Sense::hover());
                     for (i, tl) in row.iter().enumerate() {

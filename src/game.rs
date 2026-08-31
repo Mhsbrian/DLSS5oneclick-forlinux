@@ -15,6 +15,9 @@ pub const DLSSNR_DLL: &str = "nvngx_dlssnr.dll";
 pub const DLSS_DLL: &str = "nvngx_dlss.dll";
 pub const LUMENITE_KERNEL_FX: &str = "lumenite_Kernel.fx";
 pub const LUMENITE_BLUENOISE: &str = "lumenite_bluenoise256.png";
+pub const BRIDGE_ADDON: &str = "dlss5-dx11-bridge.addon64";
+/// Sidecar written next to an `nvngx_dlss.dll` this tool placed, so it is never mistaken for the game's own.
+pub const DLSS_MARKER: &str = "nvngx_dlss.dll.dlss5oneclick";
 pub const RESHADE_PROXY: &str = "dxgi.dll";
 /// Shader headers the official installer fetches from crosire/reshade-shaders (branch `slim`).
 /// Not inside the setup exe. DLSS5_Feed.fx and every lumenite_*.fx include ReShade.fxh;
@@ -61,8 +64,205 @@ pub fn is_reshade_dll(path: &Path) -> bool {
     }
 }
 
+/// Which install path applies to a game.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Game has no DLSS: DLSS5-Feeder + LumeniteFX fake the DLSS contract.
+    Feeder,
+    /// Game ships its own DLSS: the DLSS 5 add-on hooks the game's NGX calls directly
+    /// (plus dlss5-dx11-bridge when the game renders with D3D11).
+    Native,
+}
+
+/// Graphics API the exe imports, from its PE import table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Api {
+    Dx11,
+    Dx12,
+    /// Neither d3d11.dll nor d3d12.dll is a static import (loaded at runtime, or DX9/Vulkan).
+    Unknown,
+}
+
+impl Api {
+    pub fn label(self) -> &'static str {
+        match self {
+            Api::Dx11 => "DX11",
+            Api::Dx12 => "DX12",
+            Api::Unknown => "API unknown, assuming DX12",
+        }
+    }
+}
+
+/// Lower-cased DLL names from the exe's static import table. Empty on any parse problem.
+pub fn pe_imports(exe: &Path) -> Vec<String> {
+    let Ok(data) = fs::read(exe) else {
+        return vec![];
+    };
+    let rd32 = |o: usize| -> Option<u32> {
+        data.get(o..o + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let rd16 =
+        |o: usize| -> Option<u16> { data.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]])) };
+    let parse = || -> Option<Vec<String>> {
+        if data.get(..2)? != b"MZ" {
+            return None;
+        }
+        let pe = rd32(0x3C)? as usize;
+        if data.get(pe..pe + 4)? != b"PE\0\0" {
+            return None;
+        }
+        let coff = pe + 4;
+        let nsec = rd16(coff + 2)? as usize;
+        let opt_size = rd16(coff + 16)? as usize;
+        let opt = coff + 20;
+        let magic = rd16(opt)?;
+        let dd_off = match magic {
+            0x20B => 112,
+            0x10B => 96,
+            _ => return None,
+        };
+        let import_rva = rd32(opt + dd_off + 8)? as usize;
+        if import_rva == 0 {
+            return Some(vec![]);
+        }
+        let sec = opt + opt_size;
+        let mut sections = Vec::new();
+        for i in 0..nsec {
+            let s = sec + i * 40;
+            sections.push((
+                rd32(s + 12)? as usize,
+                rd32(s + 16)? as usize,
+                rd32(s + 20)? as usize,
+            ));
+        }
+        let to_off = |rva: usize| -> Option<usize> {
+            sections
+                .iter()
+                .find(|(va, size, _)| rva >= *va && rva < va + size)
+                .map(|(va, _, raw)| raw + (rva - va))
+        };
+        let mut names = Vec::new();
+        let mut desc = to_off(import_rva)?;
+        for _ in 0..512 {
+            let name_rva = rd32(desc + 12)? as usize;
+            if name_rva == 0 && rd32(desc)? == 0 {
+                break;
+            }
+            if let Some(off) = to_off(name_rva) {
+                let end = data[off..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .map(|n| off + n)
+                    .unwrap_or(off);
+                names.push(String::from_utf8_lossy(&data[off..end]).to_ascii_lowercase());
+            }
+            desc += 20;
+        }
+        Some(names)
+    };
+    parse().unwrap_or_default()
+}
+
+pub fn detect_api(exe: &Path) -> Api {
+    fn classify(imports: &[String]) -> Api {
+        let has = |n: &str| imports.iter().any(|i| i == n);
+        if has("d3d12.dll") {
+            Api::Dx12
+        } else if has("d3d11.dll") {
+            Api::Dx11
+        } else {
+            Api::Unknown
+        }
+    }
+    let api = classify(&pe_imports(exe));
+    if api != Api::Unknown {
+        return api;
+    }
+    // Engines like Unity and Unreal load D3D from an engine DLL next to the exe
+    // (UnityPlayer.dll, *-Win64-Shipping.dll, ...). Scan those, largest first,
+    // skipping proxies/add-ons that would mislead (dxgi.dll, d3d*.dll, nvngx*).
+    let Some(dir) = exe.parent() else {
+        return Api::Unknown;
+    };
+    let Ok(rd) = fs::read_dir(dir) else {
+        return Api::Unknown;
+    };
+    let mut dlls: Vec<(u64, PathBuf)> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("dll")))
+        .filter(|p| {
+            let n = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            !(n.starts_with("dxgi")
+                || n.starts_with("d3d")
+                || n.starts_with("nvngx")
+                || n.starts_with("reshade"))
+        })
+        .filter_map(|p| fs::metadata(&p).ok().map(|m| (m.len(), p)))
+        .collect();
+    dlls.sort_by_key(|(size, _)| std::cmp::Reverse(*size));
+    let mut seen_dx11 = false;
+    for (_, dll) in dlls.into_iter().take(12) {
+        match classify(&pe_imports(&dll)) {
+            Api::Dx12 => return Api::Dx12,
+            Api::Dx11 => seen_dx11 = true,
+            Api::Unknown => {}
+        }
+    }
+    if seen_dx11 {
+        Api::Dx11
+    } else {
+        Api::Unknown
+    }
+}
+
+/// True if the game ships its own DLSS.
+///
+/// Signals, any one is enough: an `nvngx_dlss.dll` under the exe's folder (depth <= 4)
+/// that this tool did not place (no sidecar marker next to it), or Streamline /
+/// frame-generation / ray-reconstruction runtimes (`sl.*.dll`, `nvngx_dlssg.dll`,
+/// `nvngx_dlssd.dll`) which only a DLSS-integrated game ships.
+pub fn game_ships_dlss(game_dir: &Path) -> bool {
+    fn walk(d: &Path, depth: u8) -> bool {
+        let Ok(rd) = fs::read_dir(d) else {
+            return false;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_file() {
+                let n = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if n == DLSS_DLL && !p.with_file_name(DLSS_MARKER).is_file() {
+                    return true;
+                }
+                if n == "nvngx_dlssg.dll"
+                    || n == "nvngx_dlssd.dll"
+                    || (n.starts_with("sl.") && n.ends_with(".dll"))
+                {
+                    return true;
+                }
+            } else if depth > 0 && p.is_dir() && walk(&p, depth - 1) {
+                return true;
+            }
+        }
+        false
+    }
+    walk(game_dir, 4)
+}
+
 #[derive(Debug, Clone)]
 pub struct GameStatus {
+    pub mode: Mode,
+    pub api: Api,
+    pub bridge: bool,
     pub exe: PathBuf,
     pub bitness: u8,
     pub reshade: bool,
@@ -79,14 +279,27 @@ impl GameStatus {
     pub fn game_dir(&self) -> &Path {
         self.exe.parent().expect("exe has a parent")
     }
+    pub fn needs_bridge(&self) -> bool {
+        self.mode == Mode::Native && self.api == Api::Dx11
+    }
     pub fn complete(&self) -> bool {
-        self.reshade
-            && self.headers
-            && self.feeder
-            && self.lumenite
-            && self.dlss5_addon
-            && self.dlssnr
-            && self.dlss
+        match self.mode {
+            Mode::Feeder => {
+                self.reshade
+                    && self.headers
+                    && self.feeder
+                    && self.lumenite
+                    && self.dlss5_addon
+                    && self.dlssnr
+                    && self.dlss
+            }
+            Mode::Native => {
+                self.reshade
+                    && self.dlss5_addon
+                    && self.dlssnr
+                    && (!self.needs_bridge() || self.bridge)
+            }
+        }
     }
 }
 
@@ -106,12 +319,22 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         problems
             .push("A d3d9.dll proxy is present; DirectX 9 games are not supported here.".into());
     }
+    let feeder = d.join(FEEDER_ADDON).is_file() && shaders.join(FEEDER_FX).is_file();
+    let mode = if game_ships_dlss(d) {
+        Mode::Native
+    } else {
+        Mode::Feeder
+    };
+    let api = detect_api(exe);
     Ok(GameStatus {
+        mode,
+        api,
+        bridge: d.join(BRIDGE_ADDON).is_file(),
         exe: exe.to_path_buf(),
         bitness,
         reshade: is_reshade_dll(&d.join(RESHADE_PROXY)),
         headers: RESHADE_HEADERS.iter().all(|h| shaders.join(h).is_file()),
-        feeder: d.join(FEEDER_ADDON).is_file() && shaders.join(FEEDER_FX).is_file(),
+        feeder,
         lumenite: shaders.join(LUMENITE_KERNEL_FX).is_file()
             && textures.join(LUMENITE_BLUENOISE).is_file(),
         dlss5_addon: d.join(DLSS5_ADDON).is_file(),
@@ -169,11 +392,45 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
         }
     };
     push_dir(dir);
-    if let Ok(rd) = fs::read_dir(dir) {
-        for e in rd.flatten() {
-            let sub = e.path().join("Binaries").join("Win64");
-            if sub.is_dir() {
-                push_dir(&sub);
+    // One and two levels down (bin/x64, bin/x64_dx12, Game/Binaries/Win64 ...), skipping
+    // engine/content trees that never hold the launch exe.
+    let skip = |p: &Path| {
+        let n = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        matches!(
+            n.as_str(),
+            "engine"
+                | "content"
+                | "saved"
+                | "intermediate"
+                | "reshade-shaders"
+                | "_commonredist"
+                | "commonredist"
+                | "redist"
+        ) || n.ends_with("_data")
+    };
+    if let Ok(rd1) = fs::read_dir(dir) {
+        for d1 in rd1
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir() && !skip(p))
+        {
+            push_dir(&d1);
+            if let Ok(rd2) = fs::read_dir(&d1) {
+                for d2 in rd2
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir() && !skip(p))
+                {
+                    push_dir(&d2);
+                    let win64 = d2.join("Win64");
+                    if win64.is_dir() {
+                        push_dir(&win64);
+                    }
+                }
             }
         }
     }
@@ -335,6 +592,39 @@ mod tests {
         let empty = t.path().join("empty");
         fs::create_dir_all(&empty).unwrap();
         assert!(resolve_target(&empty).is_err());
+    }
+
+    #[test]
+    fn native_mode_when_game_ships_dlss() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe(&d.join("game.exe"), PE_X64);
+        let st = inspect(&exe).unwrap();
+        assert_eq!(st.mode, Mode::Feeder);
+        assert_eq!(st.api, Api::Unknown);
+        // nested nvngx_dlss.dll (Unreal-style plugin folder) -> native
+        let deep = d.join("Engine").join("Plugins").join("DLSS");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join(DLSS_DLL), b"x").unwrap();
+        let st = inspect(&exe).unwrap();
+        assert_eq!(st.mode, Mode::Native);
+        assert!(!st.complete());
+        // our own copy (with sidecar marker) does not count
+        fs::remove_file(deep.join(DLSS_DLL)).unwrap();
+        fs::write(d.join(DLSS_DLL), b"x").unwrap();
+        fs::write(d.join(DLSS_MARKER), b"").unwrap();
+        assert_eq!(inspect(&exe).unwrap().mode, Mode::Feeder);
+        // Streamline runtime alone is a DLSS signal
+        fs::write(d.join("sl.interposer.dll"), b"x").unwrap();
+        assert_eq!(inspect(&exe).unwrap().mode, Mode::Native);
+    }
+
+    #[test]
+    fn pe_imports_handles_stub_pe() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe(&t.path().join("game.exe"), PE_X64);
+        assert!(pe_imports(&exe).is_empty());
+        assert_eq!(detect_api(&exe), Api::Unknown);
     }
 
     #[test]
