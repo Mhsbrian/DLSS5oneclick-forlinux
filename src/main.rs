@@ -11,7 +11,7 @@ mod theme;
 use std::io::Write;
 use std::path::PathBuf;
 
-/// `dlss5oneclick <GAME.exe | game folder> [--remove | --check]` runs headless; no args opens the GUI.
+/// `dlss5oneclick <GAME.exe | game folder> [--remove | --remove-all | --check]` runs headless; no args opens the GUI.
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(first) = args.first().filter(|a| !a.starts_with('-')) {
@@ -19,6 +19,7 @@ fn main() {
         let code = cli(
             PathBuf::from(first),
             args.iter().any(|a| a == "--remove"),
+            args.iter().any(|a| a == "--remove-all"),
             args.iter().any(|a| a == "--check"),
         );
         std::process::exit(code);
@@ -29,7 +30,7 @@ fn main() {
     }
 }
 
-fn cli(target: PathBuf, remove: bool, check: bool) -> i32 {
+fn cli(target: PathBuf, remove: bool, remove_all: bool, check: bool) -> i32 {
     let (exe, candidates) = match game::resolve_target(&target) {
         Ok(v) => v,
         Err(e) => {
@@ -68,6 +69,23 @@ fn cli(target: PathBuf, remove: bool, check: bool) -> i32 {
                 }
                 let names: Vec<&str> = installer::plan(&st).iter().map(|s| s.name).collect();
                 println!("  plan: {}", names.join(" -> "));
+                0
+            }
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                1
+            }
+        };
+    }
+    if remove_all {
+        return match installer::uninstall_all(&exe) {
+            Ok((list, kept)) => {
+                for f in list {
+                    println!("removed {f}");
+                }
+                if let Some(k) = kept {
+                    println!("{k}");
+                }
                 0
             }
             Err(e) => {

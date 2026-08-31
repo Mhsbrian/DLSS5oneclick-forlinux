@@ -105,7 +105,7 @@ impl App {
             .map(|p| game::inspect(p).map_err(|e| format!("{e:#}")));
     }
 
-    fn start(&mut self, remove: bool) {
+    fn start(&mut self, remove: Option<bool>) {
         let Some(exe) = self.exe() else { return };
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
         self.rx = Some(rx);
@@ -115,19 +115,26 @@ impl App {
         self.log.clear();
         self.last_error = None;
         thread::spawn(move || {
-            let out = if remove {
-                installer::uninstall(&exe)
-                    .map(|r| {
-                        format!(
-                            "Removed: {}",
-                            if r.is_empty() {
-                                "nothing".into()
-                            } else {
-                                r.join(", ")
-                            }
-                        )
+            let out = if let Some(everything) = remove {
+                let res = if everything {
+                    installer::uninstall_all(&exe).map(|(mut r, kept)| {
+                        r.extend(kept);
+                        r
                     })
-                    .map_err(|e| format!("{e:#}"))
+                } else {
+                    installer::uninstall(&exe)
+                };
+                res.map(|r| {
+                    format!(
+                        "Removed: {}",
+                        if r.is_empty() {
+                            "nothing".into()
+                        } else {
+                            r.join(", ")
+                        }
+                    )
+                })
+                .map_err(|e| format!("{e:#}"))
             } else {
                 let p_tx = tx.clone();
                 let s_tx = tx.clone();
@@ -504,7 +511,7 @@ impl eframe::App for App {
                         .corner_radius(CornerRadius::same(8))
                         .min_size(Vec2::new(180.0, 42.0));
                     if ui.add_enabled(can_run, install).clicked() {
-                        self.start(false);
+                        self.start(None);
                     }
                     let remove = egui::Button::new(RichText::new("Remove").font(t::plex_medium(13.0)).color(t::TEXT_OFF))
                         .fill(Color32::TRANSPARENT)
@@ -581,9 +588,13 @@ impl eframe::App for App {
                 .collapsible(false).resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ui.ctx(), |ui| {
-                    ui.label("Remove DLSS5-Feeder, LumeniteFX and the DLSS 5 add-on from this game?\nReShade itself and nvngx_dlss.dll stay.");
+                    ui.label("Remove the DLSS 5 files from this game?
+
+Remove takes out what this tool added; ReShade stays.
+Remove incl. ReShade also deletes ReShade (dxgi.dll, ini files, reshade-shaders) - refused if any add-on or shader this tool did not install is still there.");
                     ui.horizontal(|ui| {
-                        if ui.button("Remove").clicked() { self.confirm_remove = false; self.start(true); }
+                        if ui.button("Remove").clicked() { self.confirm_remove = false; self.start(Some(false)); }
+                        if ui.button("Remove incl. ReShade").clicked() { self.confirm_remove = false; self.start(Some(true)); }
                         if ui.button("Cancel").clicked() { self.confirm_remove = false; }
                     });
                 });

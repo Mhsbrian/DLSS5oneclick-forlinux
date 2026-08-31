@@ -588,6 +588,92 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
     Ok(removed)
 }
 
+/// `uninstall`, then ReShade itself — but only when nothing foreign remains.
+///
+/// Refuses to touch ReShade when, after removing this tool's files, the game
+/// still has other `.addon64`/`.addon32` files or other shaders in
+/// `reshade-shaders` — that is somebody's own ReShade setup. `dxgi.dll` is
+/// only deleted when it verifiably is a ReShade DLL. Returns
+/// `(removed, kept_reason)`; `kept_reason` is `Some` when ReShade was left.
+pub fn uninstall_all(exe: &Path) -> Result<(Vec<String>, Option<String>)> {
+    let mut removed = uninstall(exe)?;
+    let d = exe.parent().context("exe has no parent")?;
+
+    let mut foreign: Vec<String> = Vec::new();
+    if let Ok(rd) = fs::read_dir(d) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().to_lowercase();
+            if n.ends_with(".addon64") || n.ends_with(".addon32") {
+                foreign.push(n);
+            }
+        }
+    }
+    let shaders_root = d.join("reshade-shaders");
+    let mut walk = vec![shaders_root.clone()];
+    while let Some(dir) = walk.pop() {
+        if let Ok(rd) = fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk.push(p);
+                } else {
+                    foreign.push(
+                        p.strip_prefix(d)
+                            .unwrap_or(&p)
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
+                }
+            }
+        }
+    }
+    if !foreign.is_empty() {
+        foreign.sort();
+        foreign.truncate(6);
+        return Ok((
+            removed,
+            Some(format!(
+                "ReShade left in place: the game still has files this tool did not install ({})",
+                foreign.join(", ")
+            )),
+        ));
+    }
+
+    let mut rm = |p: PathBuf| -> Result<()> {
+        if p.is_file() {
+            fs::remove_file(&p)?;
+            removed.push(
+                p.strip_prefix(d)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
+        }
+        Ok(())
+    };
+    let proxy = d.join(game::RESHADE_PROXY);
+    if game::is_reshade_dll(&proxy) {
+        rm(proxy)?;
+    }
+    if let Ok(rd) = fs::read_dir(d) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().to_lowercase();
+            let reshade_file = (n.starts_with("reshade")
+                && (n.ends_with(".ini") || n.ends_with(".log")))
+                || n.starts_with("reshadepreset")
+                || n.starts_with("dlss5-feed.");
+            if reshade_file {
+                rm(e.path())?;
+            }
+        }
+    }
+    if shaders_root.is_dir() {
+        fs::remove_dir_all(&shaders_root)?;
+        removed.push("reshade-shaders/".into());
+    }
+    Ok((removed, None))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,6 +849,49 @@ mod tests {
         st.api = game::Api::Dx11;
         let names: Vec<&str> = plan(&st).iter().map(|s| s.name).collect();
         assert_eq!(names[2], "DLSS 5 DX11 bridge");
+    }
+
+    #[test]
+    fn uninstall_all_removes_reshade_only_when_nothing_foreign_remains() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe(&d.join("game.exe"), game::PE_X64);
+        crate::game::testutil::make_reshade_dll(&d.join("dxgi.dll"));
+        let sh = d.join("reshade-shaders").join("Shaders");
+        fs::create_dir_all(&sh).unwrap();
+        fs::write(d.join(game::FEEDER_ADDON), b"x").unwrap();
+        fs::write(sh.join(game::FEEDER_FX), b"x").unwrap();
+        fs::write(sh.join("ReShade.fxh"), b"x").unwrap();
+        fs::write(d.join("ReShade.ini"), b"x").unwrap();
+        fs::write(d.join("ReShadePreset.ini"), b"x").unwrap();
+        fs::write(d.join("dlss5-feed.cfg"), b"x").unwrap();
+        // a foreign shader blocks ReShade removal
+        fs::write(sh.join("Clarity.fx"), b"user shader").unwrap();
+        let (_removed, kept) = uninstall_all(&exe).unwrap();
+        assert!(kept.is_some());
+        assert!(d.join("dxgi.dll").is_file());
+        assert!(!d.join(game::FEEDER_ADDON).is_file());
+        // without it, everything goes
+        fs::remove_file(sh.join("Clarity.fx")).unwrap();
+        let (removed, kept) = uninstall_all(&exe).unwrap();
+        assert!(kept.is_none(), "{kept:?}");
+        assert!(removed.iter().any(|r| r == "dxgi.dll"));
+        assert!(!d.join("dxgi.dll").exists());
+        assert!(!d.join("ReShade.ini").exists());
+        assert!(!d.join("dlss5-feed.cfg").exists());
+        assert!(!d.join("reshade-shaders").exists());
+    }
+
+    #[test]
+    fn uninstall_all_keeps_foreign_addons() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe(&d.join("game.exe"), game::PE_X64);
+        crate::game::testutil::make_reshade_dll(&d.join("dxgi.dll"));
+        fs::write(d.join("someones-mod.addon64"), b"x").unwrap();
+        let (_removed, kept) = uninstall_all(&exe).unwrap();
+        assert!(kept.is_some());
+        assert!(d.join("dxgi.dll").is_file());
     }
 
     #[test]
