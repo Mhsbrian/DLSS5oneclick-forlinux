@@ -316,7 +316,7 @@ impl eframe::App for App {
 
         // ── header ────────────────────────────────────────────────
         egui::Panel::top("header")
-            .frame(Frame::new().fill(t::HEADER).inner_margin(Margin::symmetric(18, 12)).stroke(Stroke::new(1.0, t::BORDER)))
+            .frame(Frame::new().fill(t::HEADER).inner_margin(Margin { left: 18, right: 28, top: 12, bottom: 12 }).stroke(Stroke::new(1.0, t::BORDER)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 12.0;
@@ -336,7 +336,12 @@ impl eframe::App for App {
             });
 
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(t::PANEL).inner_margin(Margin { left: 18, right: 18, top: 14, bottom: 14 }))
+            .frame(Frame::new().fill(t::PANEL).inner_margin(Margin {
+                left: 18,
+                right: 28,
+                top: 14,
+                bottom: 14,
+            }))
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 12.0;
 
