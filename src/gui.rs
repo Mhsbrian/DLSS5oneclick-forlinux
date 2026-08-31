@@ -262,35 +262,38 @@ fn paint_check(ui: &mut egui::Ui, ok: bool, optional: bool) {
 fn tile(ui: &mut egui::Ui, width: f32, tl: &Tile, st: Option<&GameStatus>) {
     let ok = st.map(tl.ok).unwrap_or(false);
     let dashed = tl.optional && !ok;
-    Frame::new()
-        .fill(t::TILE)
-        .stroke(Stroke::new(
-            1.0,
-            if dashed { t::BORDER_DASH } else { t::BORDER },
-        ))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::symmetric(11, 9))
-        .show(ui, |ui| {
-            ui.set_width(width - 22.0);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                paint_check(ui, ok, tl.optional);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 1.0;
-                    let title_color = if dashed { t::TEXT_OFF } else { t::TEXT };
-                    ui.label(
-                        RichText::new(tl.title)
-                            .font(t::plex_medium(13.0))
-                            .color(title_color),
-                    );
-                    ui.label(
-                        RichText::new(tl.detail)
-                            .font(t::plex(11.0))
-                            .color(if dashed { t::TEXT_DIM } else { t::TEXT_MUTED }),
-                    );
+    ui.allocate_ui_with_layout(Vec2::new(width, 0.0), Layout::top_down(Align::Min), |ui| {
+        ui.set_width(width);
+        Frame::new()
+            .fill(t::TILE)
+            .stroke(Stroke::new(
+                1.0,
+                if dashed { t::BORDER_DASH } else { t::BORDER },
+            ))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(11, 9))
+            .show(ui, |ui| {
+                ui.set_width(width - 22.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    paint_check(ui, ok, tl.optional);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        let title_color = if dashed { t::TEXT_OFF } else { t::TEXT };
+                        ui.label(
+                            RichText::new(tl.title)
+                                .font(t::plex_medium(13.0))
+                                .color(title_color),
+                        );
+                        ui.label(
+                            RichText::new(tl.detail)
+                                .font(t::plex(11.0))
+                                .color(if dashed { t::TEXT_DIM } else { t::TEXT_MUTED }),
+                        );
+                    });
                 });
             });
-        });
+    });
 }
 
 impl eframe::App for App {
@@ -421,15 +424,19 @@ impl eframe::App for App {
 
                 // ── tiles ─────────────────────────────────────────
                 let gap = 8.0;
-                let col_w = (ui.available_width() - gap) / 2.0;
-                egui::Grid::new("tiles").num_columns(2).spacing([gap, gap]).show(ui, |ui| {
-                    for (i, tl) in TILES.iter().enumerate() {
-                        tile(ui, col_w, tl, ok_status.as_ref());
-                        if i % 2 == 1 {
-                            ui.end_row();
-                        }
-                    }
-                });
+                let col_w = ((ui.available_width() - gap) / 2.0).floor();
+                for row in TILES.chunks(2) {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(ui.available_width(), 0.0),
+                        Layout::left_to_right(Align::Min),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.x = gap;
+                            for tl in row {
+                                tile(ui, col_w, tl, ok_status.as_ref());
+                            }
+                        },
+                    );
+                }
 
                 // ── actions ───────────────────────────────────────
                 let can_run = ok_status.is_some() && problems.is_empty() && !self.running;
