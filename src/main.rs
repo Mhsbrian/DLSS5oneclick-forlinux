@@ -11,7 +11,7 @@ mod theme;
 use std::io::Write;
 use std::path::PathBuf;
 
-/// `dlss5oneclick <GAME.exe | game folder> [--remove | --remove-all | --check]` runs headless; no args opens the GUI.
+/// `dlss5oneclick <GAME.exe | game folder> [--remove | --remove-all | --check | --engine=opti]` runs headless; no args opens the GUI.
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(first) = args.first().filter(|a| !a.starts_with('-')) {
@@ -21,6 +21,11 @@ fn main() {
             args.iter().any(|a| a == "--remove"),
             args.iter().any(|a| a == "--remove-all"),
             args.iter().any(|a| a == "--check"),
+            if args.iter().any(|a| a == "--engine=opti" || a == "--opti") {
+                installer::Engine::Opti
+            } else {
+                installer::Engine::ReShade
+            },
         );
         std::process::exit(code);
     }
@@ -30,7 +35,13 @@ fn main() {
     }
 }
 
-fn cli(target: PathBuf, remove: bool, remove_all: bool, check: bool) -> i32 {
+fn cli(
+    target: PathBuf,
+    remove: bool,
+    remove_all: bool,
+    check: bool,
+    engine: installer::Engine,
+) -> i32 {
     let (exe, candidates) = match game::resolve_target(&target) {
         Ok(v) => v,
         Err(e) => {
@@ -60,9 +71,9 @@ fn cli(target: PathBuf, remove: bool, remove_all: bool, check: bool) -> i32 {
         return match game::inspect(&exe) {
             Ok(st) => {
                 println!(
-                    "{} | {}-bit | {} | mode={:?} | reshade={} headers={} feeder={} lumenite={} dlss5={} dlssnr={} dlss={} bridge={} | complete={}",
+                    "{} | {}-bit | {} | mode={:?} | reshade={} headers={} feeder={} lumenite={} dlss5={} dlssnr={} dlss={} bridge={} opti={} | complete={}",
                     exe.display(), st.bitness, st.api.label(), st.mode, st.reshade, st.headers, st.feeder,
-                    st.lumenite, st.dlss5_addon, st.dlssnr, st.dlss, st.bridge, st.complete()
+                    st.lumenite, st.dlss5_addon, st.dlssnr, st.dlss, st.bridge, st.opti, st.complete()
                 );
                 for p in &st.problems {
                     println!("  ! {p}");
@@ -120,9 +131,19 @@ fn cli(target: PathBuf, remove: bool, remove_all: bool, check: bool) -> i32 {
             Error => println!("\n      FAILED: {detail}"),
         }
     };
-    match installer::run_all(&exe, &progress, &step) {
+    match installer::run_all_with(&exe, engine, &progress, &step) {
         Ok(_) => {
-            println!("\nDone. In game: Home -> DLSS 5 Neural Rendering panel -> enable.");
+            if engine == installer::Engine::Opti {
+                println!(
+                    "
+Done. In game: Insert opens the OptiScaler overlay -> enable Neural Rendering (off by default)."
+                );
+            } else {
+                println!(
+                    "
+Done. In game: Home -> DLSS 5 Neural Rendering panel -> enable."
+                );
+            }
             0
         }
         Err(e) => {

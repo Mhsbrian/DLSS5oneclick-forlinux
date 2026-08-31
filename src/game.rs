@@ -16,6 +16,8 @@ pub const DLSS_DLL: &str = "nvngx_dlss.dll";
 pub const LUMENITE_KERNEL_FX: &str = "lumenite_Kernel.fx";
 pub const LUMENITE_BLUENOISE: &str = "lumenite_bluenoise256.png";
 pub const BRIDGE_ADDON: &str = "dlss5-dx11-bridge.addon64";
+/// Files this tool wrote for an OptiScaler install, one path per line.
+pub const OPTI_MANIFEST: &str = ".dlss5oneclick-optiscaler-manifest";
 /// Sidecar written next to an `nvngx_dlss.dll` this tool placed, so it is never mistaken for the game's own.
 pub const DLSS_MARKER: &str = "nvngx_dlss.dll.dlss5oneclick";
 pub const RESHADE_PROXY: &str = "dxgi.dll";
@@ -263,6 +265,7 @@ pub struct GameStatus {
     pub mode: Mode,
     pub api: Api,
     pub bridge: bool,
+    pub opti: bool,
     pub exe: PathBuf,
     pub bitness: u8,
     pub reshade: bool,
@@ -294,10 +297,11 @@ impl GameStatus {
                     && self.dlss
             }
             Mode::Native => {
-                self.reshade
-                    && self.dlss5_addon
-                    && self.dlssnr
-                    && (!self.needs_bridge() || self.bridge)
+                (self.opti && self.dlssnr)
+                    || (self.reshade
+                        && self.dlss5_addon
+                        && self.dlssnr
+                        && (!self.needs_bridge() || self.bridge))
             }
         }
     }
@@ -330,9 +334,10 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         mode,
         api,
         bridge: d.join(BRIDGE_ADDON).is_file(),
+        opti: d.join(OPTI_MANIFEST).is_file(),
         exe: exe.to_path_buf(),
         bitness,
-        reshade: is_reshade_dll(&d.join(RESHADE_PROXY)),
+        reshade: !d.join(OPTI_MANIFEST).is_file() && is_reshade_dll(&d.join(RESHADE_PROXY)),
         headers: RESHADE_HEADERS.iter().all(|h| shaders.join(h).is_file()),
         feeder,
         lumenite: shaders.join(LUMENITE_KERNEL_FX).is_file()

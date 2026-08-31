@@ -2,7 +2,7 @@
 //! tiles, one Install button, progress, log.
 
 use crate::game::{self, GameStatus};
-use crate::installer::{self, StepState};
+use crate::installer::{self, Engine, StepState};
 use crate::logo;
 use crate::theme::{self as t};
 use eframe::egui::{
@@ -38,6 +38,7 @@ pub struct App {
     last_error: Option<String>,
     candidates: Vec<PathBuf>,
     resolved_exe: Option<PathBuf>,
+    engine: Engine,
 }
 
 impl App {
@@ -60,6 +61,7 @@ impl App {
             last_error: None,
             candidates: Vec::new(),
             resolved_exe: None,
+            engine: Engine::default(),
         };
         app.refresh();
         app
@@ -107,6 +109,7 @@ impl App {
 
     fn start(&mut self, remove: Option<bool>) {
         let Some(exe) = self.exe() else { return };
+        let engine = self.engine;
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
         self.rx = Some(rx);
         self.running = true;
@@ -138,8 +141,9 @@ impl App {
             } else {
                 let p_tx = tx.clone();
                 let s_tx = tx.clone();
-                installer::run_all(
+                installer::run_all_with(
                     &exe,
+                    engine,
                     &move |pct, msg| {
                         let _ = p_tx.send(Msg::Progress(pct, msg.to_owned()));
                     },
@@ -152,7 +156,13 @@ impl App {
                         let _ = s_tx.send(Msg::Log(line));
                     },
                 )
-                .map(|_| "Done. In game: Home → DLSS 5 Neural Rendering → enable.".to_owned())
+                .map(|_| {
+                    if engine == Engine::Opti {
+                        "Done. In game: Insert opens the OptiScaler overlay → enable Neural Rendering.".to_owned()
+                    } else {
+                        "Done. In game: Home → DLSS 5 Neural Rendering → enable.".to_owned()
+                    }
+                })
                 .map_err(|e| format!("{e:#}"))
             };
             let _ = tx.send(Msg::Finished(out));
@@ -238,6 +248,13 @@ const TILES_FEEDER: [Tile; 6] = [
     },
 ];
 
+const TILE_OPTI: Tile = Tile {
+    title: "OptiScaler + NR pass",
+    detail: "Dagherbou fork as dxgi.dll · Insert opens its overlay",
+    ok: |s| s.opti,
+    optional: false,
+};
+
 const TILES_NATIVE: [Tile; 4] = [
     Tile {
         title: "Game DLSS",
@@ -267,6 +284,9 @@ const TILES_NATIVE: [Tile; 4] = [
 
 fn tiles_for(st: Option<&GameStatus>) -> Vec<&'static Tile> {
     match st.map(|s| s.mode) {
+        Some(game::Mode::Native) if st.is_some_and(|s| s.opti) => {
+            vec![&TILES_NATIVE[0], &TILE_OPTI, &TILES_NATIVE[2]]
+        }
         Some(game::Mode::Native) => {
             let needs_bridge = st.is_some_and(|s| s.needs_bridge());
             TILES_NATIVE
@@ -499,6 +519,27 @@ impl eframe::App for App {
                         );
                         tile(ui, rect, tl, ok_status.as_ref());
                     }
+                }
+
+                // ── engine choice (games with native DLSS) ────────
+                if ok_status.as_ref().is_some_and(|s| s.mode == game::Mode::Native) {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        ui.label(RichText::new("Engine").font(t::plex(12.0)).color(t::TEXT_MUTED));
+                        ui.radio_value(&mut self.engine, Engine::ReShade, "ReShade + RenoDX add-on");
+                        ui.radio_value(&mut self.engine, Engine::Opti, "OptiScaler (built-in NR pass)");
+                    });
+                    if self.engine == Engine::Opti {
+                        ui.label(
+                            RichText::new(
+                                "OptiScaler engine: extracts Dagherbou's OptiScaler_DLSSNR fork as dxgi.dll and adds the DLSS 5 model.                                  In game: Insert opens the OptiScaler overlay, enable Neural Rendering there (off by default).                                  Not compatible with a ReShade install in the same game.",
+                            )
+                            .font(t::plex(11.0))
+                            .color(t::TEXT_DIM),
+                        );
+                    }
+                } else {
+                    self.engine = Engine::ReShade;
                 }
 
                 // ── actions ───────────────────────────────────────

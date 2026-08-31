@@ -30,6 +30,133 @@ pub const FEEDER_LATEST: &str =
     "https://api.github.com/repos/jlrouzies-fr/DLSS5-Feeder/releases/latest";
 pub const LUMENITE_ZIP: &str =
     "https://codeload.github.com/umar-afzaal/LumeniteFX/zip/refs/heads/mainline";
+
+/// Which install engine carries the DLSS 5 pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Engine {
+    /// ReShade + RenoDX add-on (both game kinds; the default).
+    #[default]
+    ReShade,
+    /// Dagherbou's OptiScaler fork with the built-in Neural Rendering pass.
+    /// Games with native DLSS only (the pass reads the inputs the game hands to DLSS).
+    Opti,
+}
+
+pub const OPTI_RELEASES: &str = "https://api.github.com/repos/Dagherbou/OptiScaler_DLSSNR/releases";
+
+const STEP_OPTI: Step = Step {
+    name: "OptiScaler + DLSS Neural Rendering",
+    run: step_opti,
+};
+
+/// Extract the whole OptiScaler_DLSSNR release into the game folder,
+/// writing `OptiScaler.dll` as `dxgi.dll` (the fork's default load name for
+/// DX11/DX12 games) and recording every path in a manifest for uninstall.
+fn step_opti(
+    client: &Client,
+    st: &GameStatus,
+    work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    if st.opti {
+        progress(100, "OptiScaler already installed");
+        return Ok(vec![]);
+    }
+    let d = st.game_dir();
+    if game::is_reshade_dll(&d.join(game::RESHADE_PROXY)) {
+        bail!(
+            "ReShade is installed as dxgi.dll in this game; OptiScaler needs that name. \
+             Run Remove (or Remove incl. ReShade) first, then install with the OptiScaler engine."
+        );
+    }
+    progress(0, "Looking up latest OptiScaler DLSS-NR release");
+    let releases = net::get_json(client, OPTI_RELEASES)?;
+    let asset = releases
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|r| r.get("assets"))
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(|a| a.get("browser_download_url"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("OptiScaler_DLSSNR has no release asset"))?;
+    let zip_path = work.join("optiscaler-dlssnr.zip");
+    net::download(client, asset, &zip_path, "OptiScaler DLSS-NR", progress)?;
+
+    let f = fs::File::open(&zip_path)?;
+    let mut zip = zip::ZipArchive::new(f).context("OptiScaler download is not a valid zip")?;
+    let names: Vec<String> = zip.file_names().map(str::to_owned).collect();
+    let mut installed: Vec<String> = Vec::new();
+    for member in names {
+        // This zip uses backslash separators; normalise, and never trust the path.
+        let rel = member.replace('\\', "/");
+        if rel.ends_with('/') {
+            continue;
+        }
+        let parts: Vec<&str> = rel
+            .split('/')
+            .filter(|p| !p.is_empty() && *p != "." && *p != "..")
+            .collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let fname = parts.last().unwrap().to_string();
+        // The interactive setup script and its banner file are not needed:
+        // the renaming it performs is done right here.
+        if fname.eq_ignore_ascii_case("setup_windows.bat")
+            || fname.eq_ignore_ascii_case("setup_linux.sh")
+            || fname.starts_with("!!")
+        {
+            continue;
+        }
+        let out_rel = if fname.eq_ignore_ascii_case("OptiScaler.dll") {
+            game::RESHADE_PROXY.to_string() // dxgi.dll
+        } else {
+            parts.join("/")
+        };
+        let dest = d.join(out_rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        net::extract_member(&mut zip, &member, &dest)?;
+        installed.push(out_rel);
+    }
+    if !installed.iter().any(|p| p == game::RESHADE_PROXY) {
+        bail!("the OptiScaler release had no OptiScaler.dll — layout changed upstream");
+    }
+    fs::write(d.join(game::OPTI_MANIFEST), installed.join("\n"))?;
+    installed.push(game::OPTI_MANIFEST.into());
+    Ok(installed)
+}
+
+/// Remove an OptiScaler install recorded in the manifest.
+fn uninstall_opti(d: &Path, removed: &mut Vec<String>) -> Result<()> {
+    let manifest = d.join(game::OPTI_MANIFEST);
+    let Ok(list) = fs::read_to_string(&manifest) else {
+        return Ok(());
+    };
+    for rel in list.lines().filter(|l| !l.trim().is_empty()) {
+        let clean: Vec<&str> = rel
+            .split('/')
+            .filter(|p| !p.is_empty() && *p != "." && *p != "..")
+            .collect();
+        let p = clean
+            .iter()
+            .fold(d.to_path_buf(), |acc, part| acc.join(part));
+        if p.is_file() {
+            fs::remove_file(&p)?;
+            removed.push(rel.to_string());
+        }
+    }
+    // Clean now-empty folders the archive created.
+    for sub in ["OptiScaler/D3D12_OptiScaler", "OptiScaler", "Licenses"] {
+        let p = d.join(sub.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if p.is_dir() && fs::read_dir(&p)?.next().is_none() {
+            fs::remove_dir(&p)?;
+        }
+    }
+    fs::remove_file(&manifest)?;
+    removed.push(game::OPTI_MANIFEST.into());
+    Ok(())
+}
+
 pub const BRIDGE_LATEST: &str =
     "https://api.github.com/repos/NIGos/dlss5-dx11-bridge/releases/latest";
 pub const RHI_RELEASES: &str =
@@ -61,6 +188,10 @@ const STEP_DLSS5: Step = Step {
     name: "DLSS 5 add-on + models",
     run: step_dlss5,
 };
+const STEP_DLSSNR_ONLY: Step = Step {
+    name: "DLSS 5 model (nvngx_dlssnr.dll)",
+    run: step_dlssnr_only,
+};
 const STEP_BRIDGE: Step = Step {
     name: "DLSS 5 DX11 bridge",
     run: step_bridge,
@@ -76,6 +207,16 @@ const STEP_FEEDER_CLEANUP: Step = Step {
 
 /// Steps for a game, by install path.
 pub fn plan(st: &GameStatus) -> Vec<Step> {
+    plan_with(st, Engine::ReShade)
+}
+
+pub fn plan_with(st: &GameStatus, engine: Engine) -> Vec<Step> {
+    if engine == Engine::Opti {
+        // Only games with native DLSS: the NR pass reads the inputs the game
+        // hands to DLSS. Callers gate on mode; return the plan regardless so
+        // --check can show it.
+        return vec![STEP_OPTI, STEP_DLSSNR_ONLY];
+    }
     match st.mode {
         game::Mode::Feeder => vec![
             STEP_RESHADE,
@@ -409,6 +550,30 @@ fn step_dlss5(
     Ok(installed)
 }
 
+// ── opti engine: just the model DLL beside OptiScaler ───────────────
+
+fn step_dlssnr_only(
+    client: &Client,
+    st: &GameStatus,
+    work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    if st.dlssnr {
+        progress(100, "nvngx_dlssnr.dll already present");
+        return Ok(vec![]);
+    }
+    progress(0, "Looking up DLSS 5 model releases");
+    let releases = net::get_json(client, RHI_RELEASES)?;
+    let releases = releases
+        .as_array()
+        .ok_or_else(|| anyhow!("unexpected response from GitHub for rhi-repo"))?;
+    let (tag, url) = pick_latest_asset(releases, "dlssnr-")?;
+    let z = work.join(format!("{tag}.zip"));
+    net::download(client, &url, &z, game::DLSSNR_DLL, progress)?;
+    install_single_from_zip(&z, game::DLSSNR_DLL, &st.game_dir().join(game::DLSSNR_DLL))?;
+    Ok(vec![format!("{} ({tag})", game::DLSSNR_DLL)])
+}
+
 // ── native mode: a Feeder left over from an earlier install must go ─
 
 fn step_feeder_cleanup(
@@ -501,8 +666,9 @@ pub enum StepState {
     Error,
 }
 
-pub fn run_all(
+pub fn run_all_with(
     exe: &Path,
+    engine: Engine,
     progress: Progress,
     step_cb: &(dyn Fn(usize, usize, &str, StepState, &str) + Sync),
 ) -> Result<Vec<(String, Vec<String>)>> {
@@ -510,11 +676,19 @@ pub fn run_all(
     if !st.problems.is_empty() {
         bail!("{}", st.problems.join("\n"));
     }
+    if engine == Engine::Opti && st.mode != game::Mode::Feeder {
+        // fine: native DLSS present
+    } else if engine == Engine::Opti {
+        bail!(
+            "The OptiScaler engine needs a game with its own DLSS (its Neural Rendering pass \
+             reads the inputs the game hands to DLSS). This game has none — use the ReShade engine."
+        );
+    }
     let client = net::client()?;
     let work = tempfile::Builder::new()
         .prefix("dlss5oneclick-")
         .tempdir()?;
-    let steps = plan(&st);
+    let steps = plan_with(&st, engine);
     let n = steps.len();
     let mut results = Vec::new();
     for (i, step) in steps.iter().enumerate() {
@@ -571,6 +745,7 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
         targets.push(d.join(game::DLSS_DLL));
     }
     let mut removed = Vec::new();
+    uninstall_opti(d, &mut removed)?;
     for t in targets {
         if t.is_file() {
             fs::remove_file(&t)?;
@@ -895,10 +1070,52 @@ mod tests {
     }
 
     #[test]
+    fn opti_plan_and_engine_gate() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe(&t.path().join("game.exe"), game::PE_X64);
+        let st = game::inspect(&exe).unwrap();
+        let names: Vec<&str> = plan_with(&st, Engine::Opti)
+            .iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "OptiScaler + DLSS Neural Rendering",
+                "DLSS 5 model (nvngx_dlssnr.dll)"
+            ]
+        );
+        // Feeder-mode game + Opti engine is refused before any network
+        let err = run_all_with(&exe, Engine::Opti, &|_, _| {}, &|_, _, _, _, _| {}).unwrap_err();
+        assert!(err.to_string().contains("own DLSS"));
+    }
+
+    #[test]
+    fn uninstall_removes_opti_manifest_files() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe(&d.join("game.exe"), game::PE_X64);
+        fs::create_dir_all(d.join("OptiScaler")).unwrap();
+        fs::write(d.join("dxgi.dll"), b"opti").unwrap();
+        fs::write(d.join("OptiScaler.ini"), b"ini").unwrap();
+        fs::write(d.join("OptiScaler").join("libxess.dll"), b"x").unwrap();
+        fs::write(
+            d.join(game::OPTI_MANIFEST),
+            "dxgi.dll\nOptiScaler.ini\nOptiScaler/libxess.dll",
+        )
+        .unwrap();
+        let removed = uninstall(&exe).unwrap();
+        assert!(removed.iter().any(|r| r == "dxgi.dll"));
+        assert!(!d.join("dxgi.dll").exists());
+        assert!(!d.join("OptiScaler").exists());
+        assert!(!d.join(game::OPTI_MANIFEST).exists());
+    }
+
+    #[test]
     fn run_all_refuses_32bit_before_network() {
         let t = tempfile::tempdir().unwrap();
         let exe = make_pe(&t.path().join("game.exe"), game::PE_X86);
-        let err = run_all(&exe, &|_, _| {}, &|_, _, _, _, _| {}).unwrap_err();
+        let err = run_all_with(&exe, Engine::ReShade, &|_, _| {}, &|_, _, _, _, _| {}).unwrap_err();
         assert!(err.to_string().contains("32-bit"));
     }
 }
