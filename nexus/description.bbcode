@@ -26,9 +26,13 @@ Command line: [font=Courier New]dlss5oneclick.exe "C:\Games\Foo"[/font] · [font
 [list]
 [*]32-bit games (the Feeder's host64 setup is not automated — the tool refuses rather than half-install)
 [*]DirectX 9 and Vulkan games — the Feeder and NIGos' bridge do support them by hand, this tool does not automate those setups yet
+[*]Non-NVIDIA and GTX/GT cards — refused up front: the model needs tensor cores and NGX. RTX 50 runs it at full speed, RTX 40 with a patched build at moderate cost, RTX 20/30 through an FP16 path at heavy cost (the status line shows your tier)
 [*]Online games — ReShade with add-ons trips anti-cheat
 [*]API detection can come back unknown on monolithic Unreal exes; DX12 is then assumed (shown in the status line) — a DX11 game in that state would miss the bridge
 [/list]
+
+[size=4][b]Windows Defender[/b][/size]
+The exe is not code-signed and it downloads DLLs into game folders, so Defender/SmartScreen may complain. If it quarantines the tool or the add-on files it placed in a game, restore them from Protection history, exclude the game folder, and press Install again (it only re-fetches what is missing). Source is public on GitHub; every release is built from it.
 
 [size=4][b]Known issues[/b][/size]
 [list]

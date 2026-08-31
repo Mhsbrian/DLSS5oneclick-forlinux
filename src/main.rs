@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod game;
+mod gpu;
 mod gui;
 mod installer;
 mod logo;
@@ -71,9 +72,13 @@ fn cli(
         return match game::inspect(&exe) {
             Ok(st) => {
                 println!(
-                    "{} | {}-bit | {} | mode={:?} | reshade={} headers={} feeder={} lumenite={} dlss5={} dlssnr={} dlss={} bridge={} opti={} | complete={}",
+                    "{} | {}-bit | {} | mode={:?} | reshade={} headers={} feeder={} lumenite={} dlss5={} dlssnr={} dlss={} bridge={} opti={} | gpu={} | complete={}",
                     exe.display(), st.bitness, st.api.label(), st.mode, st.reshade, st.headers, st.feeder,
-                    st.lumenite, st.dlss5_addon, st.dlssnr, st.dlss, st.bridge, st.opti, st.complete()
+                    st.lumenite, st.dlss5_addon, st.dlssnr, st.dlss,
+                    st.bridge,
+                    st.opti,
+                    st.gpu.as_ref().map(|(g, t)| format!("{} [{}]", g.name, t.label())).unwrap_or_else(|| "unknown".into()),
+                    st.complete()
                 );
                 for p in &st.problems {
                     println!("  ! {p}");

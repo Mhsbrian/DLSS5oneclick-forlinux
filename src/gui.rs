@@ -491,7 +491,12 @@ impl eframe::App for App {
                                 game::Mode::Feeder => "no DLSS · Feeder path",
                             };
                             ui.label(
-                                RichText::new(format!("{}-bit · {} · {mode}", s.bitness, s.api.label()))
+                                RichText::new(format!(
+                                    "{}-bit · {} · {mode}{}",
+                                    s.bitness,
+                                    s.api.label(),
+                                    s.gpu.as_ref().map(|(g, t)| format!(" · {} ({})", g.name, t.label())).unwrap_or_default()
+                                ))
                                     .font(t::plex(12.0))
                                     .color(t::TEXT_DIM),
                             );

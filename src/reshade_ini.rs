@@ -206,6 +206,40 @@ pub fn write_preset(game_dir: &Path) -> Result<()> {
     ini.save(&p)
 }
 
+/// ReShade keeps a per-game `[ADDON] DisabledAddons=` list (entries are
+/// `Name`, `Name@file` or `@file`). A stray disable hides the DLSS 5 panel, so
+/// an install drops our add-ons from that list.
+pub fn clear_disabled_addons(game_dir: &Path) -> Result<()> {
+    let p = game_dir.join("ReShade.ini");
+    if !p.is_file() {
+        return Ok(());
+    }
+    let mut ini = Ini::load(&p);
+    let Some(raw) = ini.get("ADDON", "DisabledAddons") else {
+        return Ok(());
+    };
+    let ours_files = [
+        "renodx-dlss5.addon64",
+        "dlss5-feed.addon64",
+        "dlss5-bridge.addon64",
+        "dlss5-dx11-bridge.addon64",
+    ];
+    let kept: Vec<String> = split_list(raw)
+        .into_iter()
+        .filter(|e| {
+            let (name, file) = match e.split_once('@') {
+                Some((n, f)) => (n, f),
+                None => (e.as_str(), ""),
+            };
+            let file_ours = ours_files.iter().any(|f| f.eq_ignore_ascii_case(file));
+            let name_ours = name.to_ascii_lowercase().starts_with("dlss 5");
+            !(file_ours || name_ours)
+        })
+        .collect();
+    ini.set("ADDON", "DisabledAddons", join_list(&kept));
+    ini.save(&p)
+}
+
 /// Drop Lumenite_Kernel / DLSS5_Feed from an existing preset (native-DLSS games do not use them).
 pub fn remove_our_techniques(game_dir: &Path) -> Result<()> {
     let p = game_dir.join("ReShadePreset.ini");

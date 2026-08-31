@@ -636,6 +636,7 @@ fn step_bridge(
 
 fn step_config(_c: &Client, st: &GameStatus, _w: &Path, progress: Progress) -> Result<Vec<String>> {
     reshade_ini::write_reshade_ini(st.game_dir())?;
+    reshade_ini::clear_disabled_addons(st.game_dir())?;
     if st.mode == game::Mode::Native {
         progress(100, "ReShade.ini written");
         return Ok(vec![game::RESHADE_INI.into()]);

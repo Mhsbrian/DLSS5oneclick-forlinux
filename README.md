@@ -45,6 +45,14 @@ CLI: `dlss5oneclick.exe "C:\Games\Foo"` (folder or exe) / `--check` (detect only
 
 Every component comes from GitHub releases. Since 0.5.1 the tool reads the public release **pages** (no API), so it is not subject to GitHub's 60-requests-per-hour API cap that caused `HTTP 403 Forbidden` for people installing into many games. If you set a `GITHUB_TOKEN` environment variable it is used for the API path first. Where github.com itself is unreachable (some countries block it), a proxy or VPN is the only way — the files exist nowhere else this tool trusts.
 
+## GPU support
+
+The tool reads the installed display adapters from the registry and refuses up front on anything that cannot run the model: non-NVIDIA cards (NGX does not exist there) and NVIDIA cards without tensor cores (GTX/GT/MX). Among RTX cards, expect very different costs — the DLSS 5 model is FP8 with RTX-50-only kernels; the `310.8.SF` build the tool installs adds patched binaries for RTX 40 and an FP16 path for RTX 20/30. The status line shows the tier: RTX 50 full speed · RTX 40 moderate cost · RTX 20/30 heavy cost.
+
+## Windows Defender / SmartScreen
+
+The exe is not code-signed (no publisher certificate), it is new, and it downloads DLLs into game folders — three things Windows heuristics dislike. Expect a SmartScreen "unknown publisher" prompt; if Defender quarantines the exe or, worse, the add-on files it placed in a game, restore them from Protection history, add the game folder as an exclusion, and re-run Install (it re-fetches only what is missing). Every release is built from the public source in this repository.
+
 ## Known issues
 
 - **Feeder path + exclusive fullscreen.** Every focus change (alt-tab) makes the game recreate its swapchain; DLSS5-Feeder rebuilds its DLSS feature and can crash inside `CreateFeature` on that rebuild ([Feeder issue #16](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/16), upstream). The game keeps rendering, DLSS 5 stops. Use borderless/windowed; raising `create_delay` in `dlss5-feed.cfg` helps. Seen on Fell & Sell; the same game ran 16,000+ frames without a crash in borderless.

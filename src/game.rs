@@ -1,5 +1,6 @@
 //! Game-folder inspection: exe bitness, ReShade presence, installed pieces.
 
+use crate::gpu;
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -266,6 +267,7 @@ pub struct GameStatus {
     pub api: Api,
     pub bridge: bool,
     pub opti: bool,
+    pub gpu: Option<(gpu::Gpu, gpu::Tier)>,
     pub exe: PathBuf,
     pub bitness: u8,
     pub reshade: bool,
@@ -316,6 +318,16 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     let shaders = d.join("reshade-shaders").join("Shaders");
     let textures = d.join("reshade-shaders").join("Textures");
     let mut problems = Vec::new();
+    let gpu = gpu::best();
+    if let Some((g, t)) = &gpu {
+        if !t.can_run() {
+            problems.push(format!(
+                "GPU is {} ({}): the DLSS 5 model runs on NVIDIA RTX only (it needs tensor cores and NGX).",
+                g.name,
+                t.label()
+            ));
+        }
+    }
     if bitness != 64 {
         problems.push("32-bit game: DLSS5-Feeder needs the host64 setup, which this tool does not automate yet.".into());
     }
@@ -335,6 +347,7 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         api,
         bridge: d.join(BRIDGE_ADDON).is_file() || d.join("dlss5-dx11-bridge.addon64").is_file(),
         opti: d.join(OPTI_MANIFEST).is_file(),
+        gpu,
         exe: exe.to_path_buf(),
         bitness,
         reshade: !d.join(OPTI_MANIFEST).is_file() && is_reshade_dll(&d.join(RESHADE_PROXY)),
