@@ -184,10 +184,8 @@ fn cli(
 Done. In game: Insert opens the OptiScaler overlay -> enable Neural Rendering (off by default)."
                 );
             } else {
-                println!(
-                    "
-Done. In game: Home -> DLSS 5 Neural Rendering panel -> enable."
-                );
+                println!("
+Done. In game: Home opens ReShade -> Add-ons tab -> DLSS 5 Neural Rendering -> enable. (Home tab saying no effect files is normal on games with their own DLSS.)");
             }
             0
         }

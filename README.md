@@ -35,7 +35,7 @@ Every file is downloaded from its upstream at install time; a re-run only fetche
 1. Run `dlss5oneclick.exe` (single native binary, no runtime needed).
 2. Pick the game's **folder** (or its `.exe`) - the game exe is detected automatically (the folder and two levels below it are searched, so `bin\x64_dx12\` and Unreal `Binaries\Win64\` layouts work; Unity crash handlers, Unreal helpers and redist installers are skipped; a `*-Shipping.exe` is preferred). If several candidates remain, a dropdown lets you choose. The list shows what is already present.
 3. **Install DLSS 5**.
-4. In game: **Home** opens ReShade. In the **DLSS 5 Neural Rendering** panel, enable it. Keep the game's MSAA/SSAA off.
+4. In game: **Home** opens ReShade → **Add-ons** tab → **DLSS 5 Neural Rendering** panel → enable it. Keep the game's MSAA/SSAA off. On games with their own DLSS the Home tab says "No effect files found" — expected, no shaders are needed there; the panel lives on the Add-ons tab.
 
 **F6** toggles neural rendering on/off, **F5** saves the add-on's screenshot (both are the add-on's own hotkeys). On the Feeder path, `dlss5-feed.log` next to the game exe should show `feature ready … DLAA` and `DLSS5_MV_PROVIDER=3 (LumeniteFX Kernel) -> Lumenite_Kernel (enabled)`.
 
@@ -51,7 +51,7 @@ Every component comes from GitHub releases. Since 0.5.1 the tool reads the publi
 
 ## GPU support
 
-The tool reads the installed display adapters from the registry and refuses up front on anything that cannot run the model: non-NVIDIA cards (NGX does not exist there) and NVIDIA cards without tensor cores (GTX/GT/MX). Among RTX cards, expect very different costs — the DLSS 5 model is FP8 with RTX-50-only kernels; the `310.8.SF` build the tool installs adds patched binaries for RTX 40 and an FP16 path for RTX 20/30. The status line shows the tier: RTX 50 full speed · RTX 40 moderate cost · RTX 20/30 heavy cost. If your card is misdetected, set the environment variable `DLSS5ONECLICK_SKIP_GPU_CHECK=1` to bypass the refusal.
+The tool reads the installed display adapters from the registry and refuses up front on anything that cannot run the model: non-NVIDIA cards (NGX does not exist there) and NVIDIA cards without tensor cores (GTX/GT/MX). Among RTX cards, expect very different costs — the DLSS 5 model is FP8 with RTX-50-only kernels; the `310.8.SF` build the tool installs adds patched binaries for RTX 40 and an FP16 path for RTX 20/30. The status line shows the tier: RTX 50 full speed · RTX 40 moderate cost · RTX 20/30 heavy cost. Virtual/remote adapters (Hyper-V GPU-P, RDP, VMs) are treated as unknown and allowed. If your card is misdetected, set `DLSS5ONECLICK_SKIP_GPU_CHECK=1` to bypass the refusal.
 
 ## Windows Defender / SmartScreen
 
@@ -68,7 +68,7 @@ The exe is not code-signed (no publisher certificate), it is new, and it downloa
 
 - **32-bit games** — need the `host64` helper setup (see Feeder README); the tool refuses rather than half-install.
 - **DirectX 9** and **Vulkan** games — different proxy / a Vulkan layer; refused.
-- Online games — the tool refuses when it finds Easy Anti-Cheat, BattlEye or GameGuard files in the install (ReShade add-on injection is exactly what they flag: kick at best, ban at worst). `DLSS5ONECLICK_IGNORE_ANTICHEAT=1` bypasses the refusal at your own risk.
+- Online games — the tool refuses when it finds Easy Anti-Cheat, BattlEye or GameGuard files in the install (ReShade add-on injection is exactly what they flag: kick at best, ban at worst). Overwatch, Valorant and League (Blizzard/Riot anti-cheat, no marker files) are refused by exe name; Overwatch additionally blocks unsigned DLLs, so add-ons fail there with error `0x80090006`. `DLSS5ONECLICK_IGNORE_ANTICHEAT=1` bypasses the refusal at your own risk.
 
 ## Development
 
