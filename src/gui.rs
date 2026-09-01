@@ -5,12 +5,22 @@ use crate::game::{self, GameStatus};
 use crate::installer::{self, Engine, StepState};
 use crate::logo;
 use crate::theme::{self as t};
+use crate::update;
 use eframe::egui::{
     self, Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, Stroke, StrokeKind, Vec2,
 };
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
+
+#[derive(Clone)]
+enum UpdateState {
+    Idle,
+    Available(update::Available),
+    Downloading(u8, String),
+    Restarting,
+    Failed(String),
+}
 
 enum Msg {
     Progress(u8, String),
@@ -39,6 +49,9 @@ pub struct App {
     candidates: Vec<PathBuf>,
     resolved_exe: Option<PathBuf>,
     engine: Engine,
+    update: UpdateState,
+    update_rx: Option<Receiver<UpdateState>>,
+    skipped_version: String,
 }
 
 impl App {
@@ -62,8 +75,15 @@ impl App {
             candidates: Vec::new(),
             resolved_exe: None,
             engine: Engine::default(),
+            update: UpdateState::Idle,
+            update_rx: None,
+            skipped_version: cc
+                .storage
+                .and_then(|s| s.get_string("skip_version"))
+                .unwrap_or_default(),
         };
         app.refresh();
+        app.start_update_check();
         app
     }
 
@@ -167,6 +187,55 @@ impl App {
             };
             let _ = tx.send(Msg::Finished(out));
         });
+    }
+
+    fn start_update_check(&mut self) {
+        let (tx, rx) = channel::<UpdateState>();
+        self.update_rx = Some(rx);
+        thread::spawn(move || {
+            let st = match update::check() {
+                Ok(Some(av)) => UpdateState::Available(av),
+                _ => UpdateState::Idle,
+            };
+            let _ = tx.send(st);
+        });
+    }
+
+    fn start_update_download(&mut self, av: update::Available) {
+        let (tx, rx) = channel::<UpdateState>();
+        self.update_rx = Some(rx);
+        self.update = UpdateState::Downloading(0, "Starting".into());
+        thread::spawn(move || {
+            let p_tx = tx.clone();
+            let res = update::download_and_swap(&av, &move |pct, msg| {
+                let _ = p_tx.send(UpdateState::Downloading(pct, msg.to_owned()));
+            });
+            match res {
+                Ok(exe) => {
+                    let _ = tx.send(UpdateState::Restarting);
+                    if update::relaunch(&exe).is_ok() {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        std::process::exit(0);
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(UpdateState::Failed(format!("{e:#}")));
+                }
+            }
+        });
+    }
+
+    fn pump_update(&mut self) {
+        let Some(rx) = &self.update_rx else { return };
+        let mut last = None;
+        while let Ok(m) = rx.try_recv() {
+            last = Some(m);
+        }
+        if let Some(m) = last {
+            let skip =
+                matches!(&m, UpdateState::Available(av) if av.version == self.skipped_version);
+            self.update = if skip { UpdateState::Idle } else { m };
+        }
     }
 
     fn pump(&mut self) {
@@ -366,6 +435,7 @@ fn tile(ui: &mut egui::Ui, rect: egui::Rect, tl: &Tile, st: Option<&GameStatus>)
 impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string("exe", self.exe_text.clone());
+        storage.set_string("skip_version", self.skipped_version.clone());
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -401,6 +471,137 @@ impl eframe::App for App {
                     });
                 });
             });
+
+        self.pump_update();
+        match self.update.clone() {
+            UpdateState::Idle => {}
+            UpdateState::Available(av) => {
+                egui::Panel::top("update_bar")
+                    .frame(
+                        Frame::new()
+                            .fill(t::TILE)
+                            .inner_margin(Margin {
+                                left: 18,
+                                right: 28,
+                                top: 8,
+                                bottom: 8,
+                            })
+                            .stroke(Stroke::new(1.0, t::BORDER)),
+                    )
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            ui.label(
+                                RichText::new(format!(
+                                    "Version {} is available (you have {}).",
+                                    av.version,
+                                    update::CURRENT
+                                ))
+                                .font(t::plex_medium(12.5))
+                                .color(t::TEXT),
+                            );
+                            let upd = egui::Button::new(
+                                RichText::new("Update")
+                                    .font(t::plex_semibold(12.5))
+                                    .color(t::BG),
+                            )
+                            .fill(t::ACCENT)
+                            .stroke(Stroke::NONE)
+                            .corner_radius(CornerRadius::same(6));
+                            if ui.add(upd).clicked() {
+                                self.start_update_download(av.clone());
+                            }
+                            if ui.button("Later").clicked() {
+                                self.update = UpdateState::Idle;
+                            }
+                            if ui.button("Skip this version").clicked() {
+                                self.skipped_version = av.version.clone();
+                                self.update = UpdateState::Idle;
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.hyperlink_to(
+                                    RichText::new("release notes").font(t::plex(11.5)),
+                                    format!(
+                                        "https://github.com/{}/releases/tag/{}",
+                                        update::REPO,
+                                        av.tag
+                                    ),
+                                );
+                            });
+                        });
+                    });
+            }
+            UpdateState::Downloading(pct, msg) => {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(100));
+                egui::Panel::top("update_bar")
+                    .frame(
+                        Frame::new()
+                            .fill(t::TILE)
+                            .inner_margin(Margin {
+                                left: 18,
+                                right: 28,
+                                top: 8,
+                                bottom: 8,
+                            })
+                            .stroke(Stroke::new(1.0, t::BORDER)),
+                    )
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(format!("Updating: {pct}% {msg}"))
+                                .font(t::plex(12.0))
+                                .color(t::TEXT_MUTED),
+                        );
+                    });
+            }
+            UpdateState::Restarting => {
+                egui::Panel::top("update_bar")
+                    .frame(
+                        Frame::new()
+                            .fill(t::TILE)
+                            .inner_margin(Margin {
+                                left: 18,
+                                right: 28,
+                                top: 8,
+                                bottom: 8,
+                            })
+                            .stroke(Stroke::new(1.0, t::BORDER)),
+                    )
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("Updated. Restarting...")
+                                .font(t::plex(12.0))
+                                .color(t::ACCENT),
+                        );
+                    });
+            }
+            UpdateState::Failed(e) => {
+                egui::Panel::top("update_bar")
+                    .frame(
+                        Frame::new()
+                            .fill(t::TILE)
+                            .inner_margin(Margin {
+                                left: 18,
+                                right: 28,
+                                top: 8,
+                                bottom: 8,
+                            })
+                            .stroke(Stroke::new(1.0, t::BORDER)),
+                    )
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("Update failed: {e}"))
+                                    .font(t::plex(12.0))
+                                    .color(t::DANGER),
+                            );
+                            if ui.button("Dismiss").clicked() {
+                                self.update = UpdateState::Idle;
+                            }
+                        });
+                    });
+            }
+        }
 
         egui::CentralPanel::default()
             .frame(Frame::new().fill(t::PANEL).inner_margin(Margin {

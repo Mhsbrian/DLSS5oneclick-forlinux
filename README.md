@@ -41,6 +41,10 @@ Every file is downloaded from its upstream at install time; a re-run only fetche
 
 CLI: `dlss5oneclick.exe "C:\Games\Foo"` (folder or exe) / `--check` (detect only) / `--remove` (headless, prints progress).
 
+## Updates
+
+On start the tool looks at `github.com/faisalkindi/DLSS5oneclick/releases/latest` (a redirect, no API) in the background. If a newer version exists, a bar offers **Update / Later / Skip this version**; nothing is downloaded unless you press Update. Update fetches the release exe, checks it is a real executable, swaps it in place of the running one (the old file is kept as `dlss5oneclick.exe.old` until the next start) and restarts. `dlss5oneclick.exe --update` does the same from the command line.
+
 ## Downloads and GitHub
 
 Every component comes from GitHub releases. Since 0.5.1 the tool reads the public release **pages** (no API), so it is not subject to GitHub's 60-requests-per-hour API cap that caused `HTTP 403 Forbidden` for people installing into many games. If you set a `GITHUB_TOKEN` environment variable it is used for the API path first. Where github.com itself is unreachable (some countries block it), a proxy or VPN is the only way — the files exist nowhere else this tool trusts.

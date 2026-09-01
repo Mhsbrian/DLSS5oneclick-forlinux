@@ -8,13 +8,19 @@ mod logo;
 mod net;
 mod reshade_ini;
 mod theme;
+mod update;
 
 use std::io::Write;
 use std::path::PathBuf;
 
-/// `dlss5oneclick <GAME.exe | game folder> [--remove | --remove-all | --check | --engine=opti]` runs headless; no args opens the GUI.
+/// `dlss5oneclick <GAME.exe | game folder> [--remove | --remove-all | --check | --engine=opti] | --update` runs headless; no args opens the GUI.
 fn main() {
+    update::cleanup_old();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--update") {
+        attach_parent_console();
+        std::process::exit(cli_update());
+    }
     if let Some(first) = args.first().filter(|a| !a.starts_with('-')) {
         attach_parent_console();
         let code = cli(
@@ -33,6 +39,40 @@ fn main() {
     if let Err(e) = gui::run() {
         eprintln!("gui error: {e}");
         std::process::exit(2);
+    }
+}
+
+fn cli_update() -> i32 {
+    match update::check() {
+        Ok(None) => {
+            println!("DLSS5oneclick {} is the latest version.", update::CURRENT);
+            0
+        }
+        Ok(Some(av)) => {
+            println!(
+                "{} -> {} available. Downloading...",
+                update::CURRENT,
+                av.version
+            );
+            let progress = |pct: u8, msg: &str| {
+                print!("\r{pct:3}% {msg:<72}");
+                let _ = std::io::stdout().flush();
+            };
+            match update::download_and_swap(&av, &progress) {
+                Ok(exe) => {
+                    println!("\nUpdated to {} at {}", av.version, exe.display());
+                    0
+                }
+                Err(e) => {
+                    eprintln!("\nerror: {e:#}");
+                    1
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            1
+        }
     }
 }
 
