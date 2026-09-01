@@ -319,8 +319,9 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     let textures = d.join("reshade-shaders").join("Textures");
     let mut problems = Vec::new();
     let gpu = gpu::best();
+    let skip_gpu = std::env::var_os("DLSS5ONECLICK_SKIP_GPU_CHECK").is_some();
     if let Some((g, t)) = &gpu {
-        if !t.can_run() {
+        if !t.can_run() && !skip_gpu {
             problems.push(format!(
                 "GPU is {} ({}): the DLSS 5 model runs on NVIDIA RTX only (it needs tensor cores and NGX).",
                 g.name,
@@ -560,6 +561,7 @@ mod tests {
 
     #[test]
     fn inspect_empty_and_32bit() {
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
         let t = tempfile::tempdir().unwrap();
         let st = inspect(&make_pe(&t.path().join("game.exe"), PE_X64)).unwrap();
         assert_eq!(st.bitness, 64);

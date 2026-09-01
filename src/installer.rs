@@ -1051,6 +1051,7 @@ mod tests {
 
     #[test]
     fn opti_plan_and_engine_gate() {
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
         let t = tempfile::tempdir().unwrap();
         let exe = make_pe(&t.path().join("game.exe"), game::PE_X64);
         let st = game::inspect(&exe).unwrap();
