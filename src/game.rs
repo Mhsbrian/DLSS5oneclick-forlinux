@@ -272,6 +272,22 @@ pub fn detect_anticheat(game_dir: &Path) -> Option<&'static str> {
     walk(game_dir, 3)
 }
 
+/// Online titles whose anti-cheat ships no marker files (Blizzard's, Riot's).
+/// Overwatch also blocks unsigned DLLs outright (add-ons fail with 0x80090006).
+pub fn known_anticheat_exe(exe: &Path) -> Option<&'static str> {
+    let n = exe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match n.as_str() {
+        "overwatch.exe" => Some("Blizzard anti-cheat (Overwatch)"),
+        "valorant.exe" | "valorant-win64-shipping.exe" => Some("Riot Vanguard"),
+        "leagueclient.exe" | "league of legends.exe" => Some("Riot Vanguard"),
+        _ => None,
+    }
+}
+
 /// True if the game ships its own DLSS.
 ///
 /// Signals, any one is enough: an `nvngx_dlss.dll` under the exe's folder (depth <= 4)
@@ -366,7 +382,7 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     let shaders = d.join("reshade-shaders").join("Shaders");
     let textures = d.join("reshade-shaders").join("Textures");
     let mut problems = Vec::new();
-    if let Some(ac) = detect_anticheat(d) {
+    if let Some(ac) = detect_anticheat(d).or_else(|| known_anticheat_exe(exe)) {
         if std::env::var_os("DLSS5ONECLICK_IGNORE_ANTICHEAT").is_none() {
             problems.push(format!(
                 "{ac} anti-cheat found in this game. ReShade add-on injection is what it detects: kick at best, ban at worst. Refused."
@@ -378,7 +394,7 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     if let Some((g, t)) = &gpu {
         if !t.can_run() && !skip_gpu {
             problems.push(format!(
-                "GPU is {} ({}): the DLSS 5 model runs on NVIDIA RTX only (it needs tensor cores and NGX).",
+                "GPU is {} ({}): the DLSS 5 model runs on NVIDIA RTX only (it needs tensor cores and NGX). Misdetected? Set DLSS5ONECLICK_SKIP_GPU_CHECK=1.",
                 g.name,
                 t.label()
             ));

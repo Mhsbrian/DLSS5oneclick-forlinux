@@ -180,7 +180,7 @@ impl App {
                     if engine == Engine::Opti {
                         "Done. In game: Insert opens the OptiScaler overlay → enable Neural Rendering.".to_owned()
                     } else {
-                        "Done. In game: Home → DLSS 5 Neural Rendering → enable.".to_owned()
+                        "Done. In game: Home opens ReShade → Add-ons tab → DLSS 5 Neural Rendering → enable. (Home tab saying \"no effect files\" is normal on games with their own DLSS.)".to_owned()
                     }
                 })
                 .map_err(|e| format!("{e:#}"))
@@ -453,7 +453,17 @@ impl eframe::App for App {
 
         // ── header ────────────────────────────────────────────────
         egui::Panel::top("header")
-            .frame(Frame::new().fill(t::HEADER).inner_margin(Margin { left: 18, right: 28, top: 12, bottom: 12 }).stroke(Stroke::new(1.0, t::BORDER)))
+            .frame(
+                Frame::new()
+                    .fill(t::HEADER)
+                    .inner_margin(Margin {
+                        left: 18,
+                        right: 28,
+                        top: 12,
+                        bottom: 12,
+                    })
+                    .stroke(Stroke::new(1.0, t::BORDER)),
+            )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 12.0;
@@ -461,13 +471,25 @@ impl eframe::App for App {
                     logo::paint_mark(ui.painter(), rect, t::ACCENT, t::BG);
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 1.0;
-                        ui.label(RichText::new("DLSS5oneclick").font(t::sora(15.0)).color(t::TEXT));
-                        ui.label(RichText::new("Sets up the leaked DLSS 5 neural-rendering build in any DX11/DX12 game, with or without DLSS")
-                            .font(t::plex(11.0)).color(t::TEXT_MUTED));
+                        ui.label(
+                            RichText::new("DLSS5oneclick")
+                                .font(t::sora(15.0))
+                                .color(t::TEXT),
+                        );
+                        ui.label(
+                            RichText::new("Leaked DLSS 5 neural rendering for any DX11/DX12 game")
+                                .font(t::plex(11.0))
+                                .color(t::TEXT_MUTED),
+                        );
                     });
                     chip(ui, "LEAKED BUILD", t::ACCENT, true);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        chip(ui, concat!("v", env!("CARGO_PKG_VERSION")), t::TEXT_DIM, false);
+                        chip(
+                            ui,
+                            concat!("v", env!("CARGO_PKG_VERSION")),
+                            t::TEXT_DIM,
+                            false,
+                        );
                     });
                 });
             });
@@ -865,7 +887,7 @@ Remove incl. ReShade also deletes ReShade (dxgi.dll, ini files, reshade-shaders)
 pub fn run() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([700.0, 560.0])
-        .with_min_inner_size([620.0, 480.0])
+        .with_min_inner_size([700.0, 520.0])
         .with_title(concat!("DLSS5oneclick ", env!("CARGO_PKG_VERSION")));
     if let Some(icon) = logo::icon_data() {
         viewport = viewport.with_icon(icon);

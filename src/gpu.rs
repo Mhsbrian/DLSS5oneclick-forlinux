@@ -49,6 +49,25 @@ impl Tier {
 
 pub fn classify(name: &str) -> Tier {
     let n = name.to_ascii_lowercase();
+    // Virtual / remote adapters say nothing about the real GPU (Hyper-V GPU-P,
+    // RDP sessions, VMs, safe mode). Never refuse on those.
+    for v in [
+        "hyper-v",
+        "remote display",
+        "basic display",
+        "basic render",
+        "vmware",
+        "virtualbox",
+        "parallels",
+        "virtio",
+        "qxl",
+        "citrix",
+        "rdp",
+    ] {
+        if n.contains(v) {
+            return Tier::Unknown;
+        }
+    }
     if !(n.contains("nvidia") || n.contains("geforce") || n.contains("rtx") || n.contains("quadro"))
     {
         return Tier::NotNvidia;
@@ -130,7 +149,7 @@ pub fn list() -> Vec<Gpu> {
     }
     let base = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
     let mut out = Vec::new();
-    for i in 0..16 {
+    for i in 0..64 {
         let sub = wide(&format!("{base}\\{i:04}"));
         let mut key: HKEY = std::ptr::null_mut();
         let rc = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub.as_ptr(), 0, KEY_READ, &mut key) };
@@ -170,6 +189,8 @@ mod tests {
         assert_eq!(classify("AMD Radeon(TM) Graphics"), Tier::NotNvidia);
         assert_eq!(classify("Intel(R) Arc(TM) A770"), Tier::NotNvidia);
         assert_eq!(classify("NVIDIA RTX A6000"), Tier::Unknown);
+        assert_eq!(classify("Microsoft Hyper-V Video"), Tier::Unknown);
+        assert_eq!(classify("Microsoft Remote Display Adapter"), Tier::Unknown);
     }
 
     #[test]
