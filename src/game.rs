@@ -224,6 +224,54 @@ pub fn detect_api(exe: &Path) -> Api {
     }
 }
 
+/// Anti-cheat present in the install tree, by the files those systems ship.
+/// ReShade add-on injection is exactly what they look for: kicks at best, bans
+/// at worst. Verified file names: EAC `EasyAntiCheat[_EOS]/EasyAntiCheat_EOS_Setup.exe`,
+/// BattlEye `BattlEye/BEService_x64.exe`, `Install_BattlEye.bat`, `*_BE.exe`,
+/// GameGuard `tools/GGSetup.exe` or a `GameGuard` folder.
+pub fn detect_anticheat(game_dir: &Path) -> Option<&'static str> {
+    fn walk(d: &Path, depth: u8) -> Option<&'static str> {
+        let rd = fs::read_dir(d).ok()?;
+        for e in rd.flatten() {
+            let p = e.path();
+            let n = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if p.is_dir() {
+                if n == "easyanticheat" || n == "easyanticheat_eos" {
+                    return Some("Easy Anti-Cheat");
+                }
+                if n == "battleye" {
+                    return Some("BattlEye");
+                }
+                if n == "gameguard" {
+                    return Some("GameGuard");
+                }
+                if depth > 0 {
+                    if let Some(hit) = walk(&p, depth - 1) {
+                        return Some(hit);
+                    }
+                }
+            } else {
+                if n.starts_with("easyanticheat") && n.ends_with(".exe") {
+                    return Some("Easy Anti-Cheat");
+                }
+                if n == "beservice_x64.exe" || n == "install_battleye.bat" || n.ends_with("_be.exe")
+                {
+                    return Some("BattlEye");
+                }
+                if n == "ggsetup.exe" || n == "gameguard.des" {
+                    return Some("GameGuard");
+                }
+            }
+        }
+        None
+    }
+    walk(game_dir, 3)
+}
+
 /// True if the game ships its own DLSS.
 ///
 /// Signals, any one is enough: an `nvngx_dlss.dll` under the exe's folder (depth <= 4)
@@ -318,6 +366,13 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     let shaders = d.join("reshade-shaders").join("Shaders");
     let textures = d.join("reshade-shaders").join("Textures");
     let mut problems = Vec::new();
+    if let Some(ac) = detect_anticheat(d) {
+        if std::env::var_os("DLSS5ONECLICK_IGNORE_ANTICHEAT").is_none() {
+            problems.push(format!(
+                "{ac} anti-cheat found in this game. ReShade add-on injection is what it detects: kick at best, ban at worst. Refused."
+            ));
+        }
+    }
     let gpu = gpu::best();
     let skip_gpu = std::env::var_os("DLSS5ONECLICK_SKIP_GPU_CHECK").is_some();
     if let Some((g, t)) = &gpu {
@@ -645,6 +700,32 @@ mod tests {
         let exe = make_pe(&t.path().join("game.exe"), PE_X64);
         assert!(pe_imports(&exe).is_empty());
         assert_eq!(detect_api(&exe), Api::Unknown);
+    }
+
+    #[test]
+    fn anticheat_detected_and_refused() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe(&d.join("game.exe"), PE_X64);
+        assert_eq!(detect_anticheat(d), None);
+        fs::create_dir_all(d.join("tools")).unwrap();
+        fs::write(d.join("tools").join("GGSetup.exe"), b"x").unwrap();
+        assert_eq!(detect_anticheat(d), Some("GameGuard"));
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+        let st = inspect(&exe).unwrap();
+        assert!(st.problems.iter().any(|p| p.contains("GameGuard")));
+        fs::remove_dir_all(d.join("tools")).unwrap();
+        fs::create_dir_all(
+            d.join("Game")
+                .join("Binaries")
+                .join("Win64")
+                .join("EasyAntiCheat"),
+        )
+        .unwrap();
+        assert_eq!(detect_anticheat(d), Some("Easy Anti-Cheat"));
+        fs::remove_dir_all(d.join("Game")).unwrap();
+        fs::write(d.join("Foo_BE.exe"), b"x").unwrap();
+        assert_eq!(detect_anticheat(d), Some("BattlEye"));
     }
 
     #[test]

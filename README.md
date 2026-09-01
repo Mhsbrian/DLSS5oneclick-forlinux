@@ -68,7 +68,7 @@ The exe is not code-signed (no publisher certificate), it is new, and it downloa
 
 - **32-bit games** — need the `host64` helper setup (see Feeder README); the tool refuses rather than half-install.
 - **DirectX 9** and **Vulkan** games — different proxy / a Vulkan layer; refused.
-- Online games — ReShade with add-ons trips anti-cheat.
+- Online games — the tool refuses when it finds Easy Anti-Cheat, BattlEye or GameGuard files in the install (ReShade add-on injection is exactly what they flag: kick at best, ban at worst). `DLSS5ONECLICK_IGNORE_ANTICHEAT=1` bypasses the refusal at your own risk.
 
 ## Development
 
