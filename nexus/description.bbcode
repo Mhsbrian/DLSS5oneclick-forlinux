@@ -11,7 +11,9 @@ Pick the game folder, press [b]Install DLSS 5[/b]. The tool detects the game exe
 [/list]
 Re-running only fetches what is missing. Since 0.5.1 downloads no longer go through the GitHub API, so the 60-per-hour cap that caused [i]HTTP 403 Forbidden[/i] after a few installs is gone; github.com itself must be reachable (some countries block it — a proxy/VPN is the only way).
 
-[b]New in 0.5.0 — engine choice for games with native DLSS:[/b] besides the default ReShade + RenoDX add-on, you can pick [url=https://github.com/Dagherbou/OptiScaler_DLSSNR]Dagherbou's OptiScaler_DLSSNR[/url] (OptiScaler with a built-in Neural Rendering pass). The tool extracts it as dxgi.dll, adds the DLSS 5 model, and Remove takes it out via a manifest. In game: [b]Insert[/b] opens the OptiScaler overlay, enable Neural Rendering there. The two engines cannot share one game. [b]Remove[/b] takes it all out again (ReShade and the game's own nvngx_dlss.dll stay).
+[b]New in 0.5.0 — engine choice for games with native DLSS:[/b] besides the default ReShade + RenoDX add-on, you can pick [url=https://github.com/Dagherbou/OptiScaler_DLSSNR]Dagherbou's OptiScaler_DLSSNR[/url] (OptiScaler with a built-in Neural Rendering pass). The tool extracts it as dxgi.dll, adds the DLSS 5 model, and Remove takes it out via a manifest. In game: [b]Insert[/b] opens the OptiScaler overlay, enable Neural Rendering there. The two engines cannot share one game.
+
+[b]Remove[/b] takes out what the tool added (ReShade stays); [b]Remove incl. ReShade[/b] also deletes dxgi.dll, the ReShade ini files and reshade-shaders — refused if it finds add-ons or shaders the tool did not install. The game's own nvngx_dlss.dll is never touched.
 
 [size=4][b]Use[/b][/size]
 [list=1]
@@ -20,7 +22,7 @@ Re-running only fetches what is missing. Since 0.5.1 downloads no longer go thro
 [*][b]Install DLSS 5[/b]
 [*]In game: [b]Home[/b] opens ReShade → [b]DLSS 5 Neural Rendering[/b] panel → enable. [b]F6[/b] toggles neural rendering, [b]F5[/b] takes its screenshot. Keep the game's MSAA/SSAA off.
 [/list]
-Command line: [font=Courier New]dlss5oneclick.exe "C:\Games\Foo"[/font] · [font=Courier New]--check[/font] shows what it detected without installing · [font=Courier New]--remove[/font] uninstalls.
+Command line: [font=Courier New]dlss5oneclick.exe "C:\Games\Foo"[/font] · [font=Courier New]--check[/font] shows what it detected without installing · [font=Courier New]--remove[/font] uninstalls · [font=Courier New]--remove-all[/font] also removes ReShade · [font=Courier New]--engine=opti[/font] picks the OptiScaler engine.
 
 [size=4][b]Not handled[/b][/size]
 [list]
@@ -49,7 +51,8 @@ This tool only automates other people's work:
 [*][url=https://github.com/umar-afzaal/LumeniteFX]Afzaal (Kaidō)[/url] — LumeniteFX
 [*][url=https://github.com/clshortfuse/renodx]clshortfuse[/url] and the RenoDX community — RenoDX, base of the DLSS 5 add-on
 [*][url=https://github.com/RankFTW/RHI]RankFTW[/url] — RHI and the rhi-repo releases hosting the add-on and runtimes
-[*][url=https://github.com/NIGos/dlss5-dx11-bridge]NIGos[/url] — dlss5-dx11-bridge
+[*][url=https://github.com/NIGos/dlss5-bridge]NIGos[/url] — dlss5-bridge (DLSS 5 in D3D11 games with their own DLSS)
+[*][url=https://github.com/Dagherbou/OptiScaler_DLSSNR]Dagherbou[/url] — OptiScaler_DLSSNR, and the [url=https://github.com/optiscaler/OptiScaler]OptiScaler team[/url] it builds on
 [*]NVIDIA — DLSS 5
 [*]DSOGaming — the article that put the pieces together
 [*][url=https://github.com/emilk/egui]emilk[/url] — egui / eframe
