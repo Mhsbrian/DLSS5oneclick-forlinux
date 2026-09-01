@@ -17,6 +17,35 @@ use std::path::PathBuf;
 fn main() {
     update::cleanup_old();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--fetch") {
+        attach_parent_console();
+        let (Some(url), Some(dest)) = (args.get(1), args.get(2)) else {
+            eprintln!("usage: --fetch <url> <file>");
+            std::process::exit(2);
+        };
+        let code = match net::client().and_then(|c| {
+            net::download(&c, url, std::path::Path::new(dest), "fetch", &|p, m| {
+                print!("\r{p:3}% {m:<72}");
+                let _ = std::io::stdout().flush();
+            })
+        }) {
+            Ok(()) => {
+                println!(
+                    "
+ok"
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!(
+                    "
+error: {e:#}"
+                );
+                1
+            }
+        };
+        std::process::exit(code);
+    }
     if args.iter().any(|a| a == "--update") {
         attach_parent_console();
         std::process::exit(cli_update());

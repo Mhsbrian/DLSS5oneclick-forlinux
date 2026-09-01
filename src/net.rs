@@ -141,8 +141,41 @@ fn fmt_bytes(n: u64) -> String {
     }
 }
 
-/// Stream `url` to `dest` (via a `.part` file), reporting progress.
+/// Stream `url` to `dest`, retrying connection-level failures (GitHub's CDN edge
+/// occasionally answers with a broken TLS record; the next attempt succeeds).
 pub fn download(
+    client: &Client,
+    url: &str,
+    dest: &Path,
+    label: &str,
+    progress: Progress,
+) -> Result<()> {
+    let mut last = None;
+    for attempt in 1..=4u32 {
+        match download_once(client, url, dest, label, progress) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                let retryable = msg.contains("error sending request")
+                    || msg.contains("Connect")
+                    || msg.contains("corrupt message")
+                    || msg.contains("connection")
+                    || msg.contains("timed out")
+                    || msg.contains("reset");
+                if !retryable || attempt == 4 {
+                    return Err(e);
+                }
+                progress(0, &format!("{label}: retrying ({attempt}/3)"));
+                std::thread::sleep(std::time::Duration::from_secs(2 * attempt as u64));
+                last = Some(e);
+            }
+        }
+    }
+    Err(last.unwrap())
+}
+
+/// One attempt: stream to a `.part` file, reporting percent + KB/MB downloaded.
+fn download_once(
     client: &Client,
     url: &str,
     dest: &Path,
