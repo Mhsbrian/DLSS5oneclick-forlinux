@@ -5,6 +5,8 @@ use crate::diagnose;
 use crate::game::{self, GameStatus};
 use crate::installer::{self, Engine, StepState};
 use crate::logo;
+use crate::net;
+use crate::renodx;
 use crate::theme::{self as t};
 use crate::update;
 use eframe::egui::{
@@ -53,6 +55,21 @@ pub struct App {
     update: UpdateState,
     update_rx: Option<Receiver<UpdateState>>,
     skipped_version: String,
+    /// "Also install the RenoDX HDR mod" checkbox.
+    renodx_on: bool,
+    renodx: RenodxLookup,
+    renodx_rx: Option<Receiver<RenodxLookup>>,
+    /// Exe the current lookup belongs to, so a refresh does not re-fetch.
+    renodx_for: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+enum RenodxLookup {
+    Idle,
+    Pending,
+    Found(renodx::Mod),
+    NotFound,
+    Failed(String),
 }
 
 impl App {
@@ -78,6 +95,10 @@ impl App {
             engine: Engine::default(),
             update: UpdateState::Idle,
             update_rx: None,
+            renodx_on: false,
+            renodx: RenodxLookup::Idle,
+            renodx_rx: None,
+            renodx_for: None,
             skipped_version: cc
                 .storage
                 .and_then(|s| s.get_string("skip_version"))
@@ -126,11 +147,43 @@ impl App {
             .resolved_exe
             .as_ref()
             .map(|p| game::inspect(p).map_err(|e| format!("{e:#}")));
+        if self.resolved_exe != self.renodx_for {
+            self.renodx_for = self.resolved_exe.clone();
+            self.renodx_on = false;
+            self.start_renodx_lookup();
+        }
+    }
+
+    fn start_renodx_lookup(&mut self) {
+        let Some(exe) = self.exe() else {
+            self.renodx = RenodxLookup::Idle;
+            return;
+        };
+        let (tx, rx) = channel::<RenodxLookup>();
+        self.renodx_rx = Some(rx);
+        self.renodx = RenodxLookup::Pending;
+        thread::spawn(move || {
+            let r = match net::client().and_then(|c| renodx::lookup(&c, &exe)) {
+                Ok(Some(m)) => RenodxLookup::Found(m),
+                Ok(None) => RenodxLookup::NotFound,
+                Err(e) => RenodxLookup::Failed(format!("{e:#}")),
+            };
+            let _ = tx.send(r);
+        });
+    }
+
+    fn pump_renodx(&mut self) {
+        let Some(rx) = &self.renodx_rx else { return };
+        if let Ok(r) = rx.try_recv() {
+            self.renodx = r;
+            self.renodx_rx = None;
+        }
     }
 
     fn start(&mut self, remove: Option<bool>) {
         let Some(exe) = self.exe() else { return };
         let engine = self.engine;
+        let with_renodx = self.renodx_on && engine == Engine::ReShade;
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
         self.rx = Some(rx);
         self.running = true;
@@ -165,6 +218,7 @@ impl App {
                 installer::run_all_with(
                     &exe,
                     engine,
+                    with_renodx,
                     &move |pct, msg| {
                         let _ = p_tx.send(Msg::Progress(pct, msg.to_owned()));
                     },
@@ -371,7 +425,32 @@ const TILES_NATIVE: [Tile; 4] = [
     },
 ];
 
-fn tiles_for(st: Option<&GameStatus>, engine: Engine) -> Vec<&'static Tile> {
+const TILE_RENODX: Tile = Tile {
+    title: "RenoDX HDR mod",
+    detail: "game-specific renodx-*.addon64 · Home → Add-ons → RenoDX",
+    ok: |s| s.renodx_mod.is_some(),
+    optional: true,
+};
+
+const TILE_REFRAMEWORK: Tile = Tile {
+    title: "REFramework",
+    detail: "dinput8.dll · RE Engine games need it before ReShade",
+    ok: |s| s.reframework,
+    optional: false,
+};
+
+fn tiles_for(st: Option<&GameStatus>, engine: Engine, renodx_on: bool) -> Vec<&'static Tile> {
+    let mut v = base_tiles(st, engine);
+    if st.is_some_and(|s| s.re_engine) {
+        v.insert(0, &TILE_REFRAMEWORK);
+    }
+    if renodx_on || st.is_some_and(|s| s.renodx_mod.is_some()) {
+        v.push(&TILE_RENODX);
+    }
+    v
+}
+
+fn base_tiles(st: Option<&GameStatus>, engine: Engine) -> Vec<&'static Tile> {
     match st.map(|s| s.mode) {
         Some(game::Mode::Native) if engine == Engine::Opti || st.is_some_and(|s| s.opti) => {
             vec![&TILES_NATIVE[0], &TILE_OPTI, &TILES_NATIVE[2]]
@@ -548,7 +627,8 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.pump();
-        if self.running {
+        self.pump_renodx();
+        if self.running || matches!(self.renodx, RenodxLookup::Pending) {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -906,7 +986,7 @@ impl eframe::App for App {
                 let tile_h = 58.0;
                 let row_w = ui.available_width();
                 let col_w = ((row_w - gap) / 2.0).floor();
-                let tiles = tiles_for(ok_status.as_ref(), self.engine);
+                let tiles = tiles_for(ok_status.as_ref(), self.engine, self.renodx_on);
                 for row in tiles.chunks(2) {
                     let (row_rect, _) =
                         ui.allocate_exact_size(Vec2::new(row_w, tile_h), egui::Sense::hover());
@@ -918,6 +998,48 @@ impl eframe::App for App {
                         );
                         tile(ui, rect, tl, ok_status.as_ref());
                     }
+                }
+
+                // ── RenoDX HDR mod ────────────────────────────────
+                if let Some(s) = &ok_status {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(
+                            RichText::new("RENODX HDR MOD")
+                                .font(t::plex_semibold(11.0))
+                                .color(t::TEXT_MUTED),
+                        );
+                        let dim = |ui: &mut egui::Ui, text: String| {
+                            ui.label(RichText::new(text).font(t::plex(11.0)).color(t::TEXT_DIM));
+                        };
+                        if let Some(installed) = &s.renodx_mod {
+                            dim(ui, format!("— installed: {installed} (Remove takes it out too)"));
+                        } else if !s.foreign_renodx.is_empty() {
+                            dim(ui, format!(
+                                "— already present, not installed by this tool: {} (left untouched; ReShade loads one RenoDX mod per game)",
+                                s.foreign_renodx.join(", ")
+                            ));
+                        } else if self.engine == Engine::Opti {
+                            self.renodx_on = false;
+                            dim(ui, "— RenoDX mods are ReShade add-ons; pick the ReShade engine to add one.".into());
+                        } else {
+                            match &self.renodx {
+                                RenodxLookup::Idle | RenodxLookup::Pending => dim(ui, "— looking up clshortfuse/renodx for this game…".into()),
+                                RenodxLookup::NotFound => dim(ui, "— no RenoDX mod is published for this game.".into()),
+                                RenodxLookup::Failed(e) => dim(ui, format!("— lookup failed: {e}")),
+                                RenodxLookup::Found(m) => {
+                                    let label = format!("Also install {} — {}", m.file, m.status_label());
+                                    let cb = egui::Checkbox::new(&mut self.renodx_on, RichText::new(label).font(t::plex(12.0)).color(t::TEXT_SOFT));
+                                    ui.add_enabled(!self.running, cb).on_hover_text(
+                                        "Game-specific HDR / tone-mapping mod from the RenoDX project. Loads beside the DLSS 5 add-on (different add-on name, different settings section). Turn Windows AutoHDR / RTX HDR off to avoid double tone mapping.",
+                                    );
+                                    if !m.note.is_empty() {
+                                        dim(ui, format!("— {}", m.note));
+                                    }
+                                }
+                            }
+                        }
+                    });
                 }
 
                 // ── actions ───────────────────────────────────────

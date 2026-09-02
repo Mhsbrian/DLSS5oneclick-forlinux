@@ -7,6 +7,7 @@ mod gui;
 mod installer;
 mod logo;
 mod net;
+mod renodx;
 mod reshade_ini;
 mod theme;
 mod update;
@@ -14,7 +15,7 @@ mod update;
 use std::io::Write;
 use std::path::PathBuf;
 
-/// `dlss5oneclick <GAME.exe | game folder> [--remove | --remove-all | --check | --diagnose | --engine=opti] | --update` runs headless; no args opens the GUI.
+/// `dlss5oneclick <GAME.exe | game folder> [--remove | --remove-all | --check | --diagnose | --engine=opti | --renodx] | --update` runs headless; no args opens the GUI.
 fn main() {
     update::cleanup_old();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -64,6 +65,7 @@ error: {e:#}"
             } else {
                 installer::Engine::ReShade
             },
+            args.iter().any(|a| a == "--renodx"),
         );
         std::process::exit(code);
     }
@@ -114,6 +116,7 @@ fn cli(
     check: bool,
     diagnose_only: bool,
     engine: installer::Engine,
+    with_renodx: bool,
 ) -> i32 {
     let (exe, candidates) = match game::resolve_target(&target) {
         Ok(v) => v,
@@ -178,8 +181,45 @@ fn cli(
                 for p in &st.problems {
                     println!("  ! {p}");
                 }
-                let names: Vec<&str> = installer::plan(&st).iter().map(|s| s.name).collect();
+                let names: Vec<&str> = installer::plan_with(&st, engine, with_renodx)
+                    .iter()
+                    .map(|s| s.name)
+                    .collect();
                 println!("  plan: {}", names.join(" -> "));
+                if st.re_engine {
+                    println!(
+                        "  RE Engine game: REFramework (dinput8.dll) {}",
+                        if st.reframework {
+                            "present"
+                        } else {
+                            "missing, will be installed"
+                        }
+                    );
+                }
+                if let Some(m) = &st.renodx_mod {
+                    println!("  RenoDX mod installed: {m}");
+                }
+                if !st.foreign_renodx.is_empty() {
+                    println!(
+                        "  RenoDX mod present (not installed by this tool): {}",
+                        st.foreign_renodx.join(", ")
+                    );
+                }
+                match net::client().and_then(|c| renodx::lookup(&c, &exe)) {
+                    Ok(Some(m)) => println!(
+                        "  RenoDX HDR mod available: {} -> {} ({}){}",
+                        m.title,
+                        m.file,
+                        m.status_label(),
+                        if m.note.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" | {}", m.note)
+                        }
+                    ),
+                    Ok(None) => println!("  RenoDX HDR mod: none for this game"),
+                    Err(e) => println!("  RenoDX lookup failed: {e:#}"),
+                }
                 0
             }
             Err(e) => {
@@ -231,7 +271,7 @@ fn cli(
             Error => println!("\n      FAILED: {detail}"),
         }
     };
-    match installer::run_all_with(&exe, engine, &progress, &step) {
+    match installer::run_all_with(&exe, engine, with_renodx, &progress, &step) {
         Ok(_) => {
             if engine == installer::Engine::Opti {
                 println!(

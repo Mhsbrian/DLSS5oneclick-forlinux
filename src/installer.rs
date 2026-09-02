@@ -15,6 +15,7 @@
 
 use crate::game::{self, GameStatus};
 use crate::net::{self, Progress};
+use crate::renodx;
 use crate::reshade_ini;
 use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
@@ -215,19 +216,82 @@ const STEP_FEEDER_CLEANUP: Step = Step {
     name: "Remove DLSS5-Feeder (game has native DLSS)",
     run: step_feeder_cleanup,
 };
+const STEP_REFRAMEWORK: Step = Step {
+    name: "REFramework (RE Engine needs it before ReShade)",
+    run: step_reframework,
+};
+const STEP_RENODX: Step = Step {
+    name: "RenoDX HDR mod for this game",
+    run: step_renodx,
+};
 
-/// Steps for a game, by install path.
-pub fn plan(st: &GameStatus) -> Vec<Step> {
-    plan_with(st, Engine::ReShade)
+pub const REFRAMEWORK_ZIP: &str =
+    "https://github.com/praydog/REFramework-nightly/releases/latest/download/REFramework.zip";
+
+/// praydog's monolithic nightly: one `dinput8.dll` that detects the RE Engine
+/// game at runtime (DMC5, RE2/3/4/7/8/9, MHRise, MHWilds, SF6, DD2, Pragmata...).
+/// Only the DLL is extracted, as its release notes insist.
+fn step_reframework(
+    client: &Client,
+    st: &GameStatus,
+    work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    if st.reframework {
+        progress(100, "REFramework already present");
+        return Ok(vec![]);
+    }
+    let d = st.game_dir();
+    let zip_path = work.join("REFramework.zip");
+    net::download(client, REFRAMEWORK_ZIP, &zip_path, "REFramework", progress)?;
+    let f = fs::File::open(&zip_path)?;
+    let mut zip = zip::ZipArchive::new(f).context("REFramework download is not a valid zip")?;
+    let member = zip
+        .file_names()
+        .find(|n| net::file_name(n).eq_ignore_ascii_case(game::REFRAMEWORK_DLL))
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("REFramework.zip has no {}", game::REFRAMEWORK_DLL))?;
+    net::extract_member(&mut zip, &member, &d.join(game::REFRAMEWORK_DLL))?;
+    fs::write(d.join(game::REFRAMEWORK_MARKER), b"")?;
+    Ok(vec![game::REFRAMEWORK_DLL.to_owned()])
 }
 
-pub fn plan_with(st: &GameStatus, engine: Engine) -> Vec<Step> {
-    if engine == Engine::Opti {
+fn step_renodx(
+    client: &Client,
+    st: &GameStatus,
+    _work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    progress(0, "Looking up the RenoDX mod for this game");
+    let m = renodx::lookup(client, &st.exe)?
+        .ok_or_else(|| anyhow!("no RenoDX mod is published for this game"))?;
+    renodx::install(client, &st.exe, &m, progress)
+}
+
+/// `with_renodx` adds the game's RenoDX HDR mod after the DLSS 5 add-on
+/// (ReShade engine only: it is a ReShade add-on). RE Engine games get
+/// REFramework first on either engine.
+pub fn plan_with(st: &GameStatus, engine: Engine, with_renodx: bool) -> Vec<Step> {
+    let mut v = if engine == Engine::Opti {
         // Only games with native DLSS: the NR pass reads the inputs the game
         // hands to DLSS. Callers gate on mode; return the plan regardless so
         // --check can show it.
-        return vec![STEP_OPTI, STEP_DLSSNR_ONLY];
+        vec![STEP_OPTI, STEP_DLSSNR_ONLY]
+    } else {
+        let mut v = plan_reshade(st);
+        if with_renodx {
+            let at = v.len() - 1; // before ReShade config
+            v.insert(at, STEP_RENODX);
+        }
+        v
+    };
+    if st.re_engine {
+        v.insert(0, STEP_REFRAMEWORK);
     }
+    v
+}
+
+fn plan_reshade(st: &GameStatus) -> Vec<Step> {
     match st.mode {
         game::Mode::Feeder => vec![
             STEP_RESHADE,
@@ -671,6 +735,7 @@ pub enum StepState {
 pub fn run_all_with(
     exe: &Path,
     engine: Engine,
+    with_renodx: bool,
     progress: Progress,
     step_cb: &(dyn Fn(usize, usize, &str, StepState, &str) + Sync),
 ) -> Result<Vec<(String, Vec<String>)>> {
@@ -690,7 +755,7 @@ pub fn run_all_with(
     let work = tempfile::Builder::new()
         .prefix("dlss5oneclick-")
         .tempdir()?;
-    let steps = plan_with(&st, engine);
+    let steps = plan_with(&st, engine, with_renodx);
     let n = steps.len();
     let mut results = Vec::new();
     for (i, step) in steps.iter().enumerate() {
@@ -746,6 +811,17 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
     }
     if d.join(game::DLSS_MARKER).is_file() {
         targets.push(d.join(game::DLSS_DLL));
+    }
+    if let Ok(name) = fs::read_to_string(d.join(game::RENODX_MANIFEST)) {
+        let name = name.trim();
+        if name.starts_with("renodx-") && !name.contains(['/', '\\']) {
+            targets.push(d.join(name));
+        }
+        targets.push(d.join(game::RENODX_MANIFEST));
+    }
+    if d.join(game::REFRAMEWORK_MARKER).is_file() {
+        targets.push(d.join(game::REFRAMEWORK_DLL));
+        targets.push(d.join(game::REFRAMEWORK_MARKER));
     }
     let mut removed = Vec::new();
     uninstall_opti(d, &mut removed)?;
@@ -996,16 +1072,81 @@ mod tests {
     }
 
     #[test]
+    fn plan_adds_reframework_first_and_renodx_before_config() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe(&t.path().join("re4.exe"), game::PE_X64);
+        fs::write(t.path().join(game::RE_ENGINE_PAK), b"pak").unwrap();
+        let mut st = game::inspect(&exe).unwrap();
+        assert!(st.re_engine && !st.reframework);
+        st.mode = game::Mode::Native;
+        st.api = game::Api::Dx12;
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, true)
+            .iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "REFramework (RE Engine needs it before ReShade)",
+                "ReShade (add-on build)",
+                "DLSS 5 add-on + models",
+                "RenoDX HDR mod for this game",
+                "ReShade config"
+            ]
+        );
+        let names: Vec<&str> = plan_with(&st, Engine::Opti, true)
+            .iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names[0], "REFramework (RE Engine needs it before ReShade)");
+        assert!(!names.contains(&"RenoDX HDR mod for this game"));
+    }
+
+    #[test]
+    fn uninstall_removes_recorded_renodx_mod_and_reframework_only() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe(&t.path().join("game.exe"), game::PE_X64);
+        fs::write(t.path().join("renodx-cp2077.addon64"), b"ours").unwrap();
+        fs::write(t.path().join("renodx-ff7rebirth.addon64"), b"theirs").unwrap();
+        fs::write(
+            t.path().join(game::RENODX_MANIFEST),
+            "renodx-cp2077.addon64\n",
+        )
+        .unwrap();
+        fs::write(t.path().join(game::REFRAMEWORK_DLL), b"ref").unwrap();
+        let st = game::inspect(&exe).unwrap();
+        assert_eq!(st.renodx_mod.as_deref(), Some("renodx-cp2077.addon64"));
+        assert_eq!(
+            st.foreign_renodx,
+            vec!["renodx-ff7rebirth.addon64".to_string()]
+        );
+        let removed = uninstall(&exe).unwrap();
+        assert!(removed.contains(&"renodx-cp2077.addon64".to_string()));
+        assert!(t.path().join("renodx-ff7rebirth.addon64").is_file());
+        // dinput8.dll without our marker is somebody else's REFramework: kept.
+        assert!(t.path().join(game::REFRAMEWORK_DLL).is_file());
+        fs::write(t.path().join(game::REFRAMEWORK_MARKER), b"").unwrap();
+        let removed = uninstall(&exe).unwrap();
+        assert!(removed.contains(&game::REFRAMEWORK_DLL.to_string()));
+    }
+
+    #[test]
     fn plan_follows_mode_and_api() {
         let t = tempfile::tempdir().unwrap();
         let exe = make_pe(&t.path().join("game.exe"), game::PE_X64);
         let mut st = game::inspect(&exe).unwrap();
-        let names: Vec<&str> = plan(&st).iter().map(|s| s.name).collect();
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false)
+            .iter()
+            .map(|s| s.name)
+            .collect();
         assert_eq!(names.len(), 6);
         assert_eq!(names[2], "DLSS5-Feeder");
         st.mode = game::Mode::Native;
         st.api = game::Api::Dx12;
-        let names: Vec<&str> = plan(&st).iter().map(|s| s.name).collect();
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false)
+            .iter()
+            .map(|s| s.name)
+            .collect();
         assert_eq!(
             names,
             [
@@ -1015,7 +1156,10 @@ mod tests {
             ]
         );
         st.api = game::Api::Dx11;
-        let names: Vec<&str> = plan(&st).iter().map(|s| s.name).collect();
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false)
+            .iter()
+            .map(|s| s.name)
+            .collect();
         assert_eq!(names[2], "DLSS 5 DX11 bridge");
     }
 
@@ -1068,7 +1212,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let exe = make_pe(&t.path().join("game.exe"), game::PE_X64);
         let st = game::inspect(&exe).unwrap();
-        let names: Vec<&str> = plan_with(&st, Engine::Opti)
+        let names: Vec<&str> = plan_with(&st, Engine::Opti, false)
             .iter()
             .map(|s| s.name)
             .collect();
@@ -1080,7 +1224,8 @@ mod tests {
             ]
         );
         // Feeder-mode game + Opti engine is refused before any network
-        let err = run_all_with(&exe, Engine::Opti, &|_, _| {}, &|_, _, _, _, _| {}).unwrap_err();
+        let err =
+            run_all_with(&exe, Engine::Opti, false, &|_, _| {}, &|_, _, _, _, _| {}).unwrap_err();
         assert!(err.to_string().contains("own DLSS"));
     }
 
@@ -1109,7 +1254,14 @@ mod tests {
     fn run_all_refuses_32bit_before_network() {
         let t = tempfile::tempdir().unwrap();
         let exe = make_pe(&t.path().join("game.exe"), game::PE_X86);
-        let err = run_all_with(&exe, Engine::ReShade, &|_, _| {}, &|_, _, _, _, _| {}).unwrap_err();
+        let err = run_all_with(
+            &exe,
+            Engine::ReShade,
+            false,
+            &|_, _| {},
+            &|_, _, _, _, _| {},
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("32-bit"));
     }
 }

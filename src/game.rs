@@ -26,6 +26,13 @@ pub const RESHADE_PROXY: &str = "dxgi.dll";
 /// Not inside the setup exe. DLSS5_Feed.fx and every lumenite_*.fx include ReShade.fxh;
 /// DLSS5_Feed.fx also includes DrawText.fxh; ReShadeUI.fxh is the standard companion.
 pub const RESHADE_HEADERS: [&str; 3] = ["ReShade.fxh", "ReShadeUI.fxh", "DrawText.fxh"];
+/// Name of the RenoDX game mod this tool placed (one line), so Remove takes only that one.
+pub const RENODX_MANIFEST: &str = ".dlss5oneclick-renodx";
+/// REFramework (praydog) loads as dinput8.dll; RE Engine games crash under ReShade without it.
+pub const REFRAMEWORK_DLL: &str = "dinput8.dll";
+pub const REFRAMEWORK_MARKER: &str = ".dlss5oneclick-reframework";
+/// Every RE Engine game keeps its base archive under this name next to the exe.
+pub const RE_ENGINE_PAK: &str = "re_chunk_000.pak";
 pub const RESHADE_INI: &str = "ReShade.ini";
 pub const RESHADE_PRESET: &str = "ReShadePreset.ini";
 
@@ -179,6 +186,14 @@ pub fn detect_api(exe: &Path) -> Api {
         }
     }
     let api = classify(&pe_imports(exe));
+    let agility_sdk = exe
+        .parent()
+        .is_some_and(|d| d.join("D3D12").join("D3D12Core.dll").is_file());
+    if api == Api::Dx12 || (api == Api::Dx11 && agility_sdk) {
+        // The DirectX 12 Agility SDK redist ships only with D3D12 renderers;
+        // RE Engine exes import d3d11.dll statically and create D3D12 at runtime.
+        return Api::Dx12;
+    }
     if api != Api::Unknown {
         return api;
     }
@@ -322,7 +337,27 @@ pub fn game_ships_dlss(game_dir: &Path) -> bool {
         }
         false
     }
-    walk(game_dir, 4)
+    if walk(game_dir, 4) {
+        return true;
+    }
+    // Unreal: exe in <Project>/Binaries/Win64, DLSS in
+    // <Project>/Plugins/NVIDIA/DLSS/Binaries/ThirdParty/Win64 (or Engine/Plugins/...).
+    let unreal_root = game_dir
+        .parent()
+        .filter(|b| {
+            b.file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("binaries"))
+        })
+        .and_then(Path::parent);
+    match unreal_root {
+        Some(proj) => {
+            walk(&proj.join("Plugins"), 7)
+                || proj
+                    .parent()
+                    .is_some_and(|root| walk(&root.join("Engine").join("Plugins"), 7))
+        }
+        None => false,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -341,6 +376,13 @@ pub struct GameStatus {
     pub dlss5_addon: bool,
     pub dlssnr: bool,
     pub dlss: bool,
+    /// Capcom RE Engine (needs REFramework before ReShade will run).
+    pub re_engine: bool,
+    pub reframework: bool,
+    /// RenoDX game mod this tool installed, from its manifest.
+    pub renodx_mod: Option<String>,
+    /// Other RenoDX game mods found in the folder (not ours, not the DLSS 5 add-on).
+    pub foreign_renodx: Vec<String>,
     pub problems: Vec<String>,
 }
 
@@ -414,6 +456,10 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         Mode::Feeder
     };
     let api = detect_api(exe);
+    let renodx_mod = fs::read_to_string(d.join(RENODX_MANIFEST))
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|n| !n.is_empty() && d.join(n).is_file());
     Ok(GameStatus {
         mode,
         api,
@@ -430,6 +476,10 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         dlss5_addon: d.join(DLSS5_ADDON).is_file(),
         dlssnr: d.join(DLSSNR_DLL).is_file(),
         dlss: d.join(DLSS_DLL).is_file(),
+        re_engine: d.join(RE_ENGINE_PAK).is_file(),
+        reframework: d.join(REFRAMEWORK_DLL).is_file(),
+        renodx_mod: renodx_mod.clone(),
+        foreign_renodx: crate::renodx::foreign_mods(d, renodx_mod.as_deref()),
         problems,
     })
 }
@@ -467,8 +517,8 @@ fn norm(s: &str) -> String {
 ///
 /// Looks in the folder itself and in any `*/Binaries/Win64/` (Unreal layout,
 /// where ReShade must sit next to the `-Shipping.exe`, not the root launcher).
-/// Keeps 64-bit PEs only, drops known helpers, then ranks: name matches the
-/// folder name > Unreal shipping exe > larger file.
+/// Keeps 64-bit PEs only, drops known helpers, then ranks: Unreal shipping
+/// exe > name matches the folder name > larger file.
 pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = Vec::new();
     let mut push_dir = |d: &Path| {
@@ -535,13 +585,15 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
             let size = fs::metadata(&p).map(|m| m.len()).unwrap_or(0) as i64;
             let mut score: i64 = 0;
             let n = norm(&stem);
+            // An Unreal `-Shipping.exe` is always the real game; the root exe
+            // named after the folder (Expedition33_Steam.exe, 700 KB) is a bootstrapper.
+            if stem.ends_with("-shipping") {
+                score += 2_000_000_000;
+            }
             if !folder.is_empty()
                 && (n == folder || n.starts_with(&folder) || folder.starts_with(&n))
             {
                 score += 1_000_000_000;
-            }
-            if stem.ends_with("-shipping") {
-                score += 500_000_000;
             }
             score += size.min(400_000_000);
             Some((score, p))
