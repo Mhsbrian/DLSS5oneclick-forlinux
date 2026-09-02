@@ -176,9 +176,144 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
 }
 
 /// Read the game folder and produce findings, or a single fatal one.
+/// Log-based findings only (host-independent; what the tests cover).
+#[cfg(test)]
 pub fn run(exe: &Path) -> Result<Vec<Finding>> {
     let st = game::inspect(exe)?;
     Ok(diagnose(&st))
+}
+
+/// Host findings (launch options, driver, Proton) first, then the log-based
+/// ones — what the CLI and GUI show.
+pub fn run_full(exe: &Path) -> Result<Vec<Finding>> {
+    let st = game::inspect(exe)?;
+    let mut findings = host_findings(&st, &crate::platform::host_context(&st));
+    findings.extend(diagnose(&st));
+    Ok(findings)
+}
+
+/// Linux-side facts about how this game is launched, gathered by
+/// `platform::host_context`. Everything defaults to "unknown/irrelevant", so
+/// on Windows (or when nothing is known) `host_findings` stays silent and the
+/// log-based diagnosis above is all there is.
+#[derive(Debug, Clone, Default)]
+pub struct HostContext {
+    /// False ⇒ produce no host findings at all.
+    pub relevant: bool,
+    /// "Steam" / "Heroic" / "Lutris" when the game folder maps to a launcher.
+    pub launcher: Option<&'static str>,
+    /// Per Steam user file: (short label, launch options already satisfy the
+    /// requirements?). Empty for non-Steam launchers.
+    pub steam_options: Vec<(String, bool)>,
+    /// The full string to paste when something is missing.
+    pub required_display: String,
+    /// CompatToolMapping name, e.g. "GE-Proton11-5-x86_64".
+    pub proton: Option<String>,
+    /// The Proton build predates default-on NVAPI (or is unknown).
+    pub proton_needs_nvapi_env: bool,
+    /// Where the NVIDIA driver's Wine NGX DLLs were found, if anywhere.
+    pub nvngx_wine_dir: Option<std::path::PathBuf>,
+    /// nvngx.dll present inside the game's Proton prefix (None = no prefix known).
+    pub prefix_nvngx: Option<bool>,
+    pub driver_version: Option<String>,
+    /// Feeder path without a native d3dcompiler_47.dll next to the exe.
+    pub d3dcompiler_missing_feeder: bool,
+    pub steam_running: bool,
+}
+
+/// Findings about the host setup (launch options, driver, Proton) — pure and
+/// fixture-testable; `ctx` carries every fact.
+pub fn host_findings(st: &GameStatus, ctx: &HostContext) -> Vec<Finding> {
+    let mut out = Vec::new();
+    if !ctx.relevant {
+        return out;
+    }
+    match ctx.launcher {
+        Some("Steam") => {
+            if ctx.steam_options.is_empty() {
+                out.push(warn(
+                    "No Steam user config (localconfig.vdf) found; cannot verify launch options.",
+                ));
+            }
+            for (label, satisfied) in &ctx.steam_options {
+                if *satisfied {
+                    out.push(ok(format!("Steam launch options set ({label}).")));
+                } else {
+                    out.push(bad(format!(
+                        "Steam launch options incomplete ({label}): without them Proton loads its \
+                         own dxgi and nothing injects. Run --launch-options, or paste into \
+                         Properties -> Launch Options: {}",
+                        ctx.required_display
+                    )));
+                }
+            }
+            match &ctx.proton {
+                Some(p) => {
+                    if ctx.proton_needs_nvapi_env {
+                        out.push(warn(format!(
+                            "Proton \"{p}\" predates default-on NVAPI; PROTON_ENABLE_NVAPI=1 is \
+                             required (a Proton 9+ build is a better fix)."
+                        )));
+                    } else {
+                        out.push(ok(format!("Proton: {p}.")));
+                    }
+                }
+                None => out.push(warn(
+                    "No Proton mapping found for this game; Steam's default applies.",
+                )),
+            }
+            if ctx.steam_running {
+                out.push(warn(
+                    "Steam is running — launch-option changes need it closed.",
+                ));
+            }
+        }
+        Some(other) => out.push(warn(format!(
+            "{other} game: verify WINEDLLOVERRIDES is set in {other}'s per-game environment \
+             settings ({}).",
+            ctx.required_display
+        ))),
+        None => out.push(warn(format!(
+            "This folder maps to no known launcher; wherever it runs under Proton/Wine it needs: {}",
+            ctx.required_display
+        ))),
+    }
+    match &ctx.nvngx_wine_dir {
+        Some(dir) => out.push(ok(format!(
+            "NVIDIA NGX Wine DLLs present ({}).",
+            dir.display()
+        ))),
+        None => out.push(bad(
+            "The NVIDIA driver's Wine NGX DLLs (nvngx.dll/_nvngx.dll under /usr/lib/nvidia/wine \
+             or the distro equivalent) were not found — DLSS cannot initialise under Proton. \
+             Install the driver's Wine/NGX component (e.g. nvidia-utils or libnvidia-ngx).",
+        )),
+    }
+    if let Some(present) = ctx.prefix_nvngx {
+        if present {
+            out.push(ok("nvngx.dll present in the game's Proton prefix."));
+        } else {
+            out.push(warn(
+                "nvngx.dll not yet in the game's Proton prefix; Proton copies it on the first \
+                 launch with NVAPI enabled — start the game once, then re-run --diagnose.",
+            ));
+        }
+    }
+    match &ctx.driver_version {
+        Some(v) => out.push(ok(format!("NVIDIA kernel driver {v}."))),
+        None => out.push(warn(
+            "NVIDIA kernel module not loaded (no /sys/module/nvidia/version).",
+        )),
+    }
+    if ctx.d3dcompiler_missing_feeder && st.mode == game::Mode::Feeder {
+        out.push(warn(
+            "No d3dcompiler_47.dll next to the game exe; ReShade falls back to Proton's builtin \
+             compiler, which usually works. If effects fail to compile in ReShade.log, copy a \
+             native d3dcompiler_47.dll next to the exe and add d3dcompiler_47=n to \
+             WINEDLLOVERRIDES.",
+        ));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -194,6 +329,83 @@ mod tests {
             fs::write(t.path().join(game::DLSS_DLL), b"x").unwrap();
         }
         (t, exe)
+    }
+
+    fn host_ctx() -> HostContext {
+        HostContext {
+            relevant: true,
+            launcher: Some("Steam"),
+            steam_options: vec![("user 111".into(), true)],
+            required_display: "WINEDLLOVERRIDES=\"dxgi=n,b\" %command%".into(),
+            proton: Some("GE-Proton11-5".into()),
+            proton_needs_nvapi_env: false,
+            nvngx_wine_dir: Some(std::path::PathBuf::from("/usr/lib/nvidia/wine")),
+            prefix_nvngx: Some(true),
+            driver_version: Some("610.57.04".into()),
+            d3dcompiler_missing_feeder: false,
+            steam_running: false,
+        }
+    }
+
+    #[test]
+    fn host_findings_all_green() {
+        let (_t, exe) = setup(true);
+        let st = game::inspect(&exe).unwrap();
+        let f = host_findings(&st, &host_ctx());
+        assert!(!f.is_empty());
+        assert!(f.iter().all(|x| x.level == Level::Ok), "{f:?}");
+    }
+
+    #[test]
+    fn host_findings_missing_launch_options_is_bad() {
+        let (_t, exe) = setup(true);
+        let st = game::inspect(&exe).unwrap();
+        let mut ctx = host_ctx();
+        ctx.steam_options = vec![("user 111".into(), false)];
+        let f = host_findings(&st, &ctx);
+        let bad = f.iter().find(|x| x.level == Level::Bad).unwrap();
+        assert!(bad.text.contains("launch options incomplete"));
+        assert!(bad.text.contains("WINEDLLOVERRIDES"));
+    }
+
+    #[test]
+    fn host_findings_old_proton_and_missing_ngx() {
+        let (_t, exe) = setup(true);
+        let st = game::inspect(&exe).unwrap();
+        let mut ctx = host_ctx();
+        ctx.proton = Some("proton_63".into());
+        ctx.proton_needs_nvapi_env = true;
+        ctx.nvngx_wine_dir = None;
+        let f = host_findings(&st, &ctx);
+        assert!(f
+            .iter()
+            .any(|x| x.level == Level::Warn && x.text.contains("predates default-on NVAPI")));
+        assert!(f
+            .iter()
+            .any(|x| x.level == Level::Bad && x.text.contains("Wine NGX DLLs")));
+    }
+
+    #[test]
+    fn host_findings_d3dcompiler_warns_only_on_feeder() {
+        let mut ctx = host_ctx();
+        ctx.d3dcompiler_missing_feeder = true;
+        let (_t, exe) = setup(true); // feeder mode
+        let st = game::inspect(&exe).unwrap();
+        assert!(host_findings(&st, &ctx)
+            .iter()
+            .any(|x| x.text.contains("d3dcompiler_47")));
+        let (_t2, exe2) = setup(false); // native mode
+        let st2 = game::inspect(&exe2).unwrap();
+        assert!(!host_findings(&st2, &ctx)
+            .iter()
+            .any(|x| x.text.contains("d3dcompiler_47")));
+    }
+
+    #[test]
+    fn host_findings_silent_when_irrelevant() {
+        let (_t, exe) = setup(true);
+        let st = game::inspect(&exe).unwrap();
+        assert!(host_findings(&st, &HostContext::default()).is_empty());
     }
 
     #[test]

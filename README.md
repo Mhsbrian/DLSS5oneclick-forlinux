@@ -1,113 +1,81 @@
-# DLSS5oneclick
+# DLSS5oneclick for Linux
 
-<p>
-  <a href="https://github.com/faisalkindi/DLSS5oneclick/releases/latest"><img src="https://img.shields.io/github/v/release/faisalkindi/DLSS5oneclick?style=flat-square&color=2878D0&label=Download" alt="Download"></a>
-  <img src="https://img.shields.io/github/downloads/faisalkindi/DLSS5oneclick/total?style=flat-square&color=16A34A&label=Downloads" alt="Downloads">
-  <img src="https://img.shields.io/github/stars/faisalkindi/DLSS5oneclick?style=flat-square&color=EAB308&label=Stars" alt="Stars">
-  <a href="https://ko-fi.com/kindiboy"><img src="https://img.shields.io/badge/Support-Ko--fi-FF5E5B?style=flat-square&logo=ko-fi&logoColor=white" alt="Ko-fi"></a>
-</p>
+One button that sets up the **leaked DLSS 5 neural-rendering build** in DirectX 11/12 games running under **Steam/Proton** (Heroic and Lutris games work too). This is the Linux port of [faisalkindi/DLSS5oneclick](https://github.com/faisalkindi/DLSS5oneclick) — same installer, plus everything a Linux gaming box actually needs: your Steam library listed in the app, the Proton launch options set for you, Linux GPU/driver checks, and native Linux builds.
 
-One button that sets up the **leaked DLSS 5 neural-rendering build** in any DirectX 11/12 game, with or without DLSS of its own. Single native Windows exe, no runtime. Everything it installs is downloaded from the projects that made it; the only third-party content inside the exe is three SIL-OFL fonts.
+Single native binary, no runtime. Everything it installs is downloaded from the projects that made it; the only third-party content inside the binary is three SIL-OFL fonts.
 
-Download: [latest release](https://github.com/faisalkindi/DLSS5oneclick/releases/latest) → `dlss5oneclick.exe`.
+Download: [latest release](https://github.com/Mhsbrian/DLSS5oneclick-forlinux/releases/latest) → `dlss5oneclick-linux-x86_64` (portable binary) or `dlss5oneclick-x86_64.AppImage`.
 
-## Two paths, picked automatically
+```
+chmod +x dlss5oneclick-linux-x86_64
+./dlss5oneclick-linux-x86_64
+```
 
-| The game | What gets installed |
-|---|---|
-| **Ships its own DLSS** (an `nvngx_dlss.dll` this tool did not place, or Streamline `sl.*.dll`, `nvngx_dlssg/dlssd.dll`, anywhere up to four folders deep) | ReShade add-on build + the DLSS 5 add-on (`renodx-dlss5.addon64`, `nvngx_dlssnr.dll`). The add-on hooks the game's own NGX calls directly. **DX11 games** also get [dlss5-bridge](https://github.com/NIGos/dlss5-bridge), which replays the D3D11 DLSS calls on a private D3D12 device so the add-on can see them. No Feeder, no LumeniteFX; a Feeder left over from an earlier run is removed. |
-| **Has no DLSS** | The full Feeder path below: ReShade + shader headers + DLSS5-Feeder + LumeniteFX + the DLSS 5 add-on + config. |
+Works on any x86_64 gaming distro with glibc ≥ 2.35 (Arch/CachyOS/EndeavourOS, Bazzite, Nobara, Fedora, Ubuntu/Mint/Pop!_OS, openSUSE, SteamOS desktop mode). Wayland and X11 both fine; the file picker uses the XDG portal.
 
-**Engine choice for games with native DLSS**: the default engine is ReShade + the RenoDX add-on. A second engine — [Dagherbou's OptiScaler_DLSSNR fork](https://github.com/Dagherbou/OptiScaler_DLSSNR) (OptiScaler with a built-in Neural Rendering pass, colour composition from RenoDX under MIT) — can be picked in the GUI or with `--engine=opti`: the tool extracts the fork's release into the game as `dxgi.dll`, adds `nvngx_dlssnr.dll`, and records a manifest so Remove takes it out cleanly. In game, Insert opens the OptiScaler overlay; Neural Rendering is off by default there. The two engines cannot share a game (both load as dxgi.dll). Note the fork targets the unpatched model: on the driver's own DLL that means RTX 50; with the `310.8.SF` model this tool installs, older RTX generations may work but are untested there.
+## What the Linux version adds
 
-DX11 vs DX12 is read from the exe's import table, then from the engine DLLs next to it (`UnityPlayer.dll`, ...). When neither says, DX12 is assumed and the status line says so. `dlss5oneclick.exe "<game folder>" --check` prints the detected mode, API and plan without installing anything.
+- **Game library built in.** Your installed Steam games (native, Flatpak or Snap Steam, all library folders), Heroic (Epic/GOG) and Lutris games are listed in the app — click one instead of hunting for the folder. `--list-games` does the same in the terminal, and the CLI takes a game name or Steam appid: `dlss5oneclick "skyrim special"`.
+- **Launch options handled.** ReShade/OptiScaler load as `dxgi.dll`, which Proton only picks up with `WINEDLLOVERRIDES="dxgi=n,b" %command%` in the game's launch options. After an install the tool sets this **for you** (Steam closed: it edits `localconfig.vdf` surgically, with backups; Steam running: it shows the exact string with a copy button). Existing launch options are merged, never overwritten — your `MANGOHUD=1`, game arguments, and other DLL overrides survive. `--launch-options` / `--revert-launch-options` do it from the terminal. On old Proton (< 9) `PROTON_ENABLE_NVAPI=1` is added too; Heroic gets its per-game environment variables written (experimental), Lutris users get the exact variables to paste.
+- **Linux GPU and driver checks.** The RTX tier (RTX 50 full speed · RTX 40 moderate cost · RTX 20/30 heavy cost) is read from the NVIDIA driver; non-NVIDIA and GTX cards are refused up front, exactly like on Windows. `--diagnose` also verifies the driver's Wine NGX DLLs (`/usr/lib/nvidia/wine`), the kernel driver version, the game's Proton mapping and its prefix — the usual "DLSS silently does nothing" causes on Linux.
+- **Self-updating from this repo**, AppImage included.
 
-### The no-DLSS path
-
-It does, in order, exactly what the [DLSS5-Feeder README](https://github.com/jlrouzies-fr/DLSS5-Feeder#install-for-a-64-bit-game) tells you to do by hand:
-
-| Step | What | From |
-|---|---|---|
-| 1 | ReShade **with add-on support**, dropped as `dxgi.dll` | `ReShade_Setup_<ver>_Addon.exe` on [reshade.me](https://reshade.me) (DLL pulled straight out of the installer, nothing is run) |
-| 2 | `ReShade.fxh`, `ReShadeUI.fxh`, `DrawText.fxh` into `reshade-shaders\Shaders` (the setup exe has only the DLLs; every shader below includes `ReShade.fxh`) | [crosire/reshade-shaders](https://github.com/crosire/reshade-shaders/tree/slim/Shaders) (`slim` branch) |
-| 3 | `dlss5-feed.addon64` + `DLSS5_Feed.fx` | [jlrouzies-fr/DLSS5-Feeder](https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest) |
-| 4 | Motion-vector provider: `lumenite_*.fx`, `include\*.fxh`, `lumenite_bluenoise256.png` | [umar-afzaal/LumeniteFX](https://github.com/umar-afzaal/LumeniteFX) (`mainline` branch) |
-| 5 | `renodx-dlss5.addon64` (the leaked DLSS 5 add-on, closed-source and community-distributed), `nvngx_dlssnr.dll` (its neural-rendering model), `nvngx_dlss.dll` (DLSS runtime; the Feeder's NGX session fails without one next to the game, so it is always placed and marked with a `nvngx_dlss.dll.dlss5oneclick` sidecar) | [RankFTW/rhi-repo](https://github.com/RankFTW/rhi-repo/releases) releases (`renodx-dlss5-*`, `dlssnr-*`, `dlss-*`) |
-| 6 | `ReShade.ini` gets `PreprocessorDefinitions=DLSS5_MV_PROVIDER=3`; `ReShadePreset.ini` enables `Lumenite_Kernel` **above** `DLSS5_Feed` | written by this tool, existing keys preserved |
-
-Every file is downloaded from its upstream at install time; a re-run only fetches what is missing.
+Everything else — the two install paths, the OptiScaler engine, `--check`, `--remove`, anti-cheat refusals — is upstream, unchanged. See [upstream's README](https://github.com/faisalkindi/DLSS5oneclick#readme) for the full story of what gets installed and from where.
 
 ## Use
 
-1. Run `dlss5oneclick.exe` (single native binary, no runtime needed).
-2. Pick the game's **folder** (or its `.exe`) - the game exe is detected automatically (the folder and two levels below it are searched, so `bin\x64_dx12\` and Unreal `Binaries\Win64\` layouts work; Unity crash handlers, Unreal helpers and redist installers are skipped; a `*-Shipping.exe` is preferred). If several candidates remain, a dropdown lets you choose. The list shows what is already present.
-3. **Install DLSS 5**.
-4. In game: **Home** opens ReShade → **Add-ons** tab → **DLSS 5 Neural Rendering** panel → enable it. Keep the game's MSAA/SSAA off. On games with their own DLSS the Home tab says "No effect files found" — expected, no shaders are needed there; the panel lives on the Add-ons tab.
+1. Run the binary. Your games appear in the library panel; pick one (or paste any game folder — Proton games from any launcher work).
+2. **Install DLSS 5**.
+3. Let it set the launch options (or paste the shown string into Steam → right-click the game → Properties → Launch Options yourself). Restart Steam if it edited the file.
+4. In game: **Home** opens ReShade → **Add-ons** tab → **DLSS 5 Neural Rendering** panel → enable it. **F6** toggles, **F5** saves the add-on's screenshot. On the OptiScaler engine: **Insert** opens the overlay instead.
 
-**F6** toggles neural rendering on/off, **F5** saves the add-on's screenshot (both are the add-on's own hotkeys). On the Feeder path, `dlss5-feed.log` next to the game exe should show `feature ready … DLAA` and `DLSS5_MV_PROVIDER=3 (LumeniteFX Kernel) -> Lumenite_Kernel (enabled)`.
+If nothing seems to happen in game, run `--diagnose` (button or CLI) — it reads the logs and the host setup and says exactly what is wrong.
 
-CLI: `dlss5oneclick.exe "C:\Games\Foo"` (folder or exe) / `--check` (detect only) / `--diagnose` (read the game's ReShade/feed logs and say why neural rendering is or is not running) / `--remove` (headless, prints progress).
+CLI: `dlss5oneclick <folder | name | appid>` installs · `--check` detect only · `--diagnose` · `--remove` / `--remove-all` · `--engine=opti` · `--launch-options` / `--revert-launch-options` · `--list-games` · `--update`.
 
-## Updates
+## Launch options details
 
-On start the tool looks at `github.com/faisalkindi/DLSS5oneclick/releases/latest` (a redirect, no API) in the background. If a newer version exists, a bar offers **Update / Later / Skip this version**; nothing is downloaded unless you press Update. Update fetches the release exe, checks it is a real executable, swaps it in place of the running one (the old file is kept as `dlss5oneclick.exe.old` until the next start) and restarts. `dlss5oneclick.exe --update` does the same from the command line.
+The required string per game is at most:
 
-## Downloads and GitHub
+```
+WINEDLLOVERRIDES="d3dcompiler_47=n;dxgi=n,b" PROTON_ENABLE_NVAPI=1 %command%
+```
 
-Every component comes from GitHub releases. Since 0.5.1 the tool reads the public release **pages** (no API), so it is not subject to GitHub's 60-requests-per-hour API cap that caused `HTTP 403 Forbidden` for people installing into many games. If you set a `GITHUB_TOKEN` environment variable it is used for the API path first. Where github.com itself is unreachable (some countries block it), a proxy or VPN is the only way — the files exist nowhere else this tool trusts.
+- `dxgi=n,b` — always: loads ReShade/OptiScaler from the game folder.
+- `d3dcompiler_47=n` — only when a native `d3dcompiler_47.dll` sits next to the game exe (many games ship one). Without it Proton's builtin compiler is used, which usually handles the shaders fine; if `--diagnose` shows effect-compile failures, drop a native `d3dcompiler_47.dll` next to the exe (e.g. via `winetricks d3dcompiler_47` into the game's prefix, or copy one from another game) and re-run `--launch-options`.
+- `PROTON_ENABLE_NVAPI=1` — only for Proton older than 9 (9+ has NVAPI on by default); harmless when redundant.
+
+Steam edits are atomic and verified: the file is re-parsed after the edit and must be byte-identical apart from that one value, or nothing is written. Backups: `localconfig.vdf.dlss5o.orig` (first ever edit) and `.dlss5o.bak` (before each edit) next to the file, under `~/.local/share/Steam/userdata/<id>/config/`.
 
 ## GPU support
 
-The tool reads the installed display adapters from the registry and refuses up front on anything that cannot run the model: non-NVIDIA cards (NGX does not exist there) and NVIDIA cards without tensor cores (GTX/GT/MX). Among RTX cards, expect very different costs — the DLSS 5 model is FP8 with RTX-50-only kernels; the `310.8.SF` build the tool installs adds patched binaries for RTX 40 and an FP16 path for RTX 20/30. The status line shows the tier: RTX 50 full speed · RTX 40 moderate cost · RTX 20/30 heavy cost. Virtual/remote adapters (Hyper-V GPU-P, RDP, VMs) are treated as unknown and allowed. If your card is misdetected, set `DLSS5ONECLICK_SKIP_GPU_CHECK=1` to bypass the refusal.
-
-## Verifying a download
-
-Each release's notes carry the SHA-256 of the attached `dlss5oneclick.exe`. Check yours with `certutil -hashfile dlss5oneclick.exe SHA256` (or PowerShell `Get-FileHash`). Only this repository's Releases page and the linked Nexus Mods page are legitimate sources — "DLSS 5 manager/one-click" executables from other repositories, videos or websites are not this tool, and at least one such repository distributes a 500 MB binary with no source at all.
-
-## Windows Defender / SmartScreen
-
-The exe is not code-signed (no publisher certificate), it is new, and it downloads DLLs into game folders — three things Windows heuristics dislike. Expect a SmartScreen "unknown publisher" prompt; if Defender quarantines the exe or, worse, the add-on files it placed in a game, restore them from Protection history, add the game folder as an exclusion, and re-run Install (it re-fetches only what is missing). Every release is built from the public source in this repository.
-
-## Known issues
-
-- **Feeder path + exclusive fullscreen.** Every focus change (alt-tab) makes the game recreate its swapchain; DLSS5-Feeder rebuilds its DLSS feature and can crash inside `CreateFeature` on that rebuild ([Feeder issue #16](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/16), upstream). The game keeps rendering, DLSS 5 stops. Use borderless/windowed; raising `create_delay` in `dlss5-feed.cfg` helps. Seen on Fell & Sell; the same game ran 16,000+ frames without a crash in borderless.
-- **Frame cost.** Neural rendering at native 4K adds several milliseconds. With v-sync on at 60 Hz that shows up as a hard drop to 30 fps. Turn v-sync off, or lower `work_resolution` in `dlss5-feed.cfg` (Feeder path, D3D11 games).
-- **API detection can come back unknown** (monolithic Unreal exes load D3D at runtime, nothing static to read). The tool then assumes DX12 and says so; a DX11 game in that state would miss the bridge. `--check` shows what was detected.
-- The DLSS 5 add-on and its model are a leaked, closed-source build. The tool downloads whatever the rhi-repo releases currently host and cannot vouch for them.
+NVIDIA RTX only (the DLSS 5 model needs tensor cores and NGX). The `310.8.SF` build the tool installs adds patched binaries for RTX 40 and an FP16 path for RTX 20/30; RTX 50 runs the native FP8 kernels. The proprietary NVIDIA driver is required — including its Wine/NGX files (`nvngx.dll` under `/usr/lib/nvidia/wine` or your distro's equivalent; package `nvidia-utils` on Arch). Misdetected? `DLSS5ONECLICK_SKIP_GPU_CHECK=1` bypasses the refusal.
 
 ## Not handled
 
-- **32-bit games** — need the `host64` helper setup (see Feeder README); the tool refuses rather than half-install.
-- **DirectX 9** and **Vulkan** games — different proxy / a Vulkan layer; refused.
-- Online games — the tool refuses when it finds Easy Anti-Cheat, BattlEye or GameGuard files in the install (ReShade add-on injection is exactly what they flag: kick at best, ban at worst). Overwatch, Valorant and League (Blizzard/Riot anti-cheat, no marker files) are refused by exe name; Overwatch additionally blocks unsigned DLLs, so add-ons fail there with error `0x80090006`. `DLSS5ONECLICK_IGNORE_ANTICHEAT=1` bypasses the refusal at your own risk.
+Same as upstream: 32-bit games, DirectX 9, Vulkan-native games (X4, most native Linux ports have no Windows exe at all and are skipped), and games with anti-cheat (EAC/BattlEye/GameGuard — refused; `DLSS5ONECLICK_IGNORE_ANTICHEAT=1` at your own risk, and under Proton that risk includes the anti-cheat's Linux path breaking outright).
+
+- The DLSS 5 add-on and its model are a leaked, closed-source build. The tool downloads whatever the rhi-repo releases currently host and cannot vouch for them.
+- Heroic environment-variable writing is experimental (config format tolerances built in; falls back to showing you the variables).
+- Lutris: games are listed and installable; add the shown variables in the game's Lutris settings yourself (v1 does not edit Lutris configs).
 
 ## Development
 
-Rust 2021, single crate. GUI is egui/eframe; HTTP is reqwest (rustls); archives via the `zip` crate.
+Rust 2021, single crate. GUI is egui/eframe; HTTP is reqwest (rustls); archives via the `zip` crate. The crate still compiles on Windows (all Linux integration is `cfg`-gated) so upstream changes merge cleanly.
 
 ```
-cargo test
-cargo build --release   # target/release/dlss5oneclick.exe
+cargo test                                  # no network, no Steam needed
+cargo clippy --all-targets -- -D warnings
+cargo build --release                       # target/release/dlss5oneclick
+packaging/build-appimage.sh                 # optional AppImage
 ```
 
-Tests use local fakes only; no network. Verified 2026-08-31: full live installs against dummy game folders (both paths), and detection against real installs — Fell & Sell (Unity, DX11, no DLSS → Feeder), Fatal Claw (Unreal, DX11 + DLSS → native + bridge), Mortal Shell 2 (Unreal + DLSS → native), The Witcher 3 (`bin\x64_dx12`, native DX12), Jotunnslayer and Trails in the Sky (DX11 + DLSS → native + bridge). DLSS 5 confirmed running in Fell & Sell (`feature ready … DLAA`, NR evaluating, F6 toggling).
+Verified 2026-09-02 on Arch (Hyprland/Wayland, RTX 4090, driver 610.57): library discovery against a real Steam install, `--check`/`--diagnose` against Cyberpunk 2077 (native DLSS, DX12, complete manual install detected and NR confirmed evaluating) and Skyrim SE (Feeder path plan), launch-option merging against real hand-written `localconfig.vdf` entries (idempotent), GUI on Wayland.
 
 ## Credits
 
-This tool only automates other people's work. The credit belongs to:
-
-- **[crosire](https://github.com/crosire)** — [ReShade](https://reshade.me) and [reshade-shaders](https://github.com/crosire/reshade-shaders), the injection framework everything here runs inside.
-- **[jlrouzies-fr](https://github.com/jlrouzies-fr)** — [DLSS5-Feeder](https://github.com/jlrouzies-fr/DLSS5-Feeder), the add-on that builds a DLSS contract from ReShade depth + motion vectors, and the install guide this tool follows step by step.
-- **[Afzaal (Kaidō)](https://github.com/umar-afzaal)** — [LumeniteFX](https://github.com/umar-afzaal/LumeniteFX), the motion-vector provider (Kernel 2.0).
-- **[clshortfuse](https://github.com/clshortfuse)** and the RenoDX community — [RenoDX](https://github.com/clshortfuse/renodx), which the DLSS 5 neural-rendering add-on is built on.
-- **[RankFTW](https://github.com/RankFTW)** — [RHI](https://github.com/RankFTW/RHI) and the [rhi-repo](https://github.com/RankFTW/rhi-repo) releases that host the DLSS 5 add-on and the NVIDIA runtimes.
-- **NVIDIA** — DLSS 5 itself and the `nvngx_dlssnr.dll` / `nvngx_dlss.dll` runtimes.
-- **DSOGaming** — the [article](https://www.dsogaming.com/articles/heres-how-you-can-install-dlss-5-to-all-dx9-dx10-dx11-dx12-and-vulkan-games/) that put the pieces together and started this.
-- **[Dagherbou](https://github.com/Dagherbou)** — [OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR), the OptiScaler fork with the built-in Neural Rendering pass, and the **[OptiScaler team](https://github.com/optiscaler/OptiScaler)** it builds on (GPL-3).
-- **[NIGos](https://github.com/NIGos)** — [dlss5-bridge](https://github.com/NIGos/dlss5-bridge), which lets the DLSS 5 add-on work in D3D11 games that have their own DLSS.
-- **[emilk](https://github.com/emilk)** — [egui / eframe](https://github.com/emilk/egui), the UI toolkit.
-- Fonts: [Sora](https://github.com/sora-xor/sora-font) by the Sora project, [IBM Plex Sans](https://github.com/IBM/plex) by IBM, [JetBrains Mono](https://github.com/JetBrains/JetBrainsMono) by JetBrains — all SIL OFL.
+This tool only automates other people's work — see [upstream's credits](https://github.com/faisalkindi/DLSS5oneclick#credits) for the full list: crosire (ReShade), jlrouzies-fr (DLSS5-Feeder), Afzaal/Kaidō (LumeniteFX), clshortfuse & the RenoDX community, RankFTW (rhi-repo), NVIDIA, DSOGaming, Dagherbou (OptiScaler_DLSSNR) and the OptiScaler team, NIGos (dlss5-bridge), emilk (egui). And **[faisalkindi](https://github.com/faisalkindi)** for DLSS5oneclick itself, which this port builds on.
 
 ## License
 
-MIT for this tool. Each downloaded component keeps its own license: ReShade BSD-3; DLSS5-Feeder — see its repo; LumeniteFX — AGNYA; dlss5-bridge MIT; the DLSS 5 add-on (`renodx-dlss5.addon64`) — closed source, no license published; NVIDIA runtimes — NVIDIA's terms.
+MIT for this tool (as upstream). Each downloaded component keeps its own license; the DLSS 5 add-on (`renodx-dlss5.addon64`) is closed source with no license published, and the NVIDIA runtimes are under NVIDIA's terms.

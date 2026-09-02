@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=DLSS5oneclick
+Comment=One-click DLSS 5 neural rendering setup for Proton games
+Exec=dlss5oneclick
+Icon=dlss5oneclick
+Terminal=false
+Categories=Game;Utility;

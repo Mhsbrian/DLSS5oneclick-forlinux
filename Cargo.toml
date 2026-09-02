@@ -1,10 +1,10 @@
 [package]
 name = "dlss5oneclick"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
-description = "One-click DLSS 5 neural rendering setup for DX11/DX12 games that ship without DLSS"
+description = "One-click DLSS 5 neural rendering setup for DX11/DX12 games, on Linux with Steam and Proton"
 license = "MIT"
-repository = "https://github.com/faisalkindi/DLSS5oneclick"
+repository = "https://github.com/Mhsbrian/DLSS5oneclick-forlinux"
 build = "build.rs"
 
 [build-dependencies]

@@ -7,6 +7,7 @@ mod gui;
 mod installer;
 mod logo;
 mod net;
+mod platform;
 mod reshade_ini;
 mod theme;
 mod update;
@@ -14,7 +15,9 @@ mod update;
 use std::io::Write;
 use std::path::PathBuf;
 
-/// `dlss5oneclick <GAME.exe | game folder> [--remove | --remove-all | --check | --diagnose | --engine=opti] | --update` runs headless; no args opens the GUI.
+/// `dlss5oneclick <GAME.exe | game folder | game name | appid> [--remove | --remove-all |
+/// --check | --diagnose | --engine=opti | --launch-options | --revert-launch-options]
+/// | --list-games | --update` runs headless; no args opens the GUI.
 fn main() {
     update::cleanup_old();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -51,10 +54,26 @@ error: {e:#}"
         attach_parent_console();
         std::process::exit(cli_update());
     }
+    if args.iter().any(|a| a == "--list-games") {
+        attach_parent_console();
+        std::process::exit(cli_list_games());
+    }
     if let Some(first) = args.first().filter(|a| !a.starts_with('-')) {
         attach_parent_console();
+        let target = PathBuf::from(first);
+        let target = if target.exists() {
+            target
+        } else {
+            match resolve_game_arg(first) {
+                Ok(dir) => dir,
+                Err(msg) => {
+                    eprintln!("{msg}");
+                    std::process::exit(2);
+                }
+            }
+        };
         let code = cli(
-            PathBuf::from(first),
+            target,
             args.iter().any(|a| a == "--remove"),
             args.iter().any(|a| a == "--remove-all"),
             args.iter().any(|a| a == "--check"),
@@ -63,6 +82,13 @@ error: {e:#}"
                 installer::Engine::Opti
             } else {
                 installer::Engine::ReShade
+            },
+            if args.iter().any(|a| a == "--revert-launch-options") {
+                Some(true)
+            } else if args.iter().any(|a| a == "--launch-options") {
+                Some(false)
+            } else {
+                None
             },
         );
         std::process::exit(code);
@@ -107,6 +133,119 @@ fn cli_update() -> i32 {
     }
 }
 
+fn cli_list_games() -> i32 {
+    let games = platform::scan_all();
+    if games.is_empty() {
+        println!("No games found through Steam, Heroic or Lutris.");
+        return 0;
+    }
+    for g in &games {
+        println!(
+            "[{:<6}] {:<40} ({})  {}",
+            g.launcher.label(),
+            g.name,
+            g.id,
+            g.dir.display()
+        );
+    }
+    0
+}
+
+/// A non-path target: exact launcher id (Steam appid) first, then a
+/// case-insensitive name substring across every known launcher.
+fn resolve_game_arg(arg: &str) -> Result<PathBuf, String> {
+    let games = platform::scan_all();
+    if let Some(g) = games.iter().find(|g| g.id == arg) {
+        return Ok(g.dir.clone());
+    }
+    let needle = arg.to_lowercase();
+    let hits: Vec<_> = games
+        .iter()
+        .filter(|g| g.name.to_lowercase().contains(&needle))
+        .collect();
+    match hits.len() {
+        0 => Err(format!(
+            "not found: {arg} (no such path, appid or game name; --list-games shows what is known)"
+        )),
+        1 => {
+            println!("{}: {}", hits[0].name, hits[0].dir.display());
+            Ok(hits[0].dir.clone())
+        }
+        _ => Err(format!(
+            "ambiguous game name {:?}: {}",
+            arg,
+            hits.iter()
+                .map(|g| g.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// Render a `LaunchAdvice` for the terminal; nonzero when the user still has
+/// to act by hand.
+#[cfg(target_os = "linux")]
+fn print_advice(advice: &platform::LaunchAdvice) -> i32 {
+    use platform::LaunchAdvice as A;
+    match advice {
+        A::AppliedSteam(outcomes) => {
+            println!("\nSteam launch options set:");
+            for o in outcomes {
+                println!("  {}", o.merged);
+                println!(
+                    "  (edited {}; backup: {})",
+                    o.file.display(),
+                    o.backup.display()
+                );
+            }
+            0
+        }
+        A::AlreadySet => {
+            println!("\nSteam launch options already contain everything needed.");
+            0
+        }
+        A::ManualSteam { display, why } => {
+            println!("\nCould not set Steam launch options automatically: {why}");
+            println!("Set them yourself: right-click the game -> Properties -> Launch Options:");
+            println!("  {display}");
+            1
+        }
+        A::AppliedHeroic { file } => {
+            println!(
+                "\nHeroic environment variables set ({}). Restart Heroic to pick them up.",
+                file.display()
+            );
+            0
+        }
+        A::ManualEnv {
+            launcher,
+            vars,
+            why,
+        } => {
+            if let Some(why) = why {
+                println!("\n{why}");
+            }
+            println!(
+                "\nAdd these environment variables in {}'s settings for this game:",
+                launcher.label()
+            );
+            for (k, v) in vars {
+                println!("  {k}={v}");
+            }
+            1
+        }
+        A::UnknownLauncher { display } => {
+            println!(
+                "\nThis folder belongs to no known launcher. Under Proton/Wine the game needs:"
+            );
+            println!("  {display}");
+            println!("(Steam: Properties -> Launch Options. Lutris/Heroic: per-game environment variables.)");
+            1
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cli(
     target: PathBuf,
     remove: bool,
@@ -114,6 +253,7 @@ fn cli(
     check: bool,
     diagnose_only: bool,
     engine: installer::Engine,
+    launch_only: Option<bool>,
 ) -> i32 {
     let (exe, candidates) = match game::resolve_target(&target) {
         Ok(v) => v,
@@ -140,8 +280,20 @@ fn cli(
     } else if !candidates.is_empty() {
         println!("using {}", exe.display());
     }
+    if let Some(_revert) = launch_only {
+        #[cfg(target_os = "linux")]
+        {
+            let d = exe.parent().map(std::path::Path::to_path_buf).unwrap_or(exe);
+            return print_advice(&platform::ensure_launch_options(&d, engine, _revert));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!("--launch-options / --revert-launch-options only apply on Linux.");
+            return 2;
+        }
+    }
     if diagnose_only {
-        return match diagnose::run(&exe) {
+        return match diagnose::run_full(&exe) {
             Ok(findings) => {
                 for f in &findings {
                     let tag = match f.level {
@@ -241,6 +393,10 @@ Done. In game: Insert opens the OptiScaler overlay -> enable Neural Rendering (o
             } else {
                 println!("
 Done. In game: Home opens ReShade -> Add-ons tab -> DLSS 5 Neural Rendering -> enable. (Home tab saying no effect files is normal on games with their own DLSS.)");
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(d) = exe.parent() {
+                print_advice(&platform::ensure_launch_options(d, engine, false));
             }
             0
         }

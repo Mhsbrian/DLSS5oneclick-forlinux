@@ -11,7 +11,10 @@ on:
 
 jobs:
   test:
-    runs-on: windows-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -21,10 +24,13 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
-  build:
+  # Linux release binary + AppImage. ubuntu-22.04 keeps the glibc floor at
+  # 2.35 so the binary runs on older gaming distros; if GitHub retires the
+  # image, switch to ubuntu-latest + a container with an old glibc.
+  build-linux:
     needs: test
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: windows-latest
+    runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
@@ -32,6 +38,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
+      - run: cp target/release/dlss5oneclick dlss5oneclick-linux-x86_64
+      - run: packaging/build-appimage.sh target/release/dlss5oneclick .
       - uses: softprops/action-gh-release@v2
         with:
-          files: target/release/dlss5oneclick.exe
+          files: |
+            dlss5oneclick-linux-x86_64
+            dlss5oneclick-x86_64.AppImage

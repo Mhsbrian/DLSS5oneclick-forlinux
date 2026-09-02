@@ -5,12 +5,13 @@ use crate::diagnose;
 use crate::game::{self, GameStatus};
 use crate::installer::{self, Engine, StepState};
 use crate::logo;
+use crate::platform;
 use crate::theme::{self as t};
 use crate::update;
 use eframe::egui::{
     self, Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, Stroke, StrokeKind, Vec2,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
@@ -37,6 +38,35 @@ enum LogLine {
     Plain(String),
 }
 
+/// A game-library row's install state, computed off-thread.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Badge {
+    Complete,
+    Partial,
+    Clean,
+    Refused,
+    /// No usable Windows exe (native Linux build, empty folder, …).
+    NotSupported,
+}
+
+impl Badge {
+    fn label(self) -> &'static str {
+        match self {
+            Badge::Complete => "installed",
+            Badge::Partial => "partial",
+            Badge::Clean => "",
+            Badge::Refused => "refused",
+            Badge::NotSupported => "not supported",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LibRow {
+    entry: platform::GameEntry,
+    badge: Badge,
+}
+
 pub struct App {
     exe_text: String,
     status: Option<Result<GameStatus, String>>,
@@ -53,6 +83,13 @@ pub struct App {
     update: UpdateState,
     update_rx: Option<Receiver<UpdateState>>,
     skipped_version: String,
+    library: Vec<LibRow>,
+    library_rx: Option<Receiver<LibRow>>,
+    lib_filter: String,
+    /// Launch-option outcome to show: (game dir it applies to, the advice).
+    launch_panel: Option<(PathBuf, platform::LaunchAdvice)>,
+    /// The running worker is an install (not a removal): apply options after.
+    finishing_install: bool,
 }
 
 impl App {
@@ -82,10 +119,319 @@ impl App {
                 .storage
                 .and_then(|s| s.get_string("skip_version"))
                 .unwrap_or_default(),
+            library: Vec::new(),
+            library_rx: None,
+            lib_filter: String::new(),
+            launch_panel: None,
+            finishing_install: false,
         };
         app.refresh();
         app.start_update_check();
+        app.start_library_scan();
         app
+    }
+
+    /// Enumerate launcher games on a worker thread; rows stream in as their
+    /// install state is inspected (big game dirs make that slow).
+    fn start_library_scan(&mut self) {
+        let (tx, rx): (Sender<LibRow>, Receiver<LibRow>) = channel();
+        self.library.clear();
+        self.library_rx = Some(rx);
+        thread::spawn(move || {
+            for entry in platform::scan_all() {
+                let badge = match game::resolve_target(&entry.dir) {
+                    Err(_) => Badge::NotSupported,
+                    Ok((exe, _)) => match game::inspect(&exe) {
+                        Err(_) => Badge::NotSupported,
+                        Ok(st) if !st.problems.is_empty() => Badge::Refused,
+                        Ok(st) if st.complete() => Badge::Complete,
+                        Ok(st)
+                            if st.reshade
+                                || st.feeder
+                                || st.dlss5_addon
+                                || st.dlssnr
+                                || st.opti =>
+                        {
+                            Badge::Partial
+                        }
+                        Ok(_) => Badge::Clean,
+                    },
+                };
+                if tx.send(LibRow { entry, badge }).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    fn pump_library(&mut self) {
+        let Some(rx) = &self.library_rx else { return };
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok(row) => self.library.push(row),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        if disconnected {
+            self.library_rx = None;
+        }
+    }
+
+    /// The game-library picker: one row per launcher game, click to select.
+    fn library_panel(&mut self, ui: &mut egui::Ui) {
+        self.pump_library();
+        if self.library_rx.is_some() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        if self.library.is_empty() {
+            return;
+        }
+        egui::Panel::top("library")
+            .frame(
+                Frame::new()
+                    .fill(t::PANEL)
+                    .inner_margin(Margin {
+                        left: 18,
+                        right: 28,
+                        top: 10,
+                        bottom: 8,
+                    })
+                    .stroke(Stroke::new(1.0, t::BORDER)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("GAME LIBRARY")
+                            .font(t::plex_semibold(10.5))
+                            .color(t::TEXT_MUTED),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.lib_filter)
+                            .hint_text(RichText::new("filter").color(t::TEXT_DIM))
+                            .font(t::plex(11.0))
+                            .desired_width(140.0),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("Rescan").clicked() {
+                            self.start_library_scan();
+                        }
+                        if self.library_rx.is_some() {
+                            ui.label(
+                                RichText::new("scanning…")
+                                    .font(t::plex(10.5))
+                                    .color(t::TEXT_DIM),
+                            );
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                let filter = self.lib_filter.to_lowercase();
+                let selected = self.input_path();
+                let mut clicked: Option<PathBuf> = None;
+                egui::ScrollArea::vertical()
+                    .max_height(126.0)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        for row in &self.library {
+                            if !filter.is_empty()
+                                && !row.entry.name.to_lowercase().contains(&filter)
+                            {
+                                continue;
+                            }
+                            let is_sel = selected == row.entry.dir;
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [52.0, 16.0],
+                                    egui::Label::new(
+                                        RichText::new(format!(
+                                            "[{}]",
+                                            row.entry.launcher.label()
+                                        ))
+                                        .font(t::mono(10.0))
+                                        .color(t::TEXT_DIM),
+                                    ),
+                                );
+                                let resp = ui.selectable_label(
+                                    is_sel,
+                                    RichText::new(&row.entry.name)
+                                        .font(t::plex_medium(12.0))
+                                        .color(if is_sel { t::TEXT } else { t::TEXT_SOFT }),
+                                );
+                                if resp.clicked() {
+                                    clicked = Some(row.entry.dir.clone());
+                                }
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    let col = match row.badge {
+                                        Badge::Complete => t::ACCENT,
+                                        Badge::Partial => t::TEXT_OFF,
+                                        Badge::Refused => t::DANGER,
+                                        _ => t::TEXT_DIM,
+                                    };
+                                    let label = row.badge.label();
+                                    if !label.is_empty() {
+                                        ui.label(
+                                            RichText::new(label).font(t::plex(10.5)).color(col),
+                                        );
+                                    }
+                                });
+                            });
+                        }
+                    });
+                if let Some(dir) = clicked {
+                    self.exe_text = dir.to_string_lossy().into_owned();
+                    self.launch_panel = None;
+                    self.refresh();
+                }
+            });
+    }
+
+    /// The post-install / on-demand launch-options bar.
+    fn launch_options_panel(&mut self, ui: &mut egui::Ui) {
+        let Some((dir, advice)) = self.launch_panel.clone() else {
+            return;
+        };
+        use platform::LaunchAdvice as A;
+        let mut dismiss = false;
+        let mut retry = false;
+        egui::Panel::top("launch_options")
+            .frame(
+                Frame::new()
+                    .fill(t::TILE)
+                    .inner_margin(Margin {
+                        left: 18,
+                        right: 28,
+                        top: 10,
+                        bottom: 10,
+                    })
+                    .stroke(Stroke::new(1.0, t::BORDER_STRONG)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("LAUNCH OPTIONS")
+                            .font(t::plex_semibold(10.5))
+                            .color(t::TEXT_MUTED),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("Dismiss").clicked() {
+                            dismiss = true;
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                let copy_row = |ui: &mut egui::Ui, text: &str| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(text).font(t::mono(11.0)).color(t::TEXT_SOFT),
+                        );
+                        if ui.small_button("Copy").clicked() {
+                            ui.ctx().copy_text(text.to_string());
+                        }
+                    });
+                };
+                match &advice {
+                    A::AppliedSteam(outcomes) => {
+                        ui.label(
+                            RichText::new(
+                                "Steam launch options set — restart Steam to pick them up.",
+                            )
+                            .font(t::plex_medium(12.0))
+                            .color(t::TEXT),
+                        );
+                        for o in outcomes {
+                            copy_row(ui, &o.merged);
+                            ui.label(
+                                RichText::new(format!("backup: {}", o.backup.display()))
+                                    .font(t::plex(10.5))
+                                    .color(t::TEXT_DIM),
+                            );
+                        }
+                    }
+                    A::AlreadySet => {
+                        ui.label(
+                            RichText::new("Steam launch options already contain everything needed.")
+                                .font(t::plex_medium(12.0))
+                                .color(t::TEXT),
+                        );
+                    }
+                    A::ManualSteam { display, why } => {
+                        ui.label(
+                            RichText::new(format!("Not applied automatically: {why}"))
+                                .font(t::plex(11.5))
+                                .color(t::TEXT_SOFT),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "Paste into Steam: right-click the game → Properties → Launch Options — or close Steam and retry:",
+                            )
+                            .font(t::plex(11.5))
+                            .color(t::TEXT_SOFT),
+                        );
+                        copy_row(ui, display);
+                        if ui.button("Retry (Steam closed)").clicked() {
+                            retry = true;
+                        }
+                    }
+                    A::AppliedHeroic { file } => {
+                        ui.label(
+                            RichText::new(format!(
+                                "Heroic environment variables set ({}). Restart Heroic.",
+                                file.display()
+                            ))
+                            .font(t::plex_medium(12.0))
+                            .color(t::TEXT),
+                        );
+                    }
+                    A::ManualEnv {
+                        launcher,
+                        vars,
+                        why,
+                    } => {
+                        if let Some(why) = why {
+                            ui.label(
+                                RichText::new(why).font(t::plex(11.5)).color(t::TEXT_SOFT),
+                            );
+                        }
+                        ui.label(
+                            RichText::new(format!(
+                                "Add these in {}'s per-game environment settings:",
+                                launcher.label()
+                            ))
+                            .font(t::plex(11.5))
+                            .color(t::TEXT_SOFT),
+                        );
+                        let joined = vars
+                            .iter()
+                            .map(|(k, v)| format!("{k}={v}"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        copy_row(ui, &joined);
+                    }
+                    A::UnknownLauncher { display } => {
+                        ui.label(
+                            RichText::new(
+                                "This folder belongs to no known launcher. Under Proton/Wine the game needs:",
+                            )
+                            .font(t::plex(11.5))
+                            .color(t::TEXT_SOFT),
+                        );
+                        copy_row(ui, display);
+                    }
+                }
+            });
+        if retry {
+            let advice = platform::ensure_launch_options(&dir, self.engine, false);
+            self.launch_panel = Some((dir, advice));
+        }
+        if dismiss {
+            self.launch_panel = None;
+        }
     }
 
     fn exe(&self) -> Option<PathBuf> {
@@ -131,6 +477,8 @@ impl App {
     fn start(&mut self, remove: Option<bool>) {
         let Some(exe) = self.exe() else { return };
         let engine = self.engine;
+        self.finishing_install = remove.is_none();
+        self.launch_panel = None;
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
         self.rx = Some(rx);
         self.running = true;
@@ -230,7 +578,7 @@ impl App {
         let Some(exe) = self.exe() else { return };
         self.log.clear();
         self.progress_msg.clear();
-        match diagnose::run(&exe) {
+        match diagnose::run_full(&exe) {
             Ok(findings) => {
                 for f in findings {
                     let line = match f.level {
@@ -279,6 +627,15 @@ impl App {
                     self.progress = 100;
                     self.progress_msg = "Done.".into();
                     self.log.push(LogLine::Plain(msg));
+                    if cfg!(target_os = "linux") && self.finishing_install {
+                        if let Some(dir) =
+                            self.exe().and_then(|e| e.parent().map(Path::to_path_buf))
+                        {
+                            let advice =
+                                platform::ensure_launch_options(&dir, self.engine, false);
+                            self.launch_panel = Some((dir, advice));
+                        }
+                    }
                 }
                 Err(e) => {
                     self.progress_msg = "Failed.".into();
@@ -286,7 +643,9 @@ impl App {
                     self.last_error = Some(e);
                 }
             }
+            self.finishing_install = false;
             self.refresh();
+            self.start_library_scan();
         }
     }
 }
@@ -645,6 +1004,9 @@ impl eframe::App for App {
             }
         }
 
+        self.library_panel(ui);
+        self.launch_options_panel(ui);
+
         egui::CentralPanel::default()
             .frame(Frame::new().fill(t::PANEL).inner_margin(Margin {
                 left: 18,
@@ -826,6 +1188,27 @@ impl eframe::App for App {
                     {
                         self.run_diagnose();
                     }
+                    if cfg!(target_os = "linux") {
+                        let lo = egui::Button::new(
+                            RichText::new("Launch options").font(t::plex_medium(13.0)).color(t::TEXT_OFF),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::new(1.0, t::BORDER_STRONG))
+                        .corner_radius(CornerRadius::same(8))
+                        .min_size(Vec2::new(120.0, 42.0));
+                        if ui
+                            .add_enabled(ok_status.is_some() && !self.running, lo)
+                            .on_hover_text(
+                                "Sets the WINEDLLOVERRIDES/Proton launch options this game needs (Steam: applied for you when Steam is closed).",
+                            )
+                            .clicked()
+                        {
+                            if let Some(dir) = self.exe().and_then(|e| e.parent().map(|d| d.to_path_buf())) {
+                                let advice = platform::ensure_launch_options(&dir, self.engine, false);
+                                self.launch_panel = Some((dir, advice));
+                            }
+                        }
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let msg = if self.running || !self.progress_msg.is_empty() {
                             self.progress_msg.clone()
@@ -921,10 +1304,14 @@ Remove incl. ReShade also deletes ReShade (dxgi.dll, ini files, reshade-shaders)
 }
 
 pub fn run() -> eframe::Result {
+    #[cfg(target_os = "linux")]
+    const TITLE: &str = concat!("DLSS5oneclick ", env!("CARGO_PKG_VERSION"), " · for Linux");
+    #[cfg(not(target_os = "linux"))]
+    const TITLE: &str = concat!("DLSS5oneclick ", env!("CARGO_PKG_VERSION"));
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([700.0, 560.0])
-        .with_min_inner_size([700.0, 520.0])
-        .with_title(concat!("DLSS5oneclick ", env!("CARGO_PKG_VERSION")));
+        .with_inner_size([760.0, 680.0])
+        .with_min_inner_size([700.0, 560.0])
+        .with_title(TITLE);
     if let Some(icon) = logo::icon_data() {
         viewport = viewport.with_icon(icon);
     }

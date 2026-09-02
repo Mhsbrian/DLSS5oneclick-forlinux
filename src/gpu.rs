@@ -168,7 +168,110 @@ pub fn list() -> Vec<Gpu> {
     out
 }
 
-#[cfg(not(windows))]
+/// The proprietary driver names the card in `/proc/driver/nvidia/gpus/*/information`
+/// ("Model:" line). Other vendors are read from DRM (`/sys/class/drm/cardN/device/vendor`)
+/// only far enough to say "not NVIDIA"; an NVIDIA card without that proc file (nouveau,
+/// driver not loaded) is reported with an unknown model so it is never falsely refused.
+#[cfg(target_os = "linux")]
+pub fn list() -> Vec<Gpu> {
+    use std::path::Path;
+    let mut out = list_at(Path::new("/proc"), Path::new("/sys"));
+    if out.is_empty() {
+        out = nvidia_smi();
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn list_at(proc_root: &std::path::Path, sys_root: &std::path::Path) -> Vec<Gpu> {
+    use std::fs;
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(proc_root.join("driver/nvidia/gpus")) {
+        for e in rd.flatten() {
+            let Ok(text) = fs::read_to_string(e.path().join("information")) else {
+                continue;
+            };
+            for line in text.lines() {
+                if let Some(rest) = line.strip_prefix("Model:") {
+                    let name = rest.trim().to_string();
+                    if !name.is_empty() {
+                        out.push(Gpu {
+                            name,
+                            vendor: "NVIDIA".into(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    let nvidia_named = !out.is_empty();
+    if let Ok(rd) = fs::read_dir(sys_root.join("class/drm")) {
+        for e in rd.flatten() {
+            let fname = e.file_name();
+            let n = fname.to_string_lossy();
+            // cardN only; card0-DP-1 etc. are connectors of the same device.
+            if !n.starts_with("card") || n.contains('-') {
+                continue;
+            }
+            let Ok(v) = fs::read_to_string(e.path().join("device/vendor")) else {
+                continue;
+            };
+            let (name, vendor) = match v.trim() {
+                "0x10de" => {
+                    if nvidia_named {
+                        continue;
+                    }
+                    ("NVIDIA GPU (model unknown, proprietary driver not detected)", "NVIDIA")
+                }
+                "0x1002" => ("AMD GPU", "AMD"),
+                "0x8086" => ("Intel GPU", "Intel"),
+                _ => continue,
+            };
+            out.push(Gpu {
+                name: name.into(),
+                vendor: vendor.into(),
+            });
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn nvidia_smi() -> Vec<Gpu> {
+    let Ok(o) = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=name", "--format=csv,noheader"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !o.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| Gpu {
+            name: l.to_string(),
+            vendor: "NVIDIA".into(),
+        })
+        .collect()
+}
+
+/// Loaded NVIDIA kernel-driver version (e.g. "610.57.04"), for diagnostics.
+#[cfg(target_os = "linux")]
+pub fn driver_version() -> Option<String> {
+    driver_version_at(std::path::Path::new("/sys"))
+}
+
+#[cfg(target_os = "linux")]
+fn driver_version_at(sys_root: &std::path::Path) -> Option<String> {
+    let v = std::fs::read_to_string(sys_root.join("module/nvidia/version")).ok()?;
+    let v = v.trim();
+    (!v.is_empty()).then(|| v.to_string())
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn list() -> Vec<Gpu> {
     Vec::new()
 }
@@ -213,6 +316,73 @@ mod tests {
         {
             let real = best();
             assert!(real.is_some());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    mod linux {
+        use super::super::*;
+        use std::fs;
+        use std::path::Path;
+
+        fn write(p: &Path, text: &str) {
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, text).unwrap();
+        }
+
+        #[test]
+        fn proc_model_line_wins_over_drm() {
+            let t = tempfile::tempdir().unwrap();
+            let (proc_r, sys_r) = (t.path().join("proc"), t.path().join("sys"));
+            write(
+                &proc_r.join("driver/nvidia/gpus/0000:01:00.0/information"),
+                "Model: \t\t NVIDIA GeForce RTX 4090\nIRQ:   \t\t 89\n",
+            );
+            write(&sys_r.join("class/drm/card0/device/vendor"), "0x1002\n");
+            write(&sys_r.join("class/drm/card1/device/vendor"), "0x10de\n");
+            let got = list_at(&proc_r, &sys_r);
+            assert_eq!(got[0].name, "NVIDIA GeForce RTX 4090");
+            assert_eq!(classify(&got[0].name), Tier::Rtx40);
+            // The 0x10de DRM entry is folded into the named one; AMD iGPU still listed.
+            assert!(got.iter().filter(|g| g.vendor == "NVIDIA").count() == 1);
+            assert!(got.iter().any(|g| g.vendor == "AMD"));
+        }
+
+        #[test]
+        fn amd_only_is_not_nvidia() {
+            let t = tempfile::tempdir().unwrap();
+            let (proc_r, sys_r) = (t.path().join("proc"), t.path().join("sys"));
+            write(&sys_r.join("class/drm/card0/device/vendor"), "0x1002\n");
+            let got = list_at(&proc_r, &sys_r);
+            assert_eq!(got.len(), 1);
+            assert_eq!(classify(&got[0].name), Tier::NotNvidia);
+        }
+
+        #[test]
+        fn nvidia_without_proprietary_driver_is_unknown_not_refused() {
+            let t = tempfile::tempdir().unwrap();
+            let (proc_r, sys_r) = (t.path().join("proc"), t.path().join("sys"));
+            write(&sys_r.join("class/drm/card0/device/vendor"), "0x10de\n");
+            let got = list_at(&proc_r, &sys_r);
+            assert_eq!(got.len(), 1);
+            let t = classify(&got[0].name);
+            assert_eq!(t, Tier::Unknown);
+            assert!(t.can_run());
+        }
+
+        #[test]
+        fn empty_roots_give_empty_list() {
+            let t = tempfile::tempdir().unwrap();
+            assert!(list_at(&t.path().join("proc"), &t.path().join("sys")).is_empty());
+        }
+
+        #[test]
+        fn driver_version_read_and_trimmed() {
+            let t = tempfile::tempdir().unwrap();
+            let sys_r = t.path().join("sys");
+            assert_eq!(driver_version_at(&sys_r), None);
+            write(&sys_r.join("module/nvidia/version"), "610.57.04\n");
+            assert_eq!(driver_version_at(&sys_r).as_deref(), Some("610.57.04"));
         }
     }
 }

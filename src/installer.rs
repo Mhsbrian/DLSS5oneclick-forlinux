@@ -28,6 +28,7 @@ pub const RESHADE_SHADERS_RAW: &str =
     "https://raw.githubusercontent.com/crosire/reshade-shaders/slim/Shaders/";
 pub const FEEDER_DOWNLOAD: &str =
     "https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest/download/";
+pub const FEEDER_REPO: &str = "jlrouzies-fr/DLSS5-Feeder";
 pub const LUMENITE_ZIP: &str =
     "https://codeload.github.com/umar-afzaal/LumeniteFX/zip/refs/heads/mainline";
 
@@ -63,7 +64,7 @@ fn step_opti(
         return Ok(vec![]);
     }
     let d = st.game_dir();
-    if game::is_reshade_dll(&d.join(game::RESHADE_PROXY)) {
+    if game::is_reshade_dll(&game::join_ci(d, &[game::RESHADE_PROXY])) {
         bail!(
             "ReShade is installed as dxgi.dll in this game; OptiScaler needs that name. \
              Run Remove (or Remove incl. ReShade) first, then install with the OptiScaler engine."
@@ -354,7 +355,7 @@ pub fn install_reshade_from_setup(
     };
     let f = fs::File::open(setup_exe)?;
     let mut zip = zip::ZipArchive::new(f).context("ReShade installer has no readable archive")?;
-    net::extract_member(&mut zip, dll, &game_dir.join(game::RESHADE_PROXY))
+    net::extract_member(&mut zip, dll, &game::join_ci(game_dir, &[game::RESHADE_PROXY]))
         .with_context(|| format!("{} does not contain {dll}", setup_exe.display()))?;
     Ok(vec![game::RESHADE_PROXY.into()])
 }
@@ -369,7 +370,7 @@ fn step_reshade(
         progress(100, "ReShade already installed");
         return Ok(vec![]);
     }
-    let proxy = st.game_dir().join(game::RESHADE_PROXY);
+    let proxy = game::join_ci(st.game_dir(), &[game::RESHADE_PROXY]);
     if proxy.is_file() {
         bail!(
             "{} exists but is not ReShade (DXVK, Special K, another injector?). Remove it first.",
@@ -391,10 +392,10 @@ fn step_headers(
     _work: &Path,
     progress: Progress,
 ) -> Result<Vec<String>> {
-    let shaders = st.game_dir().join("reshade-shaders").join("Shaders");
+    let shaders = game::join_ci(st.game_dir(), &["reshade-shaders", "Shaders"]);
     let mut installed = Vec::new();
     for h in game::RESHADE_HEADERS {
-        let dest = shaders.join(h);
+        let dest = game::existing_ci(&shaders, h).unwrap_or_else(|| shaders.join(h));
         if dest.is_file() {
             continue;
         }
@@ -418,7 +419,7 @@ fn step_headers(
 fn step_feeder(
     client: &Client,
     st: &GameStatus,
-    _work: &Path,
+    work: &Path,
     progress: Progress,
 ) -> Result<Vec<String>> {
     if st.feeder {
@@ -426,24 +427,39 @@ fn step_feeder(
         return Ok(vec![]);
     }
     progress(0, "Fetching latest DLSS5-Feeder");
-    let addon_url = format!("{FEEDER_DOWNLOAD}{}", game::FEEDER_ADDON);
-    let fx_url = format!("{FEEDER_DOWNLOAD}{}", game::FEEDER_FX);
     let d = st.game_dir();
-    let shaders = d.join("reshade-shaders").join("Shaders");
-    net::download(
-        client,
-        &addon_url,
-        &d.join(game::FEEDER_ADDON),
-        game::FEEDER_ADDON,
-        progress,
-    )?;
-    net::download(
-        client,
-        &fx_url,
-        &shaders.join(game::FEEDER_FX),
-        game::FEEDER_FX,
-        progress,
-    )?;
+    let shaders = game::join_ci(d, &["reshade-shaders", "Shaders"]);
+    // Older Feeder releases attach the two files loose; newer ones (0.11+)
+    // ship a single DLSS5-Feeder-<ver>.zip holding the same paths.
+    let loose = (|| -> Result<()> {
+        net::download(
+            client,
+            &format!("{FEEDER_DOWNLOAD}{}", game::FEEDER_ADDON),
+            &d.join(game::FEEDER_ADDON),
+            game::FEEDER_ADDON,
+            progress,
+        )?;
+        net::download(
+            client,
+            &format!("{FEEDER_DOWNLOAD}{}", game::FEEDER_FX),
+            &shaders.join(game::FEEDER_FX),
+            game::FEEDER_FX,
+            progress,
+        )
+    })();
+    if loose.is_err() {
+        progress(0, "No loose Feeder assets in the latest release; using its zip");
+        let tags = net::github_release_tags_html(client, FEEDER_REPO, "v", 2)?;
+        let tag = tags
+            .first()
+            .ok_or_else(|| anyhow!("no DLSS5-Feeder release found"))?;
+        let url =
+            net::github_asset_url_html(client, FEEDER_REPO, tag, r#"DLSS5-Feeder-[^"]+\.zip"#)?;
+        let z = work.join("dlss5-feeder.zip");
+        net::download(client, &url, &z, "DLSS5-Feeder", progress)?;
+        install_single_from_zip(&z, game::FEEDER_ADDON, &d.join(game::FEEDER_ADDON))?;
+        install_single_from_zip(&z, game::FEEDER_FX, &shaders.join(game::FEEDER_FX))?;
+    }
     Ok(vec![
         game::FEEDER_ADDON.into(),
         format!("reshade-shaders/Shaders/{}", game::FEEDER_FX),
@@ -453,8 +469,8 @@ fn step_feeder(
 // ── step 4: LumeniteFX ─────────────────────────────────────────────
 
 pub fn install_lumenite_from_zip(zip_path: &Path, game_dir: &Path) -> Result<Vec<String>> {
-    let shaders = game_dir.join("reshade-shaders").join("Shaders");
-    let textures = game_dir.join("reshade-shaders").join("Textures");
+    let shaders = game::join_ci(game_dir, &["reshade-shaders", "Shaders"]);
+    let textures = game::join_ci(game_dir, &["reshade-shaders", "Textures"]);
     let f = fs::File::open(zip_path)?;
     let mut zip = zip::ZipArchive::new(f).context("LumeniteFX download is not a valid zip")?;
     let fx = net::members_matching(
@@ -546,7 +562,7 @@ fn step_dlss5(
         let (tag, url) = rhi_latest(client, prefix)?;
         let z = work.join(format!("{tag}.zip"));
         net::download(client, &url, &z, fname, progress)?;
-        install_single_from_zip(&z, fname, &st.game_dir().join(fname))?;
+        install_single_from_zip(&z, fname, &game::join_ci(st.game_dir(), &[fname]))?;
         if fname == game::DLSS_DLL {
             fs::write(st.game_dir().join(game::DLSS_MARKER), tag.as_bytes())?;
         }
@@ -571,7 +587,7 @@ fn step_dlssnr_only(
     let (tag, url) = rhi_latest(client, "dlssnr-")?;
     let z = work.join(format!("{tag}.zip"));
     net::download(client, &url, &z, game::DLSSNR_DLL, progress)?;
-    install_single_from_zip(&z, game::DLSSNR_DLL, &st.game_dir().join(game::DLSSNR_DLL))?;
+    install_single_from_zip(&z, game::DLSSNR_DLL, &game::join_ci(st.game_dir(), &[game::DLSSNR_DLL]))?;
     Ok(vec![format!("{} ({tag})", game::DLSSNR_DLL)])
 }
 
@@ -585,11 +601,10 @@ fn step_feeder_cleanup(
 ) -> Result<Vec<String>> {
     let d = st.game_dir();
     let mut removed = Vec::new();
+    let shaders = game::join_ci(d, &["reshade-shaders", "Shaders"]);
     for f in [
-        d.join(game::FEEDER_ADDON),
-        d.join("reshade-shaders")
-            .join("Shaders")
-            .join(game::FEEDER_FX),
+        game::join_ci(d, &[game::FEEDER_ADDON]),
+        game::join_ci(&shaders, &[game::FEEDER_FX]),
     ] {
         if f.is_file() {
             fs::remove_file(&f)?;
@@ -625,7 +640,7 @@ fn step_bridge(
     net::download(
         client,
         BRIDGE_DOWNLOAD,
-        &st.game_dir().join(game::BRIDGE_ADDON),
+        &game::join_ci(st.game_dir(), &[game::BRIDGE_ADDON]),
         game::BRIDGE_ADDON,
         progress,
     )?;
@@ -706,21 +721,23 @@ pub fn run_all_with(
 /// Remove everything this tool places except ReShade itself and nvngx_dlss.dll.
 pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
     let d = exe.parent().context("exe has no parent")?;
-    let shaders = d.join("reshade-shaders").join("Shaders");
-    let include = shaders.join("include");
+    let shaders = game::join_ci(d, &["reshade-shaders", "Shaders"]);
+    let include = game::join_ci(&shaders, &["include"]);
     let mut targets: Vec<PathBuf> = vec![
-        d.join(game::DLSS_MARKER),
-        d.join(game::FEEDER_ADDON),
-        d.join(game::DLSS5_ADDON),
-        d.join(game::DLSSNR_DLL),
-        d.join(game::BRIDGE_ADDON),
-        d.join("dlss5-dx11-bridge.addon64"),
-        shaders.join(game::FEEDER_FX),
-        d.join("reshade-shaders")
-            .join("Textures")
-            .join(game::LUMENITE_BLUENOISE),
+        game::join_ci(d, &[game::DLSS_MARKER]),
+        game::join_ci(d, &[game::FEEDER_ADDON]),
+        game::join_ci(d, &[game::DLSS5_ADDON]),
+        game::join_ci(d, &[game::DLSSNR_DLL]),
+        game::join_ci(d, &[game::BRIDGE_ADDON]),
+        game::join_ci(d, &["dlss5-dx11-bridge.addon64"]),
+        game::join_ci(&shaders, &[game::FEEDER_FX]),
+        game::join_ci(d, &["reshade-shaders", "Textures", game::LUMENITE_BLUENOISE]),
     ];
-    targets.extend(game::RESHADE_HEADERS.iter().map(|h| shaders.join(h)));
+    targets.extend(
+        game::RESHADE_HEADERS
+            .iter()
+            .map(|h| game::join_ci(&shaders, &[h])),
+    );
     for (dir, ext) in [(&shaders, "fx"), (&include, "fxh")] {
         if let Ok(rd) = fs::read_dir(dir) {
             for e in rd.flatten() {
@@ -731,8 +748,8 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
             }
         }
     }
-    if d.join(game::DLSS_MARKER).is_file() {
-        targets.push(d.join(game::DLSS_DLL));
+    if game::join_ci(d, &[game::DLSS_MARKER]).is_file() {
+        targets.push(game::join_ci(d, &[game::DLSS_DLL]));
     }
     let mut removed = Vec::new();
     uninstall_opti(d, &mut removed)?;
@@ -773,7 +790,7 @@ pub fn uninstall_all(exe: &Path) -> Result<(Vec<String>, Option<String>)> {
             }
         }
     }
-    let shaders_root = d.join("reshade-shaders");
+    let shaders_root = game::join_ci(d, &["reshade-shaders"]);
     let mut walk = vec![shaders_root.clone()];
     while let Some(dir) = walk.pop() {
         if let Ok(rd) = fs::read_dir(&dir) {
@@ -816,7 +833,7 @@ pub fn uninstall_all(exe: &Path) -> Result<(Vec<String>, Option<String>)> {
         }
         Ok(())
     };
-    let proxy = d.join(game::RESHADE_PROXY);
+    let proxy = game::join_ci(d, &[game::RESHADE_PROXY]);
     if game::is_reshade_dll(&proxy) {
         rm(proxy)?;
     }
@@ -961,6 +978,30 @@ mod tests {
         let bad = t.path().join("bad.zip");
         write_zip(&bad, &[("whatever.txt", b"x")], &[]);
         assert!(install_lumenite_from_zip(&bad, t.path()).is_err());
+    }
+
+    #[test]
+    fn feeder_zip_layout_extracts_by_basename() {
+        // The 0.11+ Feeder release zip: files nested, matched by basename.
+        let t = tempfile::tempdir().unwrap();
+        let z = t.path().join("DLSS5-Feeder-0.11.0-beta.2.zip");
+        write_zip(
+            &z,
+            &[
+                ("dlss5-feed.addon64", b"addon"),
+                ("reshade-shaders/Shaders/DLSS5_Feed.fx", b"fx"),
+                ("host64/dlss5-feed-host64.exe", b"host"),
+            ],
+            &[],
+        );
+        install_single_from_zip(&z, game::FEEDER_ADDON, &t.path().join(game::FEEDER_ADDON))
+            .unwrap();
+        install_single_from_zip(&z, game::FEEDER_FX, &t.path().join(game::FEEDER_FX)).unwrap();
+        assert_eq!(
+            fs::read(t.path().join(game::FEEDER_ADDON)).unwrap(),
+            b"addon"
+        );
+        assert_eq!(fs::read(t.path().join(game::FEEDER_FX)).unwrap(), b"fx");
     }
 
     #[test]

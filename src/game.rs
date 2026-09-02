@@ -29,6 +29,37 @@ pub const RESHADE_HEADERS: [&str; 3] = ["ReShade.fxh", "ReShadeUI.fxh", "DrawTex
 pub const RESHADE_INI: &str = "ReShade.ini";
 pub const RESHADE_PRESET: &str = "ReShadePreset.ini";
 
+/// The entry in `dir` matching `name` case-insensitively; the on-disk casing wins.
+/// Game folders sit on case-sensitive filesystems on Linux, and other tools (or a
+/// Windows-made copy) may have created differently-cased versions of what this tool
+/// looks for — an exact-case miss must not split the tree or hide an install.
+pub fn existing_ci(dir: &Path, name: &str) -> Option<PathBuf> {
+    let exact = dir.join(name);
+    if exact.exists() {
+        return Some(exact);
+    }
+    for e in fs::read_dir(dir).ok()?.flatten() {
+        if e.file_name().to_string_lossy().eq_ignore_ascii_case(name) {
+            return Some(e.path());
+        }
+    }
+    None
+}
+
+/// `dir/parts…` where each component reuses an existing entry's casing when one
+/// matches case-insensitively, and keeps the given canonical casing otherwise.
+pub fn join_ci(dir: &Path, parts: &[&str]) -> PathBuf {
+    let mut p = dir.to_path_buf();
+    for part in parts {
+        p = existing_ci(&p, part).unwrap_or_else(|| p.join(part));
+    }
+    p
+}
+
+fn file_ci(dir: &Path, name: &str) -> bool {
+    existing_ci(dir, name).is_some_and(|p| p.is_file())
+}
+
 /// 64 or 32, read from the PE header's Machine field.
 pub fn exe_bitness(exe: &Path) -> Result<u8> {
     let mut f = fs::File::open(exe).with_context(|| format!("cannot open {}", exe.display()))?;
@@ -379,8 +410,8 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     }
     let d = exe.parent().context("exe has no parent directory")?;
     let bitness = exe_bitness(exe)?;
-    let shaders = d.join("reshade-shaders").join("Shaders");
-    let textures = d.join("reshade-shaders").join("Textures");
+    let shaders = join_ci(d, &["reshade-shaders", "Shaders"]);
+    let textures = join_ci(d, &["reshade-shaders", "Textures"]);
     let mut problems = Vec::new();
     if let Some(ac) = detect_anticheat(d).or_else(|| known_anticheat_exe(exe)) {
         if std::env::var_os("DLSS5ONECLICK_IGNORE_ANTICHEAT").is_none() {
@@ -403,11 +434,11 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     if bitness != 64 {
         problems.push("32-bit game: DLSS5-Feeder needs the host64 setup, which this tool does not automate yet.".into());
     }
-    if d.join("d3d9.dll").is_file() && !d.join(RESHADE_PROXY).is_file() {
+    if file_ci(d, "d3d9.dll") && !file_ci(d, RESHADE_PROXY) {
         problems
             .push("A d3d9.dll proxy is present; DirectX 9 games are not supported here.".into());
     }
-    let feeder = d.join(FEEDER_ADDON).is_file() && shaders.join(FEEDER_FX).is_file();
+    let feeder = file_ci(d, FEEDER_ADDON) && file_ci(&shaders, FEEDER_FX);
     let mode = if game_ships_dlss(d) {
         Mode::Native
     } else {
@@ -417,19 +448,18 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     Ok(GameStatus {
         mode,
         api,
-        bridge: d.join(BRIDGE_ADDON).is_file() || d.join("dlss5-dx11-bridge.addon64").is_file(),
-        opti: d.join(OPTI_MANIFEST).is_file(),
+        bridge: file_ci(d, BRIDGE_ADDON) || file_ci(d, "dlss5-dx11-bridge.addon64"),
+        opti: file_ci(d, OPTI_MANIFEST),
         gpu,
         exe: exe.to_path_buf(),
         bitness,
-        reshade: !d.join(OPTI_MANIFEST).is_file() && is_reshade_dll(&d.join(RESHADE_PROXY)),
-        headers: RESHADE_HEADERS.iter().all(|h| shaders.join(h).is_file()),
+        reshade: !file_ci(d, OPTI_MANIFEST) && is_reshade_dll(&join_ci(d, &[RESHADE_PROXY])),
+        headers: RESHADE_HEADERS.iter().all(|h| file_ci(&shaders, h)),
         feeder,
-        lumenite: shaders.join(LUMENITE_KERNEL_FX).is_file()
-            && textures.join(LUMENITE_BLUENOISE).is_file(),
-        dlss5_addon: d.join(DLSS5_ADDON).is_file(),
-        dlssnr: d.join(DLSSNR_DLL).is_file(),
-        dlss: d.join(DLSS_DLL).is_file(),
+        lumenite: file_ci(&shaders, LUMENITE_KERNEL_FX) && file_ci(&textures, LUMENITE_BLUENOISE),
+        dlss5_addon: file_ci(d, DLSS5_ADDON),
+        dlssnr: file_ci(d, DLSSNR_DLL),
+        dlss: file_ci(d, DLSS_DLL),
         problems,
     })
 }
@@ -597,6 +627,37 @@ pub mod testutil {
 mod tests {
     use super::testutil::*;
     use super::*;
+
+    #[test]
+    fn existing_ci_and_join_ci_reuse_on_disk_casing() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        fs::create_dir_all(d.join("Reshade-Shaders").join("SHADERS")).unwrap();
+        assert!(existing_ci(d, "RESHADE-shaders")
+            .unwrap()
+            .ends_with("Reshade-Shaders"));
+        assert!(existing_ci(d, "nope").is_none());
+        let j = join_ci(d, &["reshade-shaders", "Shaders", "New.fx"]);
+        assert_eq!(j, d.join("Reshade-Shaders").join("SHADERS").join("New.fx"));
+    }
+
+    #[test]
+    fn inspect_finds_pieces_in_differently_cased_tree() {
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        make_pe(&d.join("game.exe"), PE_X64);
+        let shaders = d.join("RESHADE-SHADERS").join("shaders");
+        fs::create_dir_all(&shaders).unwrap();
+        for h in RESHADE_HEADERS {
+            fs::write(shaders.join(h.to_uppercase()), b"x").unwrap();
+        }
+        fs::write(d.join("DLSS5-FEED.ADDON64"), b"x").unwrap();
+        fs::write(shaders.join("dlss5_feed.FX"), b"x").unwrap();
+        let st = inspect(&d.join("game.exe")).unwrap();
+        assert!(st.headers, "headers must be found despite casing");
+        assert!(st.feeder, "feeder must be found despite casing");
+    }
 
     #[test]
     fn bitness_x64_and_x86() {
