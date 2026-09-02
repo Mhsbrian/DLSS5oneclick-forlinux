@@ -5,6 +5,7 @@ mod game;
 mod gpu;
 mod gui;
 mod installer;
+mod library;
 mod logo;
 mod net;
 mod renodx;
@@ -47,6 +48,51 @@ error: {e:#}"
             }
         };
         std::process::exit(code);
+    }
+    if args.iter().any(|a| a == "--list-games") {
+        attach_parent_console();
+        for g in library::scan() {
+            let when = g
+                .installed
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            println!(
+                "{:<10} {:<12} {:<50} {} poster={:?}",
+                when,
+                g.store.label(),
+                g.title.chars().take(50).collect::<String>(),
+                g.dir.display(),
+                g.poster
+            );
+        }
+        std::process::exit(0);
+    }
+    if args.iter().any(|a| a == "--posters") {
+        // Support/diagnostic: decode every poster the scan resolved and report failures.
+        attach_parent_console();
+        let client = net::client().expect("http client");
+        let (mut ok, mut bad) = (0usize, 0usize);
+        for g in library::scan() {
+            match library::poster_rgba(&client, &g.poster) {
+                Some(img) => {
+                    ok += 1;
+                    println!(
+                        "ok   {}x{} {} [{:?}]",
+                        img.width(),
+                        img.height(),
+                        g.title,
+                        g.poster
+                    );
+                }
+                None => {
+                    bad += 1;
+                    println!("FAIL {} [{:?}]", g.title, g.poster);
+                }
+            }
+        }
+        println!("{ok} decoded, {bad} failed");
+        std::process::exit(0);
     }
     if args.iter().any(|a| a == "--update") {
         attach_parent_console();

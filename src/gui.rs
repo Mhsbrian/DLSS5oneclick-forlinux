@@ -4,6 +4,7 @@
 use crate::diagnose;
 use crate::game::{self, GameStatus};
 use crate::installer::{self, Engine, StepState};
+use crate::library::{self, Game, Store};
 use crate::logo;
 use crate::net;
 use crate::renodx;
@@ -12,6 +13,7 @@ use crate::update;
 use eframe::egui::{
     self, Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, Stroke, StrokeKind, Vec2,
 };
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
@@ -61,6 +63,32 @@ pub struct App {
     renodx_rx: Option<Receiver<RenodxLookup>>,
     /// Exe the current lookup belongs to, so a refresh does not re-fetch.
     renodx_for: Option<PathBuf>,
+    page: Page,
+    games: Vec<Game>,
+    scanning: bool,
+    scan_rx: Option<Receiver<Vec<Game>>>,
+    /// Per game: decoded poster texture, or `None` once decoding failed.
+    posters: HashMap<usize, Option<egui::TextureHandle>>,
+    poster_rx: Option<Receiver<(usize, Option<egui::ColorImage>)>>,
+    meta: HashMap<usize, GameMeta>,
+    meta_rx: Option<Receiver<(usize, GameMeta)>>,
+    search: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Games,
+    Setup,
+    About,
+}
+
+/// What the tool knows about an installed game without touching it.
+#[derive(Debug, Clone)]
+struct GameMeta {
+    api: &'static str,
+    has_dlss: bool,
+    addon: bool,
+    ready: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -99,13 +127,26 @@ impl App {
             renodx: RenodxLookup::Idle,
             renodx_rx: None,
             renodx_for: None,
+            page: Page::Games,
+            games: Vec::new(),
+            scanning: false,
+            scan_rx: None,
+            posters: HashMap::new(),
+            poster_rx: None,
+            meta: HashMap::new(),
+            meta_rx: None,
+            search: String::new(),
             skipped_version: cc
                 .storage
                 .and_then(|s| s.get_string("skip_version"))
                 .unwrap_or_default(),
         };
         app.refresh();
+        if app.resolved_exe.is_some() {
+            app.page = Page::Setup;
+        }
         app.start_update_check();
+        app.start_scan(&cc.egui_ctx);
         app
     }
 
@@ -242,6 +283,122 @@ impl App {
             };
             let _ = tx.send(Msg::Finished(out));
         });
+    }
+
+    fn start_scan(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = channel::<Vec<Game>>();
+        self.scan_rx = Some(rx);
+        self.scanning = true;
+        self.games.clear();
+        self.posters.clear();
+        self.meta.clear();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(library::scan());
+            ctx.request_repaint();
+        });
+    }
+
+    /// Decode posters and inspect each game in the background, oldest last.
+    fn start_game_details(&mut self, ctx: &egui::Context) {
+        let games = self.games.clone();
+        let (ptx, prx) = channel();
+        let (mtx, mrx) = channel();
+        self.poster_rx = Some(prx);
+        self.meta_rx = Some(mrx);
+        let ctx2 = ctx.clone();
+        let g2 = games.clone();
+        thread::spawn(move || {
+            for (i, g) in g2.iter().enumerate() {
+                let meta = game::resolve_target(&g.dir)
+                    .and_then(|(exe, _)| game::inspect(&exe))
+                    .ok()
+                    .map(|st| GameMeta {
+                        api: match st.api {
+                            game::Api::Dx11 => "DirectX 11",
+                            game::Api::Dx12 => "DirectX 12",
+                            game::Api::Unknown => "DirectX 12?",
+                        },
+                        has_dlss: st.mode == game::Mode::Native,
+                        addon: st.dlss5_addon || st.opti,
+                        ready: st.complete(),
+                    });
+                if let Some(m) = meta {
+                    let _ = mtx.send((i, m));
+                }
+                if i % 8 == 7 {
+                    ctx2.request_repaint();
+                }
+            }
+            ctx2.request_repaint();
+        });
+        let ctx3 = ctx.clone();
+        thread::spawn(move || {
+            let client = net::client().ok();
+            for (i, g) in games.iter().enumerate() {
+                let img = client
+                    .as_ref()
+                    .and_then(|c| library::poster_rgba(c, &g.poster))
+                    .map(|rgba| {
+                        // Cards are 150 px wide; 300x450 keeps 2x for HiDPI and saves VRAM.
+                        let (w, h) = (rgba.width(), rgba.height());
+                        let scale = (300.0 / w as f32).min(450.0 / h as f32).min(1.0);
+                        let (nw, nh) = (
+                            ((w as f32 * scale) as u32).max(1),
+                            ((h as f32 * scale) as u32).max(1),
+                        );
+                        let small = image::imageops::resize(
+                            &rgba,
+                            nw,
+                            nh,
+                            image::imageops::FilterType::Triangle,
+                        );
+                        egui::ColorImage::from_rgba_unmultiplied(
+                            [nw as usize, nh as usize],
+                            small.as_raw(),
+                        )
+                    });
+                let _ = ptx.send((i, img));
+                if i % 4 == 3 {
+                    ctx3.request_repaint();
+                }
+            }
+            ctx3.request_repaint();
+        });
+    }
+
+    fn pump_library(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.scan_rx {
+            if let Ok(games) = rx.try_recv() {
+                self.games = games;
+                self.scanning = false;
+                self.scan_rx = None;
+                self.start_game_details(ctx);
+            }
+        }
+        if let Some(rx) = &self.poster_rx {
+            let mut got = Vec::new();
+            while let Ok(m) = rx.try_recv() {
+                got.push(m);
+            }
+            for (i, img) in got {
+                let tex = img.map(|im| {
+                    ctx.load_texture(format!("poster{i}"), im, egui::TextureOptions::LINEAR)
+                });
+                self.posters.insert(i, tex);
+            }
+        }
+        if let Some(rx) = &self.meta_rx {
+            while let Ok((i, m)) = rx.try_recv() {
+                self.meta.insert(i, m);
+            }
+        }
+    }
+
+    fn open_game(&mut self, path: PathBuf) {
+        self.exe_text = path.to_string_lossy().into_owned();
+        self.refresh();
+        self.page = Page::Setup;
     }
 
     fn start_update_check(&mut self) {
@@ -619,6 +776,456 @@ fn tile(ui: &mut egui::Ui, rect: egui::Rect, tl: &Tile, st: Option<&GameStatus>)
     );
 }
 
+const CARD_W: f32 = 150.0;
+const CARD_GAP: f32 = 14.0;
+const POSTER_H: f32 = 225.0;
+const CAPTION_H: f32 = 40.0;
+
+impl App {
+    fn games_page(&mut self, ui: &mut egui::Ui) {
+        // ── header ────────────────────────────────────────────────
+        let dx12 = self
+            .meta
+            .values()
+            .filter(|m| m.api.starts_with("DirectX 12"))
+            .count();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            ui.label(RichText::new("Games").font(t::sora(16.0)).color(t::TEXT));
+            let summary = if self.scanning {
+                "scanning Steam, Epic, GOG and Xbox…".to_owned()
+            } else {
+                format!("{} found · {dx12} on DirectX 12", self.games.len())
+            };
+            ui.label(
+                RichText::new(summary)
+                    .font(t::plex(12.0))
+                    .color(t::TEXT_MUTED),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let btn = |text: &str, accent: bool| {
+                    egui::Button::new(
+                        RichText::new(text)
+                            .font(t::plex_medium(12.5))
+                            .color(if accent { t::BG } else { t::TEXT_OFF }),
+                    )
+                    .fill(if accent {
+                        t::ACCENT
+                    } else {
+                        Color32::TRANSPARENT
+                    })
+                    .stroke(Stroke::new(
+                        1.0,
+                        if accent { t::ACCENT } else { t::BORDER_STRONG },
+                    ))
+                    .corner_radius(CornerRadius::same(8))
+                    .min_size(Vec2::new(96.0, 34.0))
+                };
+                if ui
+                    .add_enabled(!self.scanning, btn("Rescan", true))
+                    .clicked()
+                {
+                    self.start_scan(ui.ctx());
+                }
+                if ui.add(btn("Add a folder", false)).clicked() {
+                    if let Some(p) = rfd::FileDialog::new()
+                        .set_title("Pick the game's install folder")
+                        .pick_folder()
+                    {
+                        self.open_game(p);
+                    }
+                }
+                if ui.add(btn("Add a game", false)).clicked() {
+                    if let Some(p) = rfd::FileDialog::new()
+                        .add_filter("Executables", &["exe"])
+                        .pick_file()
+                    {
+                        self.open_game(p);
+                    }
+                }
+                let search = egui::TextEdit::singleline(&mut self.search)
+                    .font(t::plex(12.0))
+                    .hint_text(RichText::new("Search").color(t::TEXT_DIM))
+                    .desired_width(160.0);
+                ui.add(search);
+            });
+        });
+        ui.add_space(4.0);
+
+        // ── grid, grouped by store ────────────────────────────────
+        let needle = self.search.trim().to_ascii_lowercase();
+        let mut clicked: Option<PathBuf> = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 10.0;
+                let avail = ui.available_width();
+                let cols = ((avail + CARD_GAP) / (CARD_W + CARD_GAP)).floor().max(1.0) as usize;
+                for store in [Store::Steam, Store::Epic, Store::Gog, Store::Xbox] {
+                    let idx: Vec<usize> = self
+                        .games
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, g)| {
+                            g.store == store
+                                && (needle.is_empty()
+                                    || g.title.to_ascii_lowercase().contains(&needle))
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    if idx.is_empty() {
+                        continue;
+                    }
+                    let ready = idx
+                        .iter()
+                        .filter(|i| self.meta.get(i).is_some_and(|m| m.ready))
+                        .count();
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(
+                            RichText::new(store.label())
+                                .font(t::plex_semibold(13.0))
+                                .color(t::TEXT),
+                        );
+                        ui.label(
+                            RichText::new(idx.len().to_string())
+                                .font(t::plex(12.0))
+                                .color(t::TEXT_DIM),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ready > 0 {
+                                ui.label(
+                                    RichText::new(format!("{ready} ready for DLSS 5"))
+                                        .font(t::plex(11.5))
+                                        .color(t::ACCENT),
+                                );
+                            }
+                        });
+                    });
+                    for row in idx.chunks(cols) {
+                        let (row_rect, _) = ui.allocate_exact_size(
+                            Vec2::new(avail, POSTER_H + CAPTION_H),
+                            egui::Sense::hover(),
+                        );
+                        for (k, &i) in row.iter().enumerate() {
+                            let x = row_rect.left() + k as f32 * (CARD_W + CARD_GAP);
+                            let rect = egui::Rect::from_min_size(
+                                egui::pos2(x, row_rect.top()),
+                                Vec2::new(CARD_W, POSTER_H + CAPTION_H),
+                            );
+                            if self.game_card(ui, rect, i) {
+                                let g = &self.games[i];
+                                // The store's own exe when it names one and it is readable;
+                                // else the folder, which the exe finder resolves.
+                                clicked = Some(match &g.exe_hint {
+                                    Some(e) if e.is_file() && game::exe_bitness(e).is_ok() => {
+                                        e.clone()
+                                    }
+                                    _ => g.dir.clone(),
+                                });
+                            }
+                        }
+                    }
+                    ui.add_space(10.0);
+                }
+                if !self.scanning && self.games.is_empty() {
+                    ui.add_space(40.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            RichText::new(
+                                "No installed games found from Steam, Epic, GOG or Xbox.",
+                            )
+                            .font(t::plex(13.0))
+                            .color(t::TEXT_MUTED),
+                        );
+                        ui.label(
+                            RichText::new("Use Add a folder to point at a game by hand.")
+                                .font(t::plex(12.0))
+                                .color(t::TEXT_DIM),
+                        );
+                    });
+                }
+            });
+        if let Some(p) = clicked {
+            self.open_game(p);
+        }
+    }
+
+    /// One poster card. Returns true when clicked.
+    fn game_card(&self, ui: &mut egui::Ui, rect: egui::Rect, i: usize) -> bool {
+        let g = &self.games[i];
+        let resp = ui.interact(rect, ui.id().with(("card", i)), egui::Sense::click());
+        let hovered = resp.hovered();
+        let p = ui.painter();
+        let r = CornerRadius::same(10);
+        p.rect_filled(rect, r, t::TILE);
+        let poster = egui::Rect::from_min_size(rect.min, Vec2::new(CARD_W, POSTER_H));
+        match self.posters.get(&i) {
+            Some(Some(tex)) => {
+                let top = CornerRadius {
+                    nw: 10,
+                    ne: 10,
+                    sw: 0,
+                    se: 0,
+                };
+                let [tw, th] = tex.size();
+                let aspect = tw as f32 / th.max(1) as f32;
+                if (aspect - 2.0 / 3.0).abs() < 0.08 {
+                    // Real 600x900 art: fill the frame.
+                    egui::Image::from_texture(tex)
+                        .fit_to_exact_size(poster.size())
+                        .corner_radius(top)
+                        .paint_at(ui, poster);
+                } else {
+                    // Landscape header, logo or icon: contain it on the dark card.
+                    p.rect_filled(poster, top, t::BG);
+                    let scale = (poster.width() / tw as f32).min(poster.height() / th as f32);
+                    let size = Vec2::new(tw as f32 * scale, th as f32 * scale);
+                    let inner = egui::Rect::from_center_size(poster.center(), size);
+                    egui::Image::from_texture(tex)
+                        .fit_to_exact_size(size)
+                        .paint_at(ui, inner);
+                }
+            }
+            Some(None) | None => {
+                // No artwork (yet): title on the dark card.
+                p.rect_filled(
+                    poster,
+                    CornerRadius {
+                        nw: 10,
+                        ne: 10,
+                        sw: 0,
+                        se: 0,
+                    },
+                    t::BG,
+                );
+                p.text(
+                    poster.center(),
+                    egui::Align2::CENTER_CENTER,
+                    if self.posters.contains_key(&i) {
+                        &g.title
+                    } else {
+                        "…"
+                    },
+                    t::sora(13.0),
+                    t::TEXT_MUTED,
+                );
+            }
+        }
+        let p = ui.painter();
+        // DirectX chip, top right.
+        if let Some(m) = self.meta.get(&i) {
+            let font = t::plex_semibold(9.5);
+            let galley = p.layout_no_wrap(m.api.to_owned(), font.clone(), t::BG);
+            let pad = Vec2::new(7.0, 3.0);
+            let chip = egui::Rect::from_min_size(
+                egui::pos2(
+                    poster.right() - galley.size().x - pad.x * 2.0 - 8.0,
+                    poster.top() + 8.0,
+                ),
+                galley.size() + pad * 2.0,
+            );
+            p.rect_filled(chip, CornerRadius::same(6), t::ACCENT);
+            p.galley(chip.min + pad, galley, t::BG);
+            // Status line over the bottom of the poster.
+            let band = egui::Rect::from_min_max(
+                egui::pos2(poster.left(), poster.bottom() - 26.0),
+                poster.max,
+            );
+            p.rect_filled(band, CornerRadius::ZERO, Color32::from_black_alpha(170));
+            let mut x = band.left() + 10.0;
+            for (on, label) in [
+                (m.has_dlss, if m.has_dlss { "DLSS" } else { "no DLSS" }),
+                (m.addon, if m.addon { "add-on" } else { "no add-on" }),
+            ] {
+                let cy = band.center().y;
+                p.circle_filled(
+                    egui::pos2(x + 3.0, cy),
+                    3.0,
+                    if on { t::ACCENT } else { t::TEXT_DIM },
+                );
+                let galley = p.layout_no_wrap(label.to_owned(), t::plex_medium(10.5), t::TEXT_SOFT);
+                p.galley(
+                    egui::pos2(x + 11.0, cy - galley.size().y / 2.0),
+                    galley.clone(),
+                    t::TEXT_SOFT,
+                );
+                x += 11.0 + galley.size().x + 12.0;
+            }
+        }
+        // Caption: store mark on the left, title beside it.
+        let cap = egui::Rect::from_min_max(egui::pos2(rect.left(), poster.bottom()), rect.max);
+        let mark = egui::Rect::from_min_size(
+            egui::pos2(cap.left() + 10.0, cap.top() + 9.0),
+            Vec2::splat(16.0),
+        );
+        store_mark(p, mark, g.store, t::TEXT_OFF);
+        let title_x = mark.right() + 7.0;
+        let title = p.layout(
+            g.title.clone(),
+            t::plex_medium(12.0),
+            t::TEXT,
+            cap.right() - title_x - 8.0,
+        );
+        let clip = egui::Rect::from_min_max(cap.min, egui::pos2(cap.right(), cap.bottom() - 4.0));
+        ui.painter().with_clip_rect(clip).galley(
+            egui::pos2(title_x, cap.top() + 8.0),
+            title,
+            t::TEXT,
+        );
+        p.rect_stroke(
+            rect,
+            r,
+            Stroke::new(1.0, if hovered { t::ACCENT } else { t::BORDER }),
+            StrokeKind::Inside,
+        );
+        if hovered {
+            resp.clone()
+                .on_hover_text(format!("{}\n{}", g.title, g.dir.display()));
+        }
+        resp.clicked()
+    }
+}
+
+/// Monochrome store marks, 16 px: Steam (valve + piston), Xbox (sphere, X),
+/// Epic (shield), GOG (rounded square with a dot). Painted, no bundled art.
+fn store_mark(p: &egui::Painter, r: egui::Rect, store: Store, color: Color32) {
+    let c = r.center();
+    let s = r.width() / 2.0;
+    let stroke = Stroke::new(1.5, color);
+    match store {
+        Store::Steam => {
+            p.circle_stroke(c, s - 0.75, stroke);
+            p.circle_filled(c + Vec2::new(s * 0.35, -s * 0.35), s * 0.28, color);
+            p.circle_stroke(c + Vec2::new(-s * 0.3, s * 0.3), s * 0.3, stroke);
+            p.line_segment(
+                [
+                    c + Vec2::new(-s * 0.55, s * 0.55),
+                    c + Vec2::new(-s * 0.95, s * 0.35),
+                ],
+                stroke,
+            );
+            p.line_segment(
+                [
+                    c + Vec2::new(-s * 0.05, s * 0.05),
+                    c + Vec2::new(s * 0.15, -s * 0.15),
+                ],
+                stroke,
+            );
+        }
+        Store::Xbox => {
+            p.circle_stroke(c, s - 0.75, stroke);
+            let d = s * 0.5;
+            p.line_segment([c + Vec2::new(-d, -d), c + Vec2::new(d, d)], stroke);
+            p.line_segment([c + Vec2::new(d, -d), c + Vec2::new(-d, d)], stroke);
+        }
+        Store::Epic => {
+            let w = s * 0.75;
+            let pts = vec![
+                c + Vec2::new(-w, -s * 0.9),
+                c + Vec2::new(w, -s * 0.9),
+                c + Vec2::new(w, s * 0.35),
+                c + Vec2::new(0.0, s * 0.95),
+                c + Vec2::new(-w, s * 0.35),
+            ];
+            p.add(egui::Shape::closed_line(pts, stroke));
+            p.line_segment(
+                [
+                    c + Vec2::new(-s * 0.3, -s * 0.4),
+                    c + Vec2::new(s * 0.3, -s * 0.4),
+                ],
+                stroke,
+            );
+            p.line_segment(
+                [
+                    c + Vec2::new(-s * 0.3, -s * 0.4),
+                    c + Vec2::new(-s * 0.3, s * 0.3),
+                ],
+                stroke,
+            );
+            p.line_segment(
+                [
+                    c + Vec2::new(-s * 0.3, -s * 0.05),
+                    c + Vec2::new(s * 0.15, -s * 0.05),
+                ],
+                stroke,
+            );
+            p.line_segment(
+                [
+                    c + Vec2::new(-s * 0.3, s * 0.3),
+                    c + Vec2::new(s * 0.3, s * 0.3),
+                ],
+                stroke,
+            );
+        }
+        Store::Gog => {
+            p.rect_stroke(
+                r.shrink(1.0),
+                CornerRadius::same(4),
+                stroke,
+                StrokeKind::Inside,
+            );
+            p.circle_stroke(c, s * 0.38, stroke);
+        }
+    }
+}
+
+fn about_page(ui: &mut egui::Ui) {
+    ui.label(RichText::new("About").font(t::sora(16.0)).color(t::TEXT));
+    ui.label(
+        RichText::new(concat!(
+            "DLSS5oneclick v",
+            env!("CARGO_PKG_VERSION"),
+            " — one click for the leaked DLSS 5 neural-rendering build in any DX11/DX12 game."
+        ))
+        .font(t::plex(12.5))
+        .color(t::TEXT_SOFT),
+    );
+    ui.add_space(6.0);
+    ui.label(RichText::new("Everything it installs is downloaded from the projects that made it. Credits and sources:").font(t::plex(12.0)).color(t::TEXT_MUTED));
+    for (name, url) in [
+        ("crosire — ReShade", "https://reshade.me"),
+        (
+            "clshortfuse and the RenoDX community",
+            "https://github.com/clshortfuse/renodx",
+        ),
+        (
+            "jlrouzies-fr — DLSS5-Feeder",
+            "https://github.com/jlrouzies-fr/DLSS5-Feeder",
+        ),
+        (
+            "umar-afzaal — LumeniteFX",
+            "https://github.com/umar-afzaal/LumeniteFX",
+        ),
+        (
+            "RankFTW — RHI and rhi-repo",
+            "https://github.com/RankFTW/RHI",
+        ),
+        (
+            "NIGos — dlss5-bridge",
+            "https://github.com/NIGos/dlss5-bridge",
+        ),
+        (
+            "Dagherbou — OptiScaler_DLSSNR",
+            "https://github.com/Dagherbou/OptiScaler_DLSSNR",
+        ),
+        (
+            "praydog — REFramework",
+            "https://github.com/praydog/REFramework",
+        ),
+        (
+            "Source, issues and releases",
+            "https://github.com/faisalkindi/DLSS5oneclick",
+        ),
+    ] {
+        ui.hyperlink_to(
+            RichText::new(name).font(t::plex(12.0)).color(t::TEXT_OFF),
+            url,
+        );
+    }
+}
+
 impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string("exe", self.exe_text.clone());
@@ -639,46 +1246,130 @@ impl eframe::App for App {
             None => (None, vec![], false),
         };
 
-        // ── header ────────────────────────────────────────────────
-        egui::Panel::top("header")
+        self.pump_library(ui.ctx());
+        if self.scanning || self.poster_rx.is_some() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(120));
+        }
+
+        // ── sidebar ───────────────────────────────────────────────
+        egui::Panel::left("sidebar")
+            .resizable(false)
+            .exact_size(200.0)
             .frame(
                 Frame::new()
                     .fill(t::HEADER)
-                    .inner_margin(Margin {
-                        left: 18,
-                        right: 28,
-                        top: 12,
-                        bottom: 12,
-                    })
+                    .inner_margin(Margin::symmetric(16, 18))
                     .stroke(Stroke::new(1.0, t::BORDER)),
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 12.0;
-                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(26.0), egui::Sense::hover());
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(30.0), egui::Sense::hover());
                     logo::paint_mark(ui.painter(), rect, t::ACCENT, t::BG);
                     ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 1.0;
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.label(RichText::new("DLSS 5").font(t::sora(17.0)).color(t::TEXT));
                         ui.label(
-                            RichText::new("DLSS5oneclick")
-                                .font(t::sora(15.0))
-                                .color(t::TEXT),
-                        );
-                        ui.label(
-                            RichText::new("Leaked DLSS 5 neural rendering for any DX11/DX12 game")
-                                .font(t::plex(11.0))
+                            RichText::new("ONECLICK")
+                                .font(t::plex_semibold(9.5))
                                 .color(t::TEXT_MUTED),
                         );
                     });
-                    chip(ui, "LEAKED BUILD", t::ACCENT, true);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        chip(
-                            ui,
-                            concat!("v", env!("CARGO_PKG_VERSION")),
-                            t::TEXT_DIM,
-                            false,
+                });
+                ui.add_space(22.0);
+                let setup_enabled = self.resolved_exe.is_some();
+                for (page, label, enabled) in [
+                    (Page::Games, "Games", true),
+                    (Page::Setup, "Setup", setup_enabled),
+                    (Page::About, "About", true),
+                ] {
+                    let active = self.page == page;
+                    let (rect, resp) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), 40.0),
+                        egui::Sense::click(),
+                    );
+                    if active {
+                        ui.painter()
+                            .rect_filled(rect, CornerRadius::same(10), t::TILE);
+                        ui.painter().rect_stroke(
+                            rect,
+                            CornerRadius::same(10),
+                            Stroke::new(1.0, t::BORDER_STRONG),
+                            StrokeKind::Inside,
                         );
-                    });
+                    } else if resp.hovered() && enabled {
+                        ui.painter()
+                            .rect_filled(rect, CornerRadius::same(10), t::PANEL);
+                    }
+                    let color = if !enabled {
+                        t::TEXT_DIM
+                    } else if active {
+                        t::TEXT
+                    } else {
+                        t::TEXT_OFF
+                    };
+                    ui.painter().text(
+                        rect.left_center() + Vec2::new(14.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        label,
+                        t::plex_medium(13.5),
+                        color,
+                    );
+                    if page == Page::Games && !self.games.is_empty() {
+                        ui.painter().circle_filled(
+                            rect.right_center() - Vec2::new(16.0, 0.0),
+                            3.0,
+                            t::ACCENT,
+                        );
+                    }
+                    if resp.clicked() && enabled {
+                        self.page = page;
+                    }
+                    ui.add_space(4.0);
+                }
+                ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                    let (rect, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), 86.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter()
+                        .rect_filled(rect, CornerRadius::same(10), t::TILE);
+                    ui.painter().rect_stroke(
+                        rect,
+                        CornerRadius::same(10),
+                        Stroke::new(1.0, t::BORDER),
+                        StrokeKind::Inside,
+                    );
+                    let p = ui.painter();
+                    let x = rect.left() + 14.0;
+                    p.circle_filled(egui::pos2(x + 4.0, rect.top() + 18.0), 3.5, t::ACCENT);
+                    p.text(
+                        egui::pos2(x + 14.0, rect.top() + 18.0),
+                        egui::Align2::LEFT_CENTER,
+                        "Ready",
+                        t::plex_semibold(12.5),
+                        t::TEXT,
+                    );
+                    p.text(
+                        egui::pos2(x, rect.top() + 40.0),
+                        egui::Align2::LEFT_CENTER,
+                        "Leaked DLSS 5 build",
+                        t::plex(11.0),
+                        t::TEXT_MUTED,
+                    );
+                    p.text(
+                        egui::pos2(x, rect.top() + 58.0),
+                        egui::Align2::LEFT_CENTER,
+                        concat!("v", env!("CARGO_PKG_VERSION")),
+                        t::mono(11.0),
+                        t::TEXT_DIM,
+                    );
+                    let bar = egui::Rect::from_min_size(
+                        egui::pos2(x, rect.bottom() - 12.0),
+                        Vec2::new(rect.width() - 28.0, 3.0),
+                    );
+                    p.rect_filled(bar, CornerRadius::same(2), t::ACCENT);
                 });
             });
 
@@ -815,13 +1506,24 @@ impl eframe::App for App {
 
         egui::CentralPanel::default()
             .frame(Frame::new().fill(t::PANEL).inner_margin(Margin {
-                left: 18,
+                left: 24,
                 right: 28,
-                top: 14,
+                top: 18,
                 bottom: 14,
             }))
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 12.0;
+                match self.page {
+                    Page::Games => {
+                        self.games_page(ui);
+                        return;
+                    }
+                    Page::About => {
+                        about_page(ui);
+                        return;
+                    }
+                    Page::Setup => {}
+                }
 
                 // ── path row ──────────────────────────────────────
                 ui.horizontal(|ui| {
@@ -1185,8 +1887,8 @@ Remove incl. ReShade also deletes ReShade (dxgi.dll, ini files, reshade-shaders)
 
 pub fn run() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([720.0, 660.0])
-        .with_min_inner_size([700.0, 600.0])
+        .with_inner_size([1180.0, 780.0])
+        .with_min_inner_size([960.0, 640.0])
         .with_title(concat!("DLSS5oneclick ", env!("CARGO_PKG_VERSION")));
     if let Some(icon) = logo::icon_data() {
         viewport = viewport.with_icon(icon);
