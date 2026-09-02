@@ -570,10 +570,9 @@ fn step_feeder(
     work: &Path,
     progress: Progress,
 ) -> Result<Vec<String>> {
-    if st.feeder {
-        progress(100, "DLSS5-Feeder already installed");
-        return Ok(vec![]);
-    }
+    // An installed Feeder used to be left alone forever (a 0.7.0 survived every
+    // reinstall while 0.12.0 was out, #6). The zip is small: fetch it and
+    // compare the add-on's size with what is on disk.
     progress(0, "Looking up latest DLSS5-Feeder");
     // Since 0.11 the project ships one zip per release instead of loose assets;
     // the file name carries the version, so the tag is read first.
@@ -599,6 +598,10 @@ fn step_feeder(
         .ok_or_else(|| anyhow!("DLSS5-Feeder {tag} has no {}", game::FEEDER_ADDON))?;
     let fx = pick(game::FEEDER_FX)
         .ok_or_else(|| anyhow!("DLSS5-Feeder {tag} has no {}", game::FEEDER_FX))?;
+    if st.feeder && same_size(&mut zip, &addon, &d.join(game::FEEDER_ADDON)) {
+        progress(100, &format!("DLSS5-Feeder already current ({tag})"));
+        return Ok(vec![]);
+    }
     net::extract_member(&mut zip, &addon, &d.join(game::FEEDER_ADDON))?;
     net::extract_member(
         &mut zip,
@@ -671,6 +674,18 @@ fn step_lumenite(
 
 // ── step 5: DLSS 5 add-on + models ─────────────────────────────────
 
+/// True when `dest` exists with the uncompressed size of `member`. Cheap
+/// "is this the same build" check for files whose names carry no version.
+pub fn same_size<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    member: &str,
+    dest: &Path,
+) -> bool {
+    let local = fs::metadata(dest).map(|m| m.len()).ok();
+    let remote = zip.by_name(member).ok().map(|f| f.size());
+    local.is_some() && local == remote
+}
+
 pub fn install_single_from_zip(zip_path: &Path, member_name: &str, dest: &Path) -> Result<()> {
     let f = fs::File::open(zip_path)?;
     let mut zip = zip::ZipArchive::new(f)
@@ -691,15 +706,13 @@ fn step_dlss5(
 ) -> Result<Vec<String>> {
     // A game with its own DLSS keeps its own nvngx_dlss.dll.
     let dlss_present = st.dlss || st.mode == game::Mode::Native;
+    // The add-on is re-checked every time (its zip is small and its builds
+    // change weekly); the two NVIDIA DLLs only when missing.
     let plan = [
-        ("renodx-dlss5-", game::DLSS5_ADDON, st.dlss5_addon),
+        ("renodx-dlss5-", game::DLSS5_ADDON, false),
         ("dlssnr-", game::DLSSNR_DLL, st.dlssnr),
         ("dlss-", game::DLSS_DLL, dlss_present),
     ];
-    if plan.iter().all(|(_, _, present)| *present) {
-        progress(100, "DLSS 5 add-on already present");
-        return Ok(vec![]);
-    }
     progress(0, "Looking up DLSS 5 add-on releases");
     let mut installed = Vec::new();
     for (prefix, fname, present) in plan {
@@ -709,7 +722,21 @@ fn step_dlss5(
         let (tag, url) = rhi_latest(client, prefix)?;
         let z = work.join(format!("{tag}.zip"));
         net::download(client, &url, &z, fname, progress)?;
-        install_single_from_zip(&z, fname, &st.game_dir().join(fname))?;
+        let dest = st.game_dir().join(fname);
+        if fname == game::DLSS5_ADDON && st.dlss5_addon {
+            let f = fs::File::open(&z)?;
+            let mut zip =
+                zip::ZipArchive::new(f).context("DLSS 5 add-on download is not a valid zip")?;
+            let hit = zip
+                .file_names()
+                .find(|n| net::file_name(n).eq_ignore_ascii_case(fname))
+                .map(str::to_owned);
+            if hit.is_some_and(|h| same_size(&mut zip, &h, &dest)) {
+                progress(100, &format!("{fname} already current ({tag})"));
+                continue;
+            }
+        }
+        install_single_from_zip(&z, fname, &dest)?;
         if fname == game::DLSS_DLL {
             fs::write(st.game_dir().join(game::DLSS_MARKER), tag.as_bytes())?;
         }

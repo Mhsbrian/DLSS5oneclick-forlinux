@@ -21,6 +21,15 @@ pub struct Finding {
     pub text: String,
 }
 
+/// Newest Feeder known at build time; only used to nudge users off stale copies.
+const CURRENT_FEEDER: &str = "0.12.0";
+
+fn version_key(v: &str) -> Vec<u64> {
+    v.split(['.', '-'])
+        .map(|p| p.parse::<u64>().unwrap_or(0))
+        .collect()
+}
+
 fn ok(t: impl Into<String>) -> Finding {
     Finding {
         level: Level::Ok,
@@ -136,11 +145,49 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
                  reshade-shaders\\Shaders — re-run Install.",
             ));
         }
-        if fd.contains("-> none (not installed)") {
+        // The first effects line of a session always says "none": effects are
+        // not compiled yet. Only the last one describes the running state (#6).
+        let last_effects = fd
+            .lines()
+            .rev()
+            .find(|l| l.contains("[feed] effects:"))
+            .unwrap_or("");
+        if last_effects.contains("-> none (not installed)") {
             out.push(bad(
                 "The motion-vector provider is not enabled. In ReShade's Home tab enable \
                  \"LUMENITE: Kernel 2.0\" ABOVE \"DLSS5_Feed\", then reload effects.",
             ));
+        }
+        if let Some(line) = fd
+            .lines()
+            .find(|l| l.contains("NVSDK_NGX_D3D12_Init") && l.contains("FeatureNotSupported"))
+        {
+            out.push(bad(format!(
+                "NGX refused to initialise on the Feeder's private D3D12 device: {}. Not a \
+                 ReShade or shader problem. Update the NVIDIA driver, make sure nvngx_dlss.dll \
+                 next to the exe is the one this tool placed (not an old copy), re-run Install \
+                 so DLSS5-Feeder is the current release, and attach dlss5-feed.log + ReShade.log \
+                 if it persists.",
+                line.trim()
+            )));
+        }
+        if let Some(ver) = fd
+            .lines()
+            .next()
+            .and_then(|l| {
+                // "HH:MM:SS.mmm  dlss5-feed 0.12.0 (built ...) attached."
+                let mut it = l.split_whitespace();
+                it.find(|t| t.starts_with("dlss5-feed"))?;
+                it.next()
+            })
+            .filter(|v| v.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        {
+            if version_key(ver) < version_key(CURRENT_FEEDER) {
+                out.push(warn(format!(
+                    "DLSS5-Feeder {ver} in the log is older than {CURRENT_FEEDER}; re-run Install \
+                     to refresh it (since 0.9.1 an existing Feeder is updated)."
+                )));
+            }
         }
         if fd.contains("MV probe") && fd.contains("0% non-zero") {
             out.push(bad(
@@ -251,6 +298,35 @@ mod tests {
         assert!(f
             .iter()
             .any(|x| x.text.contains("motion-vector provider is not enabled")));
+    }
+
+    #[test]
+    fn feeder_last_effects_line_wins_and_ngx_init_failure_named() {
+        let (t, exe) = setup(true);
+        fs::write(
+            t.path().join("ReShade.log"),
+            "Initializing crosire's ReShade\nRegistered add-on \"DLSS 5 Neural Rendering\"\n",
+        )
+        .unwrap();
+        fs::write(
+            t.path().join("dlss5-feed.log"),
+            "12:33:33.151  dlss5-feed 0.7.0 (built Aug 31 2026) attached.\n\
+             [feed] effects: DLSS5_Feed.fx technique MISSING, DLSS5_MV_PROVIDER=3 (LumeniteFX Kernel) -> none (not installed)\n\
+             [feed] effects: DLSS5_Feed.fx technique found, DLSS5_MV_PROVIDER=3 (LumeniteFX Kernel) -> Lumenite_Kernel (enabled)\n\
+             [feed] NVSDK_NGX_D3D12_Init -> 0xBAD00001 (FeatureNotSupported)\n\
+             stopped: the D3D12/NGX session failed to start.\n",
+        )
+        .unwrap();
+        let f = run(&exe).unwrap();
+        assert!(!f
+            .iter()
+            .any(|x| x.text.contains("motion-vector provider is not enabled")));
+        assert!(f
+            .iter()
+            .any(|x| x.text.contains("NGX refused to initialise")));
+        assert!(f
+            .iter()
+            .any(|x| x.text.contains("0.7.0 in the log is older")));
     }
 
     #[test]
