@@ -371,9 +371,9 @@ const TILES_NATIVE: [Tile; 4] = [
     },
 ];
 
-fn tiles_for(st: Option<&GameStatus>) -> Vec<&'static Tile> {
+fn tiles_for(st: Option<&GameStatus>, engine: Engine) -> Vec<&'static Tile> {
     match st.map(|s| s.mode) {
-        Some(game::Mode::Native) if st.is_some_and(|s| s.opti) => {
+        Some(game::Mode::Native) if engine == Engine::Opti || st.is_some_and(|s| s.opti) => {
             vec![&TILES_NATIVE[0], &TILE_OPTI, &TILES_NATIVE[2]]
         }
         Some(game::Mode::Native) => {
@@ -385,6 +385,94 @@ fn tiles_for(st: Option<&GameStatus>) -> Vec<&'static Tile> {
         }
         _ => TILES_FEEDER.iter().collect(),
     }
+}
+
+/// One selectable engine card: painted like a component tile, but clickable,
+/// with a radio dot, an accent border when chosen and a dimmed body when the
+/// game cannot use it.
+#[allow(clippy::too_many_arguments)]
+fn engine_card(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    selected: bool,
+    enabled: bool,
+    title: &str,
+    lines: &[&str],
+    note: &str,
+) -> bool {
+    let resp = ui.allocate_rect(rect, egui::Sense::click());
+    let hovered = enabled && resp.hovered();
+    let fill = if selected {
+        Color32::from_rgb(0x22, 0x27, 0x30)
+    } else if hovered {
+        Color32::from_rgb(0x1d, 0x21, 0x29)
+    } else {
+        t::TILE
+    };
+    let border = if selected {
+        t::ACCENT
+    } else if enabled {
+        t::BORDER_STRONG
+    } else {
+        t::BORDER
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(10), fill);
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(10),
+        Stroke::new(if selected { 2.0 } else { 1.0 }, border),
+        StrokeKind::Inside,
+    );
+
+    // radio dot
+    let c = egui::pos2(rect.left() + 20.0, rect.top() + 22.0);
+    if selected {
+        painter.circle_filled(c, 8.0, t::ACCENT);
+        painter.circle_filled(c, 3.4, t::BG);
+    } else {
+        painter.circle_stroke(
+            c,
+            7.5,
+            Stroke::new(1.6, if enabled { t::TEXT_DIM } else { t::RING_OFF }),
+        );
+    }
+
+    let title_color = if !enabled {
+        t::TEXT_DIM
+    } else if selected {
+        t::TEXT
+    } else {
+        t::TEXT_SOFT
+    };
+    let inner = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 38.0, rect.top() + 10.0),
+        egui::pos2(rect.right() - 12.0, rect.bottom() - 8.0),
+    );
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(inner)
+            .layout(Layout::top_down(Align::Min)),
+        |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(
+                RichText::new(title)
+                    .font(t::plex_semibold(13.5))
+                    .color(title_color),
+            );
+            for l in lines {
+                ui.label(RichText::new(*l).font(t::plex(11.0)).color(if enabled {
+                    t::TEXT_MUTED
+                } else {
+                    t::TEXT_DIM
+                }));
+            }
+            if !note.is_empty() {
+                ui.label(RichText::new(note).font(t::plex(11.0)).color(t::TEXT_DIM));
+            }
+        },
+    );
+    enabled && resp.clicked()
 }
 
 fn chip(ui: &mut egui::Ui, text: &str, color: Color32, outlined: bool) {
@@ -750,12 +838,75 @@ impl eframe::App for App {
                     ui.label(RichText::new(p).font(t::plex(12.0)).color(t::DANGER));
                 }
 
+                // ── engine chooser ───────────────────────────────
+                let native = ok_status.as_ref().is_some_and(|s| s.mode == game::Mode::Native);
+                if !native {
+                    self.engine = Engine::ReShade;
+                }
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.label(
+                        RichText::new("INSTALL ENGINE")
+                            .font(t::plex_semibold(11.0))
+                            .color(t::TEXT_MUTED),
+                    );
+                    ui.label(
+                        RichText::new(if native {
+                            "— two ways to run DLSS 5 in this game, pick one"
+                        } else {
+                            "— this game has no DLSS of its own, so only the ReShade path can work"
+                        })
+                        .font(t::plex(11.0))
+                        .color(t::TEXT_DIM),
+                    );
+                });
+                {
+                    let gap = 8.0;
+                    let card_h = 74.0;
+                    let row_w = ui.available_width();
+                    let col_w = ((row_w - gap) / 2.0).floor();
+                    let (row_rect, _) =
+                        ui.allocate_exact_size(Vec2::new(row_w, card_h), egui::Sense::hover());
+                    let left = egui::Rect::from_min_size(row_rect.min, Vec2::new(col_w, card_h));
+                    let right = egui::Rect::from_min_size(
+                        egui::pos2(row_rect.left() + col_w + gap, row_rect.top()),
+                        Vec2::new(col_w, card_h),
+                    );
+                    if engine_card(
+                        ui,
+                        left,
+                        self.engine == Engine::ReShade,
+                        true,
+                        "ReShade + RenoDX add-on",
+                        &["The default. Works in every supported game.", "In game: Home → Add-ons → DLSS 5 Neural Rendering."],
+                        "",
+                    ) {
+                        self.engine = Engine::ReShade;
+                    }
+                    if engine_card(
+                        ui,
+                        right,
+                        self.engine == Engine::Opti,
+                        native,
+                        "OptiScaler (built-in NR pass)",
+                        &["Dagherbou's fork, no ReShade. Also swaps upscalers.", "In game: Insert → enable Neural Rendering."],
+                        if native {
+                            ""
+                        } else {
+                            "Needs a game with its own DLSS — this one has none."
+                        },
+                    ) {
+                        self.engine = Engine::Opti;
+                    }
+                }
+                ui.add_space(2.0);
+
                 // ── tiles ─────────────────────────────────────────
                 let gap = 8.0;
                 let tile_h = 58.0;
                 let row_w = ui.available_width();
                 let col_w = ((row_w - gap) / 2.0).floor();
-                let tiles = tiles_for(ok_status.as_ref());
+                let tiles = tiles_for(ok_status.as_ref(), self.engine);
                 for row in tiles.chunks(2) {
                     let (row_rect, _) =
                         ui.allocate_exact_size(Vec2::new(row_w, tile_h), egui::Sense::hover());
@@ -767,27 +918,6 @@ impl eframe::App for App {
                         );
                         tile(ui, rect, tl, ok_status.as_ref());
                     }
-                }
-
-                // ── engine choice (games with native DLSS) ────────
-                if ok_status.as_ref().is_some_and(|s| s.mode == game::Mode::Native) {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 10.0;
-                        ui.label(RichText::new("Engine").font(t::plex(12.0)).color(t::TEXT_MUTED));
-                        ui.radio_value(&mut self.engine, Engine::ReShade, "ReShade + RenoDX add-on");
-                        ui.radio_value(&mut self.engine, Engine::Opti, "OptiScaler (built-in NR pass)");
-                    });
-                    if self.engine == Engine::Opti {
-                        ui.label(
-                            RichText::new(
-                                "OptiScaler engine: extracts Dagherbou's OptiScaler_DLSSNR fork as dxgi.dll and adds the DLSS 5 model.                                  In game: Insert opens the OptiScaler overlay, enable Neural Rendering there (off by default).                                  Not compatible with a ReShade install in the same game.",
-                            )
-                            .font(t::plex(11.0))
-                            .color(t::TEXT_DIM),
-                        );
-                    }
-                } else {
-                    self.engine = Engine::ReShade;
                 }
 
                 // ── actions ───────────────────────────────────────
@@ -922,8 +1052,8 @@ Remove incl. ReShade also deletes ReShade (dxgi.dll, ini files, reshade-shaders)
 
 pub fn run() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([700.0, 560.0])
-        .with_min_inner_size([700.0, 520.0])
+        .with_inner_size([720.0, 660.0])
+        .with_min_inner_size([700.0, 600.0])
         .with_title(concat!("DLSS5oneclick ", env!("CARGO_PKG_VERSION")));
     if let Some(icon) = logo::icon_data() {
         viewport = viewport.with_icon(icon);

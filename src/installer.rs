@@ -26,8 +26,7 @@ use std::path::{Path, PathBuf};
 pub const RESHADE_HOME: &str = "https://reshade.me";
 pub const RESHADE_SHADERS_RAW: &str =
     "https://raw.githubusercontent.com/crosire/reshade-shaders/slim/Shaders/";
-pub const FEEDER_DOWNLOAD: &str =
-    "https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest/download/";
+pub const FEEDER_REPO: &str = "jlrouzies-fr/DLSS5-Feeder";
 pub const LUMENITE_ZIP: &str =
     "https://codeload.github.com/umar-afzaal/LumeniteFX/zip/refs/heads/mainline";
 
@@ -418,34 +417,48 @@ fn step_headers(
 fn step_feeder(
     client: &Client,
     st: &GameStatus,
-    _work: &Path,
+    work: &Path,
     progress: Progress,
 ) -> Result<Vec<String>> {
     if st.feeder {
         progress(100, "DLSS5-Feeder already installed");
         return Ok(vec![]);
     }
-    progress(0, "Fetching latest DLSS5-Feeder");
-    let addon_url = format!("{FEEDER_DOWNLOAD}{}", game::FEEDER_ADDON);
-    let fx_url = format!("{FEEDER_DOWNLOAD}{}", game::FEEDER_FX);
+    progress(0, "Looking up latest DLSS5-Feeder");
+    // Since 0.11 the project ships one zip per release instead of loose assets;
+    // the file name carries the version, so the tag is read first.
+    let tags = net::github_release_tags_html(client, FEEDER_REPO, "v", 2)?;
+    let tag = tags
+        .first()
+        .ok_or_else(|| anyhow!("no DLSS5-Feeder release found"))?;
+    let url = net::github_asset_url_html(client, FEEDER_REPO, tag, r#"[^"]+\.zip"#)?;
+    let zip_path = work.join("dlss5-feeder.zip");
+    net::download(client, &url, &zip_path, "DLSS5-Feeder", progress)?;
+
     let d = st.game_dir();
-    let shaders = d.join("reshade-shaders").join("Shaders");
-    net::download(
-        client,
-        &addon_url,
-        &d.join(game::FEEDER_ADDON),
-        game::FEEDER_ADDON,
-        progress,
-    )?;
-    net::download(
-        client,
-        &fx_url,
-        &shaders.join(game::FEEDER_FX),
-        game::FEEDER_FX,
-        progress,
+    let f = fs::File::open(&zip_path)?;
+    let mut zip = zip::ZipArchive::new(f).context("DLSS5-Feeder download is not a valid zip")?;
+    let members: Vec<String> = zip.file_names().map(str::to_owned).collect();
+    let pick = |want: &str| -> Option<String> {
+        members
+            .iter()
+            .find(|m| net::file_name(&m.replace('\\', "/")).eq_ignore_ascii_case(want))
+            .cloned()
+    };
+    let addon = pick(game::FEEDER_ADDON)
+        .ok_or_else(|| anyhow!("DLSS5-Feeder {tag} has no {}", game::FEEDER_ADDON))?;
+    let fx = pick(game::FEEDER_FX)
+        .ok_or_else(|| anyhow!("DLSS5-Feeder {tag} has no {}", game::FEEDER_FX))?;
+    net::extract_member(&mut zip, &addon, &d.join(game::FEEDER_ADDON))?;
+    net::extract_member(
+        &mut zip,
+        &fx,
+        &d.join("reshade-shaders")
+            .join("Shaders")
+            .join(game::FEEDER_FX),
     )?;
     Ok(vec![
-        game::FEEDER_ADDON.into(),
+        format!("{} ({tag})", game::FEEDER_ADDON),
         format!("reshade-shaders/Shaders/{}", game::FEEDER_FX),
     ])
 }
