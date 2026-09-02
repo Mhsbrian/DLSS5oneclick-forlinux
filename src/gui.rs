@@ -1252,14 +1252,17 @@ impl eframe::App for App {
                 .request_repaint_after(std::time::Duration::from_millis(120));
         }
 
-        // ── sidebar ───────────────────────────────────────────────
-        egui::Panel::left("sidebar")
-            .resizable(false)
-            .exact_size(200.0)
+        // ── top ribbon: logo · Games / Setup / About · status ────────
+        egui::Panel::top("ribbon")
             .frame(
                 Frame::new()
                     .fill(t::HEADER)
-                    .inner_margin(Margin::symmetric(16, 18))
+                    .inner_margin(Margin {
+                        left: 20,
+                        right: 24,
+                        top: 10,
+                        bottom: 10,
+                    })
                     .stroke(Stroke::new(1.0, t::BORDER)),
             )
             .show(ui, |ui| {
@@ -1269,107 +1272,85 @@ impl eframe::App for App {
                     logo::paint_mark(ui.painter(), rect, t::ACCENT, t::BG);
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.label(RichText::new("DLSS 5").font(t::sora(17.0)).color(t::TEXT));
+                        ui.label(RichText::new("DLSS 5").font(t::sora(16.0)).color(t::TEXT));
                         ui.label(
                             RichText::new("ONECLICK")
-                                .font(t::plex_semibold(9.5))
+                                .font(t::plex_semibold(9.0))
                                 .color(t::TEXT_MUTED),
                         );
                     });
-                });
-                ui.add_space(22.0);
-                let setup_enabled = self.resolved_exe.is_some();
-                for (page, label, enabled) in [
-                    (Page::Games, "Games", true),
-                    (Page::Setup, "Setup", setup_enabled),
-                    (Page::About, "About", true),
-                ] {
-                    let active = self.page == page;
-                    let (rect, resp) = ui.allocate_exact_size(
-                        Vec2::new(ui.available_width(), 40.0),
-                        egui::Sense::click(),
-                    );
-                    if active {
-                        ui.painter()
-                            .rect_filled(rect, CornerRadius::same(10), t::TILE);
-                        ui.painter().rect_stroke(
-                            rect,
-                            CornerRadius::same(10),
-                            Stroke::new(1.0, t::BORDER_STRONG),
-                            StrokeKind::Inside,
+                    ui.add_space(22.0);
+                    let setup_enabled = self.resolved_exe.is_some();
+                    for (page, label, enabled) in [
+                        (Page::Games, "Games", true),
+                        (Page::Setup, "Setup", setup_enabled),
+                        (Page::About, "About", true),
+                    ] {
+                        let active = self.page == page;
+                        let galley = ui.painter().layout_no_wrap(
+                            label.to_owned(),
+                            t::plex_medium(13.5),
+                            t::TEXT,
                         );
-                    } else if resp.hovered() && enabled {
+                        let size = Vec2::new(galley.size().x + 32.0, 36.0);
+                        let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+                        if active {
+                            ui.painter()
+                                .rect_filled(rect, CornerRadius::same(10), t::TILE);
+                            ui.painter().rect_stroke(
+                                rect,
+                                CornerRadius::same(10),
+                                Stroke::new(1.0, t::BORDER_STRONG),
+                                StrokeKind::Inside,
+                            );
+                        } else if resp.hovered() && enabled {
+                            ui.painter()
+                                .rect_filled(rect, CornerRadius::same(10), t::PANEL);
+                        }
+                        let color = if !enabled {
+                            t::TEXT_DIM
+                        } else if active {
+                            t::TEXT
+                        } else {
+                            t::TEXT_OFF
+                        };
                         ui.painter()
-                            .rect_filled(rect, CornerRadius::same(10), t::PANEL);
+                            .galley(rect.center() - galley.size() / 2.0, galley, color);
+                        if page == Page::Games && !self.games.is_empty() {
+                            ui.painter().circle_filled(
+                                rect.right_top() + Vec2::new(-9.0, 9.0),
+                                2.5,
+                                t::ACCENT,
+                            );
+                        }
+                        if resp.clicked() && enabled {
+                            self.page = page;
+                        }
                     }
-                    let color = if !enabled {
-                        t::TEXT_DIM
-                    } else if active {
-                        t::TEXT
-                    } else {
-                        t::TEXT_OFF
-                    };
-                    ui.painter().text(
-                        rect.left_center() + Vec2::new(14.0, 0.0),
-                        egui::Align2::LEFT_CENTER,
-                        label,
-                        t::plex_medium(13.5),
-                        color,
-                    );
-                    if page == Page::Games && !self.games.is_empty() {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        chip(
+                            ui,
+                            concat!("v", env!("CARGO_PKG_VERSION")),
+                            t::TEXT_DIM,
+                            false,
+                        );
+                        chip(ui, "LEAKED BUILD", t::ACCENT, true);
+                        let (r, _) =
+                            ui.allocate_exact_size(Vec2::new(64.0, 20.0), egui::Sense::hover());
                         ui.painter().circle_filled(
-                            rect.right_center() - Vec2::new(16.0, 0.0),
-                            3.0,
+                            r.left_center() + Vec2::new(5.0, 0.0),
+                            3.5,
                             t::ACCENT,
                         );
-                    }
-                    if resp.clicked() && enabled {
-                        self.page = page;
-                    }
-                    ui.add_space(4.0);
-                }
-                ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-                    let (rect, _) = ui.allocate_exact_size(
-                        Vec2::new(ui.available_width(), 86.0),
-                        egui::Sense::hover(),
-                    );
-                    ui.painter()
-                        .rect_filled(rect, CornerRadius::same(10), t::TILE);
-                    ui.painter().rect_stroke(
-                        rect,
-                        CornerRadius::same(10),
-                        Stroke::new(1.0, t::BORDER),
-                        StrokeKind::Inside,
-                    );
-                    let p = ui.painter();
-                    let x = rect.left() + 14.0;
-                    p.circle_filled(egui::pos2(x + 4.0, rect.top() + 18.0), 3.5, t::ACCENT);
-                    p.text(
-                        egui::pos2(x + 14.0, rect.top() + 18.0),
-                        egui::Align2::LEFT_CENTER,
-                        "Ready",
-                        t::plex_semibold(12.5),
-                        t::TEXT,
-                    );
-                    p.text(
-                        egui::pos2(x, rect.top() + 40.0),
-                        egui::Align2::LEFT_CENTER,
-                        "Leaked DLSS 5 build",
-                        t::plex(11.0),
-                        t::TEXT_MUTED,
-                    );
-                    p.text(
-                        egui::pos2(x, rect.top() + 58.0),
-                        egui::Align2::LEFT_CENTER,
-                        concat!("v", env!("CARGO_PKG_VERSION")),
-                        t::mono(11.0),
-                        t::TEXT_DIM,
-                    );
-                    let bar = egui::Rect::from_min_size(
-                        egui::pos2(x, rect.bottom() - 12.0),
-                        Vec2::new(rect.width() - 28.0, 3.0),
-                    );
-                    p.rect_filled(bar, CornerRadius::same(2), t::ACCENT);
+                        ui.painter().text(
+                            r.left_center() + Vec2::new(14.0, 0.0),
+                            egui::Align2::LEFT_CENTER,
+                            "Ready",
+                            t::plex_semibold(12.0),
+                            t::TEXT,
+                        );
+                    });
                 });
             });
 
@@ -1887,8 +1868,8 @@ Remove incl. ReShade also deletes ReShade (dxgi.dll, ini files, reshade-shaders)
 
 pub fn run() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1180.0, 780.0])
-        .with_min_inner_size([960.0, 640.0])
+        .with_inner_size([1100.0, 780.0])
+        .with_min_inner_size([880.0, 620.0])
         .with_title(concat!("DLSS5oneclick ", env!("CARGO_PKG_VERSION")));
     if let Some(icon) = logo::icon_data() {
         viewport = viewport.with_icon(icon);
