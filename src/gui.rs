@@ -73,6 +73,8 @@ pub struct App {
     meta: HashMap<usize, GameMeta>,
     meta_rx: Option<Receiver<(usize, GameMeta)>>,
     search: String,
+    /// Official store marks (Simple Icons, CC0), white on transparent, tinted at paint time.
+    store_icons: HashMap<Store, egui::TextureHandle>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +138,7 @@ impl App {
             meta: HashMap::new(),
             meta_rx: None,
             search: String::new(),
+            store_icons: HashMap::new(),
             skipped_version: cc
                 .storage
                 .and_then(|s| s.get_string("skip_version"))
@@ -783,6 +786,9 @@ const CAPTION_H: f32 = 40.0;
 
 impl App {
     fn games_page(&mut self, ui: &mut egui::Ui) {
+        if self.store_icons.is_empty() {
+            self.store_icons = load_store_icons(ui.ctx());
+        }
         // ── header ────────────────────────────────────────────────
         let dx12 = self
             .meta
@@ -1060,7 +1066,7 @@ impl App {
             egui::pos2(cap.left() + 10.0, cap.top() + 9.0),
             Vec2::splat(16.0),
         );
-        store_mark(p, mark, g.store, t::TEXT_OFF);
+        store_mark(ui, &self.store_icons, mark, g.store, t::TEXT_OFF);
         let title_x = mark.right() + 7.0;
         let title = p.layout(
             g.title.clone(),
@@ -1088,86 +1094,46 @@ impl App {
     }
 }
 
-/// Monochrome store marks, 16 px: Steam (valve + piston), Xbox (sphere, X),
-/// Epic (shield), GOG (rounded square with a dot). Painted, no bundled art.
-fn store_mark(p: &egui::Painter, r: egui::Rect, store: Store, color: Color32) {
-    let c = r.center();
-    let s = r.width() / 2.0;
-    let stroke = Stroke::new(1.5, color);
-    match store {
-        Store::Steam => {
-            p.circle_stroke(c, s - 0.75, stroke);
-            p.circle_filled(c + Vec2::new(s * 0.35, -s * 0.35), s * 0.28, color);
-            p.circle_stroke(c + Vec2::new(-s * 0.3, s * 0.3), s * 0.3, stroke);
-            p.line_segment(
-                [
-                    c + Vec2::new(-s * 0.55, s * 0.55),
-                    c + Vec2::new(-s * 0.95, s * 0.35),
-                ],
-                stroke,
-            );
-            p.line_segment(
-                [
-                    c + Vec2::new(-s * 0.05, s * 0.05),
-                    c + Vec2::new(s * 0.15, -s * 0.15),
-                ],
-                stroke,
-            );
-        }
-        Store::Xbox => {
-            p.circle_stroke(c, s - 0.75, stroke);
-            let d = s * 0.5;
-            p.line_segment([c + Vec2::new(-d, -d), c + Vec2::new(d, d)], stroke);
-            p.line_segment([c + Vec2::new(d, -d), c + Vec2::new(-d, d)], stroke);
-        }
-        Store::Epic => {
-            let w = s * 0.75;
-            let pts = vec![
-                c + Vec2::new(-w, -s * 0.9),
-                c + Vec2::new(w, -s * 0.9),
-                c + Vec2::new(w, s * 0.35),
-                c + Vec2::new(0.0, s * 0.95),
-                c + Vec2::new(-w, s * 0.35),
-            ];
-            p.add(egui::Shape::closed_line(pts, stroke));
-            p.line_segment(
-                [
-                    c + Vec2::new(-s * 0.3, -s * 0.4),
-                    c + Vec2::new(s * 0.3, -s * 0.4),
-                ],
-                stroke,
-            );
-            p.line_segment(
-                [
-                    c + Vec2::new(-s * 0.3, -s * 0.4),
-                    c + Vec2::new(-s * 0.3, s * 0.3),
-                ],
-                stroke,
-            );
-            p.line_segment(
-                [
-                    c + Vec2::new(-s * 0.3, -s * 0.05),
-                    c + Vec2::new(s * 0.15, -s * 0.05),
-                ],
-                stroke,
-            );
-            p.line_segment(
-                [
-                    c + Vec2::new(-s * 0.3, s * 0.3),
-                    c + Vec2::new(s * 0.3, s * 0.3),
-                ],
-                stroke,
-            );
-        }
-        Store::Gog => {
-            p.rect_stroke(
-                r.shrink(1.0),
-                CornerRadius::same(4),
-                stroke,
-                StrokeKind::Inside,
-            );
-            p.circle_stroke(c, s * 0.38, stroke);
-        }
+/// The stores' own marks (Simple Icons, CC0 1.0), white PNGs tinted at paint time.
+const STORE_ICON_PNG: [(Store, &[u8]); 4] = [
+    (Store::Steam, include_bytes!("../assets/store-steam.png")),
+    (Store::Xbox, include_bytes!("../assets/store-xbox.png")),
+    (Store::Epic, include_bytes!("../assets/store-epic.png")),
+    (Store::Gog, include_bytes!("../assets/store-gog.png")),
+];
+
+fn load_store_icons(ctx: &egui::Context) -> HashMap<Store, egui::TextureHandle> {
+    STORE_ICON_PNG
+        .iter()
+        .filter_map(|(store, png)| {
+            let img = image::load_from_memory(png).ok()?.to_rgba8();
+            let (w, h) = img.dimensions();
+            let ci =
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw());
+            Some((
+                *store,
+                ctx.load_texture(
+                    format!("store-{}", store.label()),
+                    ci,
+                    egui::TextureOptions::LINEAR,
+                ),
+            ))
+        })
+        .collect()
+}
+
+fn store_mark(
+    ui: &egui::Ui,
+    icons: &HashMap<Store, egui::TextureHandle>,
+    r: egui::Rect,
+    store: Store,
+    color: Color32,
+) {
+    if let Some(tex) = icons.get(&store) {
+        egui::Image::from_texture(tex)
+            .fit_to_exact_size(r.size())
+            .tint(color)
+            .paint_at(ui, r);
     }
 }
 
