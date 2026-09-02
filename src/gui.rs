@@ -844,7 +844,6 @@ fn paint_status_glyph(ui: &mut egui::Ui, ok: bool, optional: bool) {
 
 const CARD_W: f32 = 150.0;
 const CARD_GAP: f32 = 14.0;
-const POSTER_H: f32 = 225.0;
 const CAPTION_H: f32 = 40.0;
 
 impl App {
@@ -929,8 +928,13 @@ impl App {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 10.0;
-                let avail = ui.available_width();
+                // Room for the scrollbar, then as many columns as fit at the
+                // minimum width; the cards then grow to fill the row (up to 190 px).
+                let avail = ui.available_width() - 14.0;
                 let cols = ((avail + CARD_GAP) / (CARD_W + CARD_GAP)).floor().max(1.0) as usize;
+                let card_w =
+                    ((avail - CARD_GAP * (cols as f32 - 1.0)) / cols as f32).clamp(CARD_W, 190.0);
+                let poster_h = (card_w * 1.5).round();
                 for store in [Store::Steam, Store::Epic, Store::Gog, Store::Xbox] {
                     let idx: Vec<usize> = self
                         .games
@@ -951,6 +955,7 @@ impl App {
                         .filter(|i| self.meta.get(i).is_some_and(|m| m.ready))
                         .count();
                     ui.horizontal(|ui| {
+                        ui.set_max_width(avail);
                         ui.spacing_mut().item_spacing.x = 8.0;
                         ui.label(
                             RichText::new(store.label())
@@ -974,14 +979,14 @@ impl App {
                     });
                     for row in idx.chunks(cols) {
                         let (row_rect, _) = ui.allocate_exact_size(
-                            Vec2::new(avail, POSTER_H + CAPTION_H),
+                            Vec2::new(avail, poster_h + CAPTION_H),
                             egui::Sense::hover(),
                         );
                         for (k, &i) in row.iter().enumerate() {
-                            let x = row_rect.left() + k as f32 * (CARD_W + CARD_GAP);
+                            let x = row_rect.left() + k as f32 * (card_w + CARD_GAP);
                             let rect = egui::Rect::from_min_size(
                                 egui::pos2(x, row_rect.top()),
-                                Vec2::new(CARD_W, POSTER_H + CAPTION_H),
+                                Vec2::new(card_w, poster_h + CAPTION_H),
                             );
                             if self.game_card(ui, rect, i) {
                                 let g = &self.games[i];
@@ -1029,7 +1034,8 @@ impl App {
         let p = ui.painter();
         let r = CornerRadius::same(10);
         p.rect_filled(rect, r, t::TILE);
-        let poster = egui::Rect::from_min_size(rect.min, Vec2::new(CARD_W, POSTER_H));
+        let poster =
+            egui::Rect::from_min_size(rect.min, Vec2::new(rect.width(), rect.height() - CAPTION_H));
         match self.posters.get(&i) {
             Some(Some(tex)) => {
                 let top = CornerRadius {
