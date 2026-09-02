@@ -683,6 +683,45 @@ fn engine_card(
         );
     }
 
+    // Right-hand pill: what clicking does. Makes the card read as a choice,
+    // unlike the flat component list below it.
+    let pill_text = if selected {
+        "SELECTED"
+    } else if enabled {
+        "CHOOSE"
+    } else {
+        "UNAVAILABLE"
+    };
+    let pill_font = t::plex_semibold(10.0);
+    let galley = painter.layout_no_wrap(pill_text.to_owned(), pill_font, t::BG);
+    let pill = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - galley.size().x - 32.0, rect.top() + 12.0),
+        galley.size() + Vec2::new(20.0, 8.0),
+    );
+    if selected {
+        painter.rect_filled(pill, CornerRadius::same(999), t::ACCENT);
+        painter.galley(pill.min + Vec2::new(10.0, 4.0), galley, t::BG);
+    } else {
+        painter.rect_stroke(
+            pill,
+            CornerRadius::same(999),
+            Stroke::new(
+                1.0,
+                if enabled {
+                    t::TEXT_MUTED
+                } else {
+                    t::BORDER_STRONG
+                },
+            ),
+            StrokeKind::Inside,
+        );
+        painter.galley(
+            pill.min + Vec2::new(10.0, 4.0),
+            galley,
+            if enabled { t::TEXT_OFF } else { t::TEXT_DIM },
+        );
+    }
+
     let title_color = if !enabled {
         t::TEXT_DIM
     } else if selected {
@@ -692,7 +731,7 @@ fn engine_card(
     };
     let inner = egui::Rect::from_min_max(
         egui::pos2(rect.left() + 38.0, rect.top() + 10.0),
-        egui::pos2(rect.right() - 12.0, rect.bottom() - 8.0),
+        egui::pos2(pill.left() - 12.0, rect.bottom() - 8.0),
     );
     ui.scope_builder(
         egui::UiBuilder::new()
@@ -749,40 +788,76 @@ fn paint_check(ui: &mut egui::Ui, ok: bool, optional: bool) {
 }
 
 fn tile(ui: &mut egui::Ui, rect: egui::Rect, tl: &Tile, st: Option<&GameStatus>) {
+    // A status row, not a control: no border, no fill, a check / ring / dash
+    // glyph and two lines of text. The hover shows nothing clickable.
     let ok = st.map(tl.ok).unwrap_or(false);
     let dashed = tl.optional && !ok;
-    let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(8), t::TILE);
-    painter.rect_stroke(
-        rect,
-        CornerRadius::same(8),
-        Stroke::new(1.0, if dashed { t::BORDER_DASH } else { t::BORDER }),
-        StrokeKind::Inside,
-    );
-    let inner = rect.shrink2(Vec2::new(11.0, 9.0));
+    let inner = rect.shrink2(Vec2::new(6.0, 4.0));
     ui.scope_builder(
         egui::UiBuilder::new()
             .max_rect(inner)
             .layout(Layout::left_to_right(Align::Center)),
         |ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
-            paint_check(ui, ok, tl.optional);
+            paint_status_glyph(ui, ok, tl.optional);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 1.0;
-                let title_color = if dashed { t::TEXT_OFF } else { t::TEXT };
+                let title_color = if ok {
+                    t::TEXT
+                } else if dashed {
+                    t::TEXT_DIM
+                } else {
+                    t::TEXT_OFF
+                };
                 ui.label(
                     RichText::new(tl.title)
-                        .font(t::plex_medium(13.0))
+                        .font(t::plex_medium(12.5))
                         .color(title_color),
                 );
                 ui.label(
                     RichText::new(tl.detail)
-                        .font(t::plex(11.0))
+                        .font(t::plex(10.5))
                         .color(if dashed { t::TEXT_DIM } else { t::TEXT_MUTED }),
                 );
             });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let (text, color) = if ok {
+                    ("installed", t::ACCENT)
+                } else if dashed {
+                    ("not needed", t::TEXT_DIM)
+                } else {
+                    ("missing", t::TEXT_MUTED)
+                };
+                ui.label(RichText::new(text).font(t::plex(10.5)).color(color));
+            });
         },
     );
+    // Hairline under each row, so the list reads as a table.
+    ui.painter().hline(
+        rect.left() + 6.0..=rect.right() - 6.0,
+        rect.bottom(),
+        Stroke::new(1.0, t::BORDER),
+    );
+}
+
+/// Filled check (installed), hollow ring (missing), dash (optional, not needed).
+fn paint_status_glyph(ui: &mut egui::Ui, ok: bool, optional: bool) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::hover());
+    let p = ui.painter();
+    let c = rect.center();
+    if ok {
+        p.circle_filled(c, 7.0, t::ACCENT);
+        let s = Stroke::new(1.7, t::BG);
+        p.line_segment([c + Vec2::new(-3.2, 0.2), c + Vec2::new(-1.1, 2.3)], s);
+        p.line_segment([c + Vec2::new(-1.1, 2.3), c + Vec2::new(3.2, -2.1)], s);
+    } else if optional {
+        p.line_segment(
+            [c + Vec2::new(-4.0, 0.0), c + Vec2::new(4.0, 0.0)],
+            Stroke::new(1.6, t::RING_OFF),
+        );
+    } else {
+        p.circle_stroke(c, 6.2, Stroke::new(1.4, t::TEXT_DIM));
+    }
 }
 
 const CARD_W: f32 = 150.0;
@@ -1529,6 +1604,8 @@ impl eframe::App for App {
                     }
                     Page::Setup => {}
                 }
+                // The setup panel was designed at 720 px; keep it from stretching.
+                ui.set_max_width(860.0);
 
                 // ── path row ──────────────────────────────────────
                 ui.horizontal(|ui| {
@@ -1699,9 +1776,14 @@ impl eframe::App for App {
                 }
                 ui.add_space(2.0);
 
-                // ── tiles ─────────────────────────────────────────
-                let gap = 8.0;
-                let tile_h = 58.0;
+                // ── component list (status, not controls) ────────
+                ui.label(
+                    RichText::new("WHAT IS IN THE GAME FOLDER")
+                        .font(t::plex_semibold(11.0))
+                        .color(t::TEXT_MUTED),
+                );
+                let gap = 24.0;
+                let tile_h = 44.0;
                 let row_w = ui.available_width();
                 let col_w = ((row_w - gap) / 2.0).floor();
                 let tiles = tiles_for(ok_status.as_ref(), self.engine, self.renodx_on);
