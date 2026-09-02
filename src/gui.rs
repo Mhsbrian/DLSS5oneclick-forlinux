@@ -75,7 +75,12 @@ pub struct App {
     search: String,
     /// Official store marks (Simple Icons, CC0), white on transparent, tinted at paint time.
     store_icons: HashMap<Store, egui::TextureHandle>,
+    kofi_icon: Option<egui::TextureHandle>,
 }
+
+pub const KOFI_URL: &str = "https://ko-fi.com/kindiboy";
+/// Ko-fi's brand red.
+const KOFI_RED: Color32 = Color32::from_rgb(0xff, 0x5e, 0x5b);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -139,6 +144,7 @@ impl App {
             meta_rx: None,
             search: String::new(),
             store_icons: HashMap::new(),
+            kofi_icon: None,
             skipped_version: cc
                 .storage
                 .and_then(|s| s.get_string("skip_version"))
@@ -1295,6 +1301,58 @@ impl eframe::App for App {
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 10.0;
+                        // ── Ko-fi (rightmost) ────────────────────
+                        if self.kofi_icon.is_none() {
+                            self.kofi_icon =
+                                image::load_from_memory(include_bytes!("../assets/kofi.png"))
+                                    .ok()
+                                    .map(|i| {
+                                        let i = i.to_rgba8();
+                                        let (w, h) = i.dimensions();
+                                        ui.ctx().load_texture(
+                                            "kofi",
+                                            egui::ColorImage::from_rgba_unmultiplied(
+                                                [w as usize, h as usize],
+                                                i.as_raw(),
+                                            ),
+                                            egui::TextureOptions::LINEAR,
+                                        )
+                                    });
+                        }
+                        let label = "Buy me a Cup of Coffee";
+                        let galley = ui.painter().layout_no_wrap(
+                            label.to_owned(),
+                            t::plex_semibold(12.5),
+                            Color32::WHITE,
+                        );
+                        let size = Vec2::new(galley.size().x + 46.0, 36.0);
+                        let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+                        let fill = if resp.hovered() {
+                            Color32::from_rgb(0xff, 0x74, 0x71)
+                        } else {
+                            KOFI_RED
+                        };
+                        ui.painter().rect_filled(rect, CornerRadius::same(10), fill);
+                        if let Some(tex) = &self.kofi_icon {
+                            let icon = egui::Rect::from_center_size(
+                                rect.left_center() + Vec2::new(20.0, 0.0),
+                                Vec2::splat(18.0),
+                            );
+                            egui::Image::from_texture(tex)
+                                .fit_to_exact_size(icon.size())
+                                .paint_at(ui, icon);
+                        }
+                        ui.painter().galley(
+                            egui::pos2(rect.left() + 36.0, rect.center().y - galley.size().y / 2.0),
+                            galley,
+                            Color32::WHITE,
+                        );
+                        if resp
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(KOFI_URL));
+                        }
                         chip(
                             ui,
                             concat!("v", env!("CARGO_PKG_VERSION")),
