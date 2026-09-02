@@ -1,5 +1,12 @@
 # DLSS5oneclick
 
+<p>
+  <a href="https://github.com/faisalkindi/DLSS5oneclick/releases/latest"><img src="https://img.shields.io/github/v/release/faisalkindi/DLSS5oneclick?style=flat-square&color=2878D0&label=Download" alt="Download"></a>
+  <img src="https://img.shields.io/github/downloads/faisalkindi/DLSS5oneclick/total?style=flat-square&color=16A34A&label=Downloads" alt="Downloads">
+  <img src="https://img.shields.io/github/stars/faisalkindi/DLSS5oneclick?style=flat-square&color=EAB308&label=Stars" alt="Stars">
+  <a href="https://ko-fi.com/kindiboy"><img src="https://img.shields.io/badge/Support-Ko--fi-FF5E5B?style=flat-square&logo=ko-fi&logoColor=white" alt="Ko-fi"></a>
+</p>
+
 One button that sets up the **leaked DLSS 5 neural-rendering build** in any DirectX 11/12 game, with or without DLSS of its own. Single native Windows exe, no runtime. Everything it installs is downloaded from the projects that made it; the only third-party content inside the exe is three SIL-OFL fonts.
 
 Download: [latest release](https://github.com/faisalkindi/DLSS5oneclick/releases/latest) → `dlss5oneclick.exe`.
