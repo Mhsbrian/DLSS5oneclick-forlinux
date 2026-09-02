@@ -122,15 +122,45 @@ pub fn github_asset_url_html(
     ))
 }
 
+/// Small GET (release pages, JSON, wiki markdown), with the same connection-level
+/// retry as `download`: github.com's edge sometimes answers one request with a
+/// broken TLS record (`received corrupt message of type InvalidContentType`).
 pub fn get_text(client: &Client, url: &str) -> Result<String> {
-    let resp = client
-        .get(url)
-        .send()
-        .with_context(|| format!("request failed: {url}"))?;
-    if !resp.status().is_success() {
-        bail!("{url}: HTTP {}", resp.status());
+    with_retry(&|_, _| {}, url, || {
+        let resp = client
+            .get(url)
+            .send()
+            .with_context(|| format!("request failed: {url}"))?;
+        if !resp.status().is_success() {
+            bail!("{url}: HTTP {}", resp.status());
+        }
+        resp.text().with_context(|| format!("bad body from {url}"))
+    })
+}
+
+/// Run `f` up to four times when it fails on a connection-level error.
+fn with_retry<T>(progress: Progress, label: &str, f: impl Fn() -> Result<T>) -> Result<T> {
+    let mut attempt = 1u32;
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                let retryable = msg.contains("error sending request")
+                    || msg.contains("Connect")
+                    || msg.contains("corrupt message")
+                    || msg.contains("connection")
+                    || msg.contains("timed out")
+                    || msg.contains("reset");
+                if !retryable || attempt == 4 {
+                    return Err(e);
+                }
+                progress(0, &format!("{label}: retrying ({attempt}/3)"));
+                std::thread::sleep(std::time::Duration::from_secs(2 * attempt as u64));
+                attempt += 1;
+            }
+        }
     }
-    resp.text().with_context(|| format!("bad body from {url}"))
 }
 
 fn fmt_bytes(n: u64) -> String {
@@ -150,28 +180,9 @@ pub fn download(
     label: &str,
     progress: Progress,
 ) -> Result<()> {
-    let mut last = None;
-    for attempt in 1..=4u32 {
-        match download_once(client, url, dest, label, progress) {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                let msg = format!("{e:#}");
-                let retryable = msg.contains("error sending request")
-                    || msg.contains("Connect")
-                    || msg.contains("corrupt message")
-                    || msg.contains("connection")
-                    || msg.contains("timed out")
-                    || msg.contains("reset");
-                if !retryable || attempt == 4 {
-                    return Err(e);
-                }
-                progress(0, &format!("{label}: retrying ({attempt}/3)"));
-                std::thread::sleep(std::time::Duration::from_secs(2 * attempt as u64));
-                last = Some(e);
-            }
-        }
-    }
-    Err(last.unwrap())
+    with_retry(progress, label, || {
+        download_once(client, url, dest, label, progress)
+    })
 }
 
 /// One attempt: stream to a `.part` file, reporting percent + KB/MB downloaded.
@@ -259,4 +270,31 @@ pub fn members_matching<R: Read + Seek>(
 
 pub fn file_name(member: &str) -> &str {
     member.rsplit('/').next().unwrap_or(member)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn with_retry_retries_connection_errors_only() {
+        let n = Cell::new(0);
+        let r: Result<u8> = with_retry(&|_, _| {}, "x", || {
+            n.set(n.get() + 1);
+            if n.get() < 3 {
+                bail!("request failed: received corrupt message of type InvalidContentType")
+            }
+            Ok(7)
+        });
+        assert_eq!(r.unwrap(), 7);
+        assert_eq!(n.get(), 3);
+        let m = Cell::new(0);
+        let r: Result<u8> = with_retry(&|_, _| {}, "x", || {
+            m.set(m.get() + 1);
+            bail!("HTTP 404 Not Found")
+        });
+        assert!(r.is_err());
+        assert_eq!(m.get(), 1);
+    }
 }
