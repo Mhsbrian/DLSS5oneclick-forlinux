@@ -699,12 +699,12 @@ fn engine_card(
         galley.size() + Vec2::new(20.0, 8.0),
     );
     if selected {
-        painter.rect_filled(pill, CornerRadius::same(999), t::ACCENT);
+        painter.rect_filled(pill, CornerRadius::same(12), t::ACCENT);
         painter.galley(pill.min + Vec2::new(10.0, 4.0), galley, t::BG);
     } else {
         painter.rect_stroke(
             pill,
-            CornerRadius::same(999),
+            CornerRadius::same(12),
             Stroke::new(
                 1.0,
                 if enabled {
@@ -767,24 +767,6 @@ fn chip(ui: &mut egui::Ui, text: &str, color: Color32, outlined: bool) {
         .show(ui, |ui| {
             ui.label(RichText::new(text).font(t::mono(10.0)).color(color));
         });
-}
-
-fn paint_check(ui: &mut egui::Ui, ok: bool, optional: bool) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), egui::Sense::hover());
-    let p = ui.painter();
-    let c = rect.center();
-    if ok {
-        p.circle_filled(c, 8.0, t::ACCENT);
-        let s = Stroke::new(1.8, t::BG);
-        p.line_segment([c + Vec2::new(-3.5, 0.2), c + Vec2::new(-1.2, 2.5)], s);
-        p.line_segment([c + Vec2::new(-1.2, 2.5), c + Vec2::new(3.5, -2.3)], s);
-    } else {
-        p.circle_stroke(
-            c,
-            7.2,
-            Stroke::new(1.6, if optional { t::RING_OFF } else { t::TEXT_DIM }),
-        );
-    }
 }
 
 fn tile(ui: &mut egui::Ui, rect: egui::Rect, tl: &Tile, st: Option<&GameStatus>) {
