@@ -53,6 +53,10 @@ Every component comes from GitHub releases. Since 0.5.1 the tool reads the publi
 
 The tool reads the installed display adapters from the registry and refuses up front on anything that cannot run the model: non-NVIDIA cards (NGX does not exist there) and NVIDIA cards without tensor cores (GTX/GT/MX). Among RTX cards, expect very different costs — the DLSS 5 model is FP8 with RTX-50-only kernels; the `310.8.SF` build the tool installs adds patched binaries for RTX 40 and an FP16 path for RTX 20/30. The status line shows the tier: RTX 50 full speed · RTX 40 moderate cost · RTX 20/30 heavy cost. Virtual/remote adapters (Hyper-V GPU-P, RDP, VMs) are treated as unknown and allowed. If your card is misdetected, set `DLSS5ONECLICK_SKIP_GPU_CHECK=1` to bypass the refusal.
 
+## Verifying a download
+
+Each release's notes carry the SHA-256 of the attached `dlss5oneclick.exe`. Check yours with `certutil -hashfile dlss5oneclick.exe SHA256` (or PowerShell `Get-FileHash`). Only this repository's Releases page and the linked Nexus Mods page are legitimate sources — "DLSS 5 manager/one-click" executables from other repositories, videos or websites are not this tool, and at least one such repository distributes a 500 MB binary with no source at all.
+
 ## Windows Defender / SmartScreen
 
 The exe is not code-signed (no publisher certificate), it is new, and it downloads DLLs into game folders — three things Windows heuristics dislike. Expect a SmartScreen "unknown publisher" prompt; if Defender quarantines the exe or, worse, the add-on files it placed in a game, restore them from Protection history, add the game folder as an exclusion, and re-run Install (it re-fetches only what is missing). Every release is built from the public source in this repository.
