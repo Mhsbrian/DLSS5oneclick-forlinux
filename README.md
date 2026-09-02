@@ -24,6 +24,8 @@ Download: [latest release](https://github.com/faisalkindi/DLSS5oneclick/releases
 
 **RE Engine games** (Resident Evil 2/3/4/7/8/Requiem, Devil May Cry 5, Monster Hunter Rise/Wilds, Street Fighter 6, Dragon's Dogma 2, Pragmata — anything with `re_chunk_000.pak` next to the exe) crash under ReShade unless praydog's [REFramework](https://github.com/praydog/REFramework) is loaded first. Since 0.8.0 the tool installs its monolithic nightly `dinput8.dll` as the first step in those games (only the DLL, as its release notes insist) and Remove takes it out again; a `dinput8.dll` the tool did not place is left alone.
 
+**Wrong path?** The DLSS detection is a folder scan, so a stray `nvngx_dlss.dll` (left by another tool, or by this one before it started marking its own copy) makes a game without DLSS look like a native-DLSS game. The dropdown next to the game line (**Auto / Force no-DLSS (Feeder) / Force native DLSS**), `--mode=feeder|native`, or `DLSS5ONECLICK_MODE` overrides it; the auto line still shows what was detected.
+
 DX11 vs DX12 is read from the exe's import table, then from the engine DLLs next to it (`UnityPlayer.dll`, ...), and a `D3D12\D3D12Core.dll` (DirectX Agility SDK redist) next to the exe counts as DX12 even when only `d3d11.dll` is imported (RE Engine). When nothing says, DX12 is assumed and the status line says so. `dlss5oneclick.exe "<game folder>" --check` prints the detected mode, API and plan without installing anything.
 
 ### The no-DLSS path

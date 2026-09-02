@@ -376,6 +376,8 @@ pub struct GameStatus {
     pub dlss5_addon: bool,
     pub dlssnr: bool,
     pub dlss: bool,
+    /// What the folder scan said, before any override.
+    pub mode_detected: Mode,
     /// Capcom RE Engine (needs REFramework before ReShade will run).
     pub re_engine: bool,
     pub reframework: bool,
@@ -389,6 +391,26 @@ pub struct GameStatus {
 }
 
 pub const IGNORE_ANTICHEAT_ENV: &str = "DLSS5ONECLICK_IGNORE_ANTICHEAT";
+/// `feeder` or `native`: override the DLSS detection (a stray `nvngx_dlss.dll`
+/// makes a game without DLSS look native; some games load DLSS from elsewhere).
+pub const MODE_ENV: &str = "DLSS5ONECLICK_MODE";
+
+pub fn mode_override() -> Option<Mode> {
+    match std::env::var(MODE_ENV).ok()?.to_ascii_lowercase().as_str() {
+        "feeder" | "nodlss" | "no-dlss" => Some(Mode::Feeder),
+        "native" | "dlss" => Some(Mode::Native),
+        _ => None,
+    }
+}
+
+/// GUI dropdown / `--mode=`: same switch as the environment variable.
+pub fn set_mode_override(m: Option<Mode>) {
+    match m {
+        Some(Mode::Feeder) => std::env::set_var(MODE_ENV, "feeder"),
+        Some(Mode::Native) => std::env::set_var(MODE_ENV, "native"),
+        None => std::env::remove_var(MODE_ENV),
+    }
+}
 
 pub fn ignore_anticheat() -> bool {
     std::env::var_os(IGNORE_ANTICHEAT_ENV).is_some()
@@ -468,11 +490,12 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
             .push("A d3d9.dll proxy is present; DirectX 9 games are not supported here.".into());
     }
     let feeder = d.join(FEEDER_ADDON).is_file() && shaders.join(FEEDER_FX).is_file();
-    let mode = if game_ships_dlss(d) {
+    let mode_detected = if game_ships_dlss(d) {
         Mode::Native
     } else {
         Mode::Feeder
     };
+    let mode = mode_override().unwrap_or(mode_detected);
     let api = detect_api(exe);
     let renodx_mod = fs::read_to_string(d.join(RENODX_MANIFEST))
         .ok()
@@ -494,6 +517,7 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         dlss5_addon: d.join(DLSS5_ADDON).is_file(),
         dlssnr: d.join(DLSSNR_DLL).is_file(),
         dlss: d.join(DLSS_DLL).is_file(),
+        mode_detected,
         re_engine: d.join(RE_ENGINE_PAK).is_file(),
         reframework: d.join(REFRAMEWORK_DLL).is_file(),
         renodx_mod: renodx_mod.clone(),

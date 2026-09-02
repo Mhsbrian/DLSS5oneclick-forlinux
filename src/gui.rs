@@ -1669,13 +1669,9 @@ impl eframe::App for App {
                             chip(ui, &short(&exe), t::TEXT_SOFT, false);
                         }
                         if let Some(s) = &ok_status {
-                            let mode = match s.mode {
-                                game::Mode::Native => "native DLSS · add-on hooks the game",
-                                game::Mode::Feeder => "no DLSS · Feeder path",
-                            };
                             ui.label(
                                 RichText::new(format!(
-                                    "{}-bit · {} · {mode}{}",
+                                    "{}-bit · {}{}",
                                     s.bitness,
                                     s.api.label(),
                                     s.gpu.as_ref().map(|(g, t)| format!(" · {} ({})", g.name, t.label())).unwrap_or_default()
@@ -1683,6 +1679,29 @@ impl eframe::App for App {
                                     .font(t::plex(12.0))
                                     .color(t::TEXT_DIM),
                             );
+                            // Path: what was detected, overridable — a stray nvngx_dlss.dll
+                            // reads as native DLSS, and #19 wanted a switch.
+                            let mut choice = game::mode_override();
+                            let name = |m: Option<game::Mode>| match m {
+                                None => match s.mode_detected {
+                                    game::Mode::Native => "Auto: native DLSS · add-on hooks the game",
+                                    game::Mode::Feeder => "Auto: no DLSS · Feeder path",
+                                },
+                                Some(game::Mode::Native) => "Force native DLSS",
+                                Some(game::Mode::Feeder) => "Force no-DLSS (Feeder)",
+                            };
+                            let before = choice;
+                            egui::ComboBox::from_id_salt("mode_pick")
+                                .selected_text(RichText::new(name(choice)).font(t::plex(12.0)).color(t::TEXT_SOFT))
+                                .show_ui(ui, |ui| {
+                                    for m in [None, Some(game::Mode::Feeder), Some(game::Mode::Native)] {
+                                        ui.selectable_value(&mut choice, m, name(m));
+                                    }
+                                });
+                            if choice != before && !self.running {
+                                game::set_mode_override(choice);
+                                self.inspect_resolved();
+                            }
                         }
                     });
                 }
