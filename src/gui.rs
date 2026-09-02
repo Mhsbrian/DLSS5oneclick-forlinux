@@ -1,6 +1,7 @@
 //! egui window, "instrument panel" layout: header with mark, path row, component
 //! tiles, one Install button, progress, log.
 
+use crate::diagnose;
 use crate::game::{self, GameStatus};
 use crate::installer::{self, Engine, StepState};
 use crate::logo;
@@ -223,6 +224,25 @@ impl App {
                 }
             }
         });
+    }
+
+    fn run_diagnose(&mut self) {
+        let Some(exe) = self.exe() else { return };
+        self.log.clear();
+        self.progress_msg.clear();
+        match diagnose::run(&exe) {
+            Ok(findings) => {
+                for f in findings {
+                    let line = match f.level {
+                        diagnose::Level::Ok => LogLine::Ok(format!("ok: {}", f.text)),
+                        diagnose::Level::Warn => LogLine::Plain(format!("warn: {}", f.text)),
+                        diagnose::Level::Bad => LogLine::Fail(format!("FAIL: {}", f.text)),
+                    };
+                    self.log.push(line);
+                }
+            }
+            Err(e) => self.log.push(LogLine::Fail(format!("{e:#}"))),
+        }
     }
 
     fn pump_update(&mut self) {
@@ -789,6 +809,22 @@ impl eframe::App for App {
                         .min_size(Vec2::new(90.0, 42.0));
                     if ui.add_enabled(ok_status.is_some() && !self.running, remove).clicked() {
                         self.confirm_remove = true;
+                    }
+                    let diag = egui::Button::new(
+                        RichText::new("Diagnose").font(t::plex_medium(13.0)).color(t::TEXT_OFF),
+                    )
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::new(1.0, t::BORDER_STRONG))
+                    .corner_radius(CornerRadius::same(8))
+                    .min_size(Vec2::new(96.0, 42.0));
+                    if ui
+                        .add_enabled(ok_status.is_some() && !self.running, diag)
+                        .on_hover_text(
+                            "Reads this game's ReShade and feed logs and says why neural rendering is or is not running. Play the game first.",
+                        )
+                        .clicked()
+                    {
+                        self.run_diagnose();
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let msg = if self.running || !self.progress_msg.is_empty() {

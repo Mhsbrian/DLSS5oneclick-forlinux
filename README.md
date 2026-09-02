@@ -46,7 +46,7 @@ Every file is downloaded from its upstream at install time; a re-run only fetche
 
 **F6** toggles neural rendering on/off, **F5** saves the add-on's screenshot (both are the add-on's own hotkeys). On the Feeder path, `dlss5-feed.log` next to the game exe should show `feature ready … DLAA` and `DLSS5_MV_PROVIDER=3 (LumeniteFX Kernel) -> Lumenite_Kernel (enabled)`.
 
-CLI: `dlss5oneclick.exe "C:\Games\Foo"` (folder or exe) / `--check` (detect only) / `--remove` (headless, prints progress).
+CLI: `dlss5oneclick.exe "C:\Games\Foo"` (folder or exe) / `--check` (detect only) / `--diagnose` (read the game's ReShade/feed logs and say why neural rendering is or is not running) / `--remove` (headless, prints progress).
 
 ## Updates
 

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod diagnose;
 mod game;
 mod gpu;
 mod gui;
@@ -13,7 +14,7 @@ mod update;
 use std::io::Write;
 use std::path::PathBuf;
 
-/// `dlss5oneclick <GAME.exe | game folder> [--remove | --remove-all | --check | --engine=opti] | --update` runs headless; no args opens the GUI.
+/// `dlss5oneclick <GAME.exe | game folder> [--remove | --remove-all | --check | --diagnose | --engine=opti] | --update` runs headless; no args opens the GUI.
 fn main() {
     update::cleanup_old();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -57,6 +58,7 @@ error: {e:#}"
             args.iter().any(|a| a == "--remove"),
             args.iter().any(|a| a == "--remove-all"),
             args.iter().any(|a| a == "--check"),
+            args.iter().any(|a| a == "--diagnose"),
             if args.iter().any(|a| a == "--engine=opti" || a == "--opti") {
                 installer::Engine::Opti
             } else {
@@ -110,6 +112,7 @@ fn cli(
     remove: bool,
     remove_all: bool,
     check: bool,
+    diagnose_only: bool,
     engine: installer::Engine,
 ) -> i32 {
     let (exe, candidates) = match game::resolve_target(&target) {
@@ -136,6 +139,29 @@ fn cli(
         );
     } else if !candidates.is_empty() {
         println!("using {}", exe.display());
+    }
+    if diagnose_only {
+        return match diagnose::run(&exe) {
+            Ok(findings) => {
+                for f in &findings {
+                    let tag = match f.level {
+                        diagnose::Level::Ok => "ok  ",
+                        diagnose::Level::Warn => "warn",
+                        diagnose::Level::Bad => "FAIL",
+                    };
+                    println!("[{tag}] {}", f.text);
+                }
+                if findings.iter().any(|f| f.level == diagnose::Level::Bad) {
+                    1
+                } else {
+                    0
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                1
+            }
+        };
     }
     if check {
         return match game::inspect(&exe) {
