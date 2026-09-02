@@ -138,6 +138,21 @@ pub fn get_text(client: &Client, url: &str) -> Result<String> {
     })
 }
 
+/// Content-Length of `url` after redirects (GitHub's `latest/download` → CDN),
+/// or `None` when the server does not say.
+pub fn remote_len(client: &Client, url: &str) -> Result<Option<u64>> {
+    with_retry(&|_, _| {}, url, || {
+        let resp = client
+            .head(url)
+            .send()
+            .with_context(|| format!("request failed: {url}"))?;
+        if !resp.status().is_success() {
+            bail!("{url}: HTTP {}", resp.status());
+        }
+        Ok(resp.content_length())
+    })
+}
+
 /// Run `f` up to four times when it fails on a connection-level error.
 fn with_retry<T>(progress: Progress, label: &str, f: impl Fn() -> Result<T>) -> Result<T> {
     let mut attempt = 1u32;

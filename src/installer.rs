@@ -780,18 +780,32 @@ fn step_bridge(
     _work: &Path,
     progress: Progress,
 ) -> Result<Vec<String>> {
-    if st.bridge {
-        progress(100, "DX11 bridge already installed");
-        return Ok(vec![]);
+    let dest = st.game_dir().join(game::BRIDGE_ADDON);
+    // The bridge has no version tag in its file name and its releases fix
+    // add-on-specific behaviour (1.4.0: the 2026-08-28 add-on build), so an
+    // existing copy is refreshed whenever the published file differs in size.
+    if st.bridge && dest.is_file() {
+        let local = fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+        match net::remote_len(client, BRIDGE_DOWNLOAD) {
+            Ok(Some(remote)) if remote != local => {
+                progress(0, "dlss5-bridge changed upstream, refreshing");
+            }
+            Ok(_) => {
+                progress(100, "DX11 bridge already installed (current)");
+                return Ok(vec![]);
+            }
+            Err(_) => {
+                progress(
+                    100,
+                    "DX11 bridge already installed (could not check for a newer one)",
+                );
+                return Ok(vec![]);
+            }
+        }
+    } else {
+        progress(0, "Fetching latest dlss5-bridge");
     }
-    progress(0, "Fetching latest dlss5-bridge");
-    net::download(
-        client,
-        BRIDGE_DOWNLOAD,
-        &st.game_dir().join(game::BRIDGE_ADDON),
-        game::BRIDGE_ADDON,
-        progress,
-    )?;
+    net::download(client, BRIDGE_DOWNLOAD, &dest, game::BRIDGE_ADDON, progress)?;
     Ok(vec![game::BRIDGE_ADDON.into()])
 }
 
