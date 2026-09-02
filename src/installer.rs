@@ -224,6 +224,86 @@ const STEP_RENODX: Step = Step {
     name: "RenoDX HDR mod for this game",
     run: step_renodx,
 };
+const STEP_RESHADE_VIA_OPTI: Step = Step {
+    name: "ReShade loaded by OptiScaler (ReShade64.dll)",
+    run: step_reshade_via_opti,
+};
+
+/// ReShade beside OptiScaler, the way OptiScaler.ini documents it: the ReShade
+/// DLL as `ReShade64.dll` next to the exe and `[Plugins] LoadReshade=true`, so
+/// OptiScaler (which holds dxgi.dll) loads it and ReShade add-ons still work.
+fn step_reshade_via_opti(
+    client: &Client,
+    st: &GameStatus,
+    work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    let d = st.game_dir();
+    let ini = d.join(OPTI_INI);
+    if !ini.is_file() {
+        bail!("{OPTI_INI} not found — install the OptiScaler engine first");
+    }
+    let mut done = Vec::new();
+    let dll = d.join(RESHADE64);
+    if !dll.is_file() {
+        progress(0, "Looking up latest ReShade");
+        let (ver, url) = resolve_reshade_setup(client)?;
+        let setup = work.join(format!("ReShade_Setup_{ver}_Addon.exe"));
+        net::download(client, &url, &setup, "ReShade", progress)?;
+        install_reshade_from_setup(&setup, d, st.bitness, RESHADE64)?;
+        // Recorded in the OptiScaler manifest so Remove takes it out with the engine.
+        let mut m = fs::read_to_string(d.join(game::OPTI_MANIFEST)).unwrap_or_default();
+        if !m.lines().any(|l| l == RESHADE64) {
+            if !m.is_empty() && !m.ends_with('\n') {
+                m.push('\n');
+            }
+            m.push_str(RESHADE64);
+            fs::write(d.join(game::OPTI_MANIFEST), m)?;
+        }
+        done.push(RESHADE64.to_owned());
+    }
+    let text = fs::read_to_string(&ini)?;
+    if let Some(new) = set_load_reshade(&text) {
+        fs::write(&ini, new)?;
+        done.push(format!("{OPTI_INI}: LoadReshade=true"));
+    }
+    if done.is_empty() {
+        progress(100, "ReShade64.dll + LoadReshade already set");
+    }
+    Ok(done)
+}
+
+pub const OPTI_INI: &str = "OptiScaler.ini";
+pub const RESHADE64: &str = "ReShade64.dll";
+
+/// `LoadReshade=true` in OptiScaler.ini; `None` when already set.
+pub fn set_load_reshade(ini: &str) -> Option<String> {
+    let mut out = String::with_capacity(ini.len() + 32);
+    let mut seen = false;
+    let mut changed = false;
+    for line in ini.split_inclusive('\n') {
+        let t = line.trim_end_matches(['\r', '\n']);
+        let key = t.split('=').next().unwrap_or("").trim();
+        if key.eq_ignore_ascii_case("LoadReshade") {
+            seen = true;
+            if t.split('=').nth(1).map(str::trim) != Some("true") {
+                out.push_str("LoadReshade=true");
+                out.push_str(&line[t.len()..]);
+                changed = true;
+                continue;
+            }
+        }
+        out.push_str(line);
+    }
+    if !seen {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("\n[Plugins]\nLoadReshade=true\n");
+        changed = true;
+    }
+    changed.then_some(out)
+}
 
 pub const REFRAMEWORK_ZIP: &str =
     "https://github.com/praydog/REFramework-nightly/releases/latest/download/REFramework.zip";
@@ -268,15 +348,20 @@ fn step_renodx(
     renodx::install(client, &st.exe, &m, progress)
 }
 
-/// `with_renodx` adds the game's RenoDX HDR mod after the DLSS 5 add-on
-/// (ReShade engine only: it is a ReShade add-on). RE Engine games get
-/// REFramework first on either engine.
+/// `with_renodx` adds the game's RenoDX HDR mod after the DLSS 5 add-on. On
+/// the OptiScaler engine that needs ReShade too, loaded by OptiScaler as
+/// `ReShade64.dll`. RE Engine games get REFramework first on either engine.
 pub fn plan_with(st: &GameStatus, engine: Engine, with_renodx: bool) -> Vec<Step> {
     let mut v = if engine == Engine::Opti {
         // Only games with native DLSS: the NR pass reads the inputs the game
         // hands to DLSS. Callers gate on mode; return the plan regardless so
         // --check can show it.
-        vec![STEP_OPTI, STEP_DLSSNR_ONLY]
+        let mut v = vec![STEP_OPTI, STEP_DLSSNR_ONLY];
+        if with_renodx {
+            v.push(STEP_RESHADE_VIA_OPTI);
+            v.push(STEP_RENODX);
+        }
+        v
     } else {
         let mut v = plan_reshade(st);
         if with_renodx {
@@ -409,6 +494,7 @@ pub fn install_reshade_from_setup(
     setup_exe: &Path,
     game_dir: &Path,
     bitness: u8,
+    dest_name: &str,
 ) -> Result<Vec<String>> {
     let dll = if bitness == 64 {
         "ReShade64.dll"
@@ -417,9 +503,9 @@ pub fn install_reshade_from_setup(
     };
     let f = fs::File::open(setup_exe)?;
     let mut zip = zip::ZipArchive::new(f).context("ReShade installer has no readable archive")?;
-    net::extract_member(&mut zip, dll, &game_dir.join(game::RESHADE_PROXY))
+    net::extract_member(&mut zip, dll, &game_dir.join(dest_name))
         .with_context(|| format!("{} does not contain {dll}", setup_exe.display()))?;
-    Ok(vec![game::RESHADE_PROXY.into()])
+    Ok(vec![dest_name.into()])
 }
 
 fn step_reshade(
@@ -443,7 +529,7 @@ fn step_reshade(
     let (ver, url) = resolve_reshade_setup(client)?;
     let setup = work.join(format!("ReShade_Setup_{ver}_Addon.exe"));
     net::download(client, &url, &setup, "ReShade", progress)?;
-    install_reshade_from_setup(&setup, st.game_dir(), st.bitness)
+    install_reshade_from_setup(&setup, st.game_dir(), st.bitness, game::RESHADE_PROXY)
 }
 
 // ── step 2: ReShade shader headers ────────────────────────────────
@@ -998,7 +1084,7 @@ mod tests {
             &[b'M', b'Z', 0, 0, 0, 0, 0, 0],
         );
         assert_eq!(
-            install_reshade_from_setup(&setup, t.path(), 64).unwrap(),
+            install_reshade_from_setup(&setup, t.path(), 64, game::RESHADE_PROXY).unwrap(),
             vec!["dxgi.dll"]
         );
         assert!(game::inspect(&exe).unwrap().reshade);
@@ -1098,8 +1184,30 @@ mod tests {
             .iter()
             .map(|s| s.name)
             .collect();
-        assert_eq!(names[0], "REFramework (RE Engine needs it before ReShade)");
-        assert!(!names.contains(&"RenoDX HDR mod for this game"));
+        assert_eq!(
+            names,
+            [
+                "REFramework (RE Engine needs it before ReShade)",
+                "OptiScaler + DLSS Neural Rendering",
+                "DLSS 5 model (nvngx_dlssnr.dll)",
+                "ReShade loaded by OptiScaler (ReShade64.dll)",
+                "RenoDX HDR mod for this game"
+            ]
+        );
+    }
+
+    #[test]
+    fn set_load_reshade_rewrites_or_appends() {
+        let ini = "[Plugins]\r\n; doc\r\nLoadReshade=auto\r\nOther=1\r\n";
+        assert_eq!(
+            set_load_reshade(ini).unwrap(),
+            "[Plugins]\r\n; doc\r\nLoadReshade=true\r\nOther=1\r\n"
+        );
+        assert!(set_load_reshade("LoadReshade=true\n").is_none());
+        assert_eq!(
+            set_load_reshade("[Upscalers]\nDx12Upscaler=auto\n").unwrap(),
+            "[Upscalers]\nDx12Upscaler=auto\n\n[Plugins]\nLoadReshade=true\n"
+        );
     }
 
     #[test]

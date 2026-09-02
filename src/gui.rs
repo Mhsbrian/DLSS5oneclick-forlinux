@@ -183,7 +183,7 @@ impl App {
     fn start(&mut self, remove: Option<bool>) {
         let Some(exe) = self.exe() else { return };
         let engine = self.engine;
-        let with_renodx = self.renodx_on && engine == Engine::ReShade;
+        let with_renodx = self.renodx_on;
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
         self.rx = Some(rx);
         self.running = true;
@@ -957,7 +957,7 @@ impl eframe::App for App {
                         left,
                         self.engine == Engine::ReShade,
                         true,
-                        "ReShade + RenoDX add-on",
+                        "ReShade + DLSS 5 add-on",
                         &["The default. Works in every supported game.", "In game: Home → Add-ons → DLSS 5 Neural Rendering."],
                         "",
                     ) {
@@ -1019,9 +1019,6 @@ impl eframe::App for App {
                                 "— already present, not installed by this tool: {} (left untouched; ReShade loads one RenoDX mod per game)",
                                 s.foreign_renodx.join(", ")
                             ));
-                        } else if self.engine == Engine::Opti {
-                            self.renodx_on = false;
-                            dim(ui, "— RenoDX mods are ReShade add-ons; pick the ReShade engine to add one.".into());
                         } else {
                             match &self.renodx {
                                 RenodxLookup::Idle | RenodxLookup::Pending => dim(ui, "— looking up clshortfuse/renodx for this game…".into()),
@@ -1033,6 +1030,9 @@ impl eframe::App for App {
                                     ui.add_enabled(!self.running, cb).on_hover_text(
                                         "Game-specific HDR / tone-mapping mod from the RenoDX project. Loads beside the DLSS 5 add-on (different add-on name, different settings section). Turn Windows AutoHDR / RTX HDR off to avoid double tone mapping.",
                                     );
+                                    if self.engine == Engine::Opti {
+                                        dim(ui, "— ReShade goes in as ReShade64.dll, loaded by OptiScaler (LoadReshade=true)".into());
+                                    }
                                     if !m.note.is_empty() {
                                         dim(ui, format!("— {}", m.note));
                                     }
