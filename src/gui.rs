@@ -917,6 +917,17 @@ impl eframe::App for App {
                 for p in &problems {
                     ui.label(RichText::new(p).font(t::plex(12.0)).color(t::DANGER));
                 }
+                if let Some(ac) = ok_status.as_ref().and_then(|s| s.anticheat) {
+                    let mut on = game::ignore_anticheat();
+                    let label = format!(
+                        "{ac} is switched off for offline play in this game (GTA V: BattlEye unticked in the Rockstar Games Launcher, or -nobattleye) — install anyway, at my own risk"
+                    );
+                    let cb = egui::Checkbox::new(&mut on, RichText::new(label).font(t::plex(11.5)).color(t::TEXT_SOFT));
+                    if ui.add_enabled(!self.running, cb).changed() {
+                        game::set_ignore_anticheat(on);
+                        self.inspect_resolved();
+                    }
+                }
 
                 // ── engine chooser ───────────────────────────────
                 let native = ok_status.as_ref().is_some_and(|s| s.mode == game::Mode::Native);

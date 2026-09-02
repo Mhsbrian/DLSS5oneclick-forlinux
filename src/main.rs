@@ -15,7 +15,7 @@ mod update;
 use std::io::Write;
 use std::path::PathBuf;
 
-/// `dlss5oneclick <GAME.exe | game folder> [--remove | --remove-all | --check | --diagnose | --engine=opti | --renodx] | --update` runs headless; no args opens the GUI.
+/// `dlss5oneclick <GAME.exe | game folder> [--remove | --remove-all | --check | --diagnose | --engine=opti | --renodx | --ignore-anticheat] | --update` runs headless; no args opens the GUI.
 fn main() {
     update::cleanup_old();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -51,6 +51,9 @@ error: {e:#}"
     if args.iter().any(|a| a == "--update") {
         attach_parent_console();
         std::process::exit(cli_update());
+    }
+    if args.iter().any(|a| a == "--ignore-anticheat") {
+        game::set_ignore_anticheat(true);
     }
     if let Some(first) = args.first().filter(|a| !a.starts_with('-')) {
         attach_parent_console();

@@ -383,7 +383,24 @@ pub struct GameStatus {
     pub renodx_mod: Option<String>,
     /// Other RenoDX game mods found in the folder (not ours, not the DLSS 5 add-on).
     pub foreign_renodx: Vec<String>,
+    /// Anti-cheat found (files or exe name), whether or not the refusal is overridden.
+    pub anticheat: Option<&'static str>,
     pub problems: Vec<String>,
+}
+
+pub const IGNORE_ANTICHEAT_ENV: &str = "DLSS5ONECLICK_IGNORE_ANTICHEAT";
+
+pub fn ignore_anticheat() -> bool {
+    std::env::var_os(IGNORE_ANTICHEAT_ENV).is_some()
+}
+
+/// GUI checkbox / `--ignore-anticheat`: same switch as the environment variable.
+pub fn set_ignore_anticheat(on: bool) {
+    if on {
+        std::env::set_var(IGNORE_ANTICHEAT_ENV, "1");
+    } else {
+        std::env::remove_var(IGNORE_ANTICHEAT_ENV);
+    }
 }
 
 impl GameStatus {
@@ -424,8 +441,9 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     let shaders = d.join("reshade-shaders").join("Shaders");
     let textures = d.join("reshade-shaders").join("Textures");
     let mut problems = Vec::new();
-    if let Some(ac) = detect_anticheat(d).or_else(|| known_anticheat_exe(exe)) {
-        if std::env::var_os("DLSS5ONECLICK_IGNORE_ANTICHEAT").is_none() {
+    let anticheat = detect_anticheat(d).or_else(|| known_anticheat_exe(exe));
+    if let Some(ac) = anticheat {
+        if !ignore_anticheat() {
             problems.push(format!(
                 "{ac} anti-cheat found in this game. ReShade add-on injection is what it detects: kick at best, ban at worst. Refused."
             ));
@@ -480,6 +498,7 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         reframework: d.join(REFRAMEWORK_DLL).is_file(),
         renodx_mod: renodx_mod.clone(),
         foreign_renodx: crate::renodx::foreign_mods(d, renodx_mod.as_deref()),
+        anticheat,
         problems,
     })
 }
@@ -782,6 +801,7 @@ mod tests {
         std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
         let st = inspect(&exe).unwrap();
         assert!(st.problems.iter().any(|p| p.contains("GameGuard")));
+        assert_eq!(st.anticheat, Some("GameGuard"));
         fs::remove_dir_all(d.join("tools")).unwrap();
         fs::create_dir_all(
             d.join("Game")

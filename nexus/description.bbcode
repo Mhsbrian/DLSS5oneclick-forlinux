@@ -31,7 +31,7 @@ Command line: [font=Courier New]dlss5oneclick.exe "C:\Games\Foo"[/font] · [font
 [*]32-bit games (the Feeder's host64 setup is not automated — the tool refuses rather than half-install)
 [*]DirectX 9 and Vulkan games — the Feeder and NIGos' bridge do support them by hand, this tool does not automate those setups yet
 [*]Non-NVIDIA and GTX/GT cards — refused up front: the model needs tensor cores and NGX. RTX 50 runs it at full speed, RTX 40 with a patched build at moderate cost, RTX 20/30 through an FP16 path at heavy cost (the status line shows your tier)
-[*]Online games — refused when Easy Anti-Cheat, BattlEye or GameGuard files are found in the install (Helldivers 2 etc.): ReShade add-on injection is what they flag, kick at best, ban at worst
+[*]Online games — refused when Easy Anti-Cheat, BattlEye or GameGuard files are found in the install (Helldivers 2 etc.): ReShade add-on injection is what they flag, kick at best, ban at worst. Games that let you switch the anti-cheat off for offline play (GTA V: BattlEye unticked in the Rockstar Games Launcher) get a checkbox under the warning to install anyway, at your own risk
 [*]API detection can come back unknown on monolithic Unreal exes; DX12 is then assumed (shown in the status line) — a DX11 game in that state would miss the bridge
 [/list]
 

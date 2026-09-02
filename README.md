@@ -83,7 +83,7 @@ The exe is not code-signed (no publisher certificate), it is new, and it downloa
 
 - **32-bit games** — need the `host64` helper setup (see Feeder README); the tool refuses rather than half-install.
 - **DirectX 9** and **Vulkan** games — different proxy / a Vulkan layer; refused.
-- Online games — the tool refuses when it finds Easy Anti-Cheat, BattlEye or GameGuard files in the install (ReShade add-on injection is exactly what they flag: kick at best, ban at worst). Overwatch, Valorant and League (Blizzard/Riot anti-cheat, no marker files) are refused by exe name; Overwatch additionally blocks unsigned DLLs, so add-ons fail there with error `0x80090006`. `DLSS5ONECLICK_IGNORE_ANTICHEAT=1` bypasses the refusal at your own risk.
+- Online games — the tool refuses when it finds Easy Anti-Cheat, BattlEye or GameGuard files in the install (ReShade add-on injection is exactly what they flag: kick at best, ban at worst). Overwatch, Valorant and League (Blizzard/Riot anti-cheat, no marker files) are refused by exe name; Overwatch additionally blocks unsigned DLLs, so add-ons fail there with error `0x80090006`. Some games let you switch the anti-cheat off for offline play (GTA V: untick *Enable BattlEye* in the Rockstar Games Launcher, or launch with `-nobattleye`; Rockstar's own FAQ says BattlEye is only needed for GTA Online). For those, a checkbox under the warning — or `--ignore-anticheat` on the command line, or `DLSS5ONECLICK_IGNORE_ANTICHEAT=1` — installs anyway, at your own risk: do it only if the anti-cheat really is off, and never take that install online.
 
 ## Development
 
