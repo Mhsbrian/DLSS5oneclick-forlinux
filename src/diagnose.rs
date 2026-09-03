@@ -21,6 +21,24 @@ pub struct Finding {
     pub text: String,
 }
 
+/// `NVSDK_NGX_*_Init -> 0xBAD00001` in a log: NGX itself refused. Add what the
+/// system says about NGX Core, which is the usual cause on capable hardware.
+fn ngx_init_failure(log: &str, out: &mut Vec<Finding>) {
+    let Some(line) = log
+        .lines()
+        .find(|l| l.contains("NVSDK_NGX") && l.contains("Init") && l.contains("0xBAD00001"))
+    else {
+        return;
+    };
+    out.push(bad(format!(
+        "NGX refused to initialise: {}. 0xBAD00001 is FeatureNotSupported, which NGX also \
+         answers when its runtime is not on the system — not a ReShade, shader or add-on \
+         problem. {}. Then update the NVIDIA driver (616.56 or newer) and re-run Install.",
+        line.trim(),
+        crate::ngx::describe()
+    )));
+}
+
 /// Newest Feeder known at build time; only used to nudge users off stale copies.
 const CURRENT_FEEDER: &str = "0.12.0";
 
@@ -122,6 +140,31 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
         ));
     }
 
+    // ── DX11 bridge (native DLSS on D3D11) ──────────────────────────
+    if let Some(bl) = read(d, "dlss5-bridge.log") {
+        if let Some(line) = bl.lines().rev().find(|l| l.contains("stopped:")) {
+            out.push(bad(format!("The DX11 bridge stopped: {}", line.trim())));
+        }
+        if let Some(line) = bl
+            .lines()
+            .find(|l| l.contains("D3D12CreateDevice failed 0x887E0003"))
+        {
+            out.push(bad(format!(
+                "{} — 0x887E0003 is D3D12_ERROR_INVALID_REDIST: this game ships a DirectX 12 \
+                 Agility SDK (a D3D12\\D3D12Core.dll beside the exe) and every D3D12 device in \
+                 the process must match it, which the bridge's private device cannot. Not \
+                 something this tool sets. Worth trying: rename the game's D3D12 folder so it \
+                 falls back to the Windows runtime, and report the log to \
+                 github.com/NIGos/dlss5-bridge.",
+                line.trim()
+            )));
+        } else if bl.contains("frames:") && !bl.contains("session failed") {
+            out.push(ok(
+                "The DX11 bridge opened its D3D12 session and is delivering frames.",
+            ));
+        }
+    }
+
     // ── Feeder side (games without DLSS) ────────────────────────────
     if st.mode == game::Mode::Feeder {
         let Some(fd) = read(d, "dlss5-feed.log") else {
@@ -158,18 +201,21 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
                  \"LUMENITE: Kernel 2.0\" ABOVE \"DLSS5_Feed\", then reload effects.",
             ));
         }
-        if let Some(line) = fd
-            .lines()
-            .find(|l| l.contains("NVSDK_NGX_D3D12_Init") && l.contains("FeatureNotSupported"))
-        {
-            out.push(bad(format!(
-                "NGX refused to initialise on the Feeder's private D3D12 device: {}. Not a \
-                 ReShade or shader problem. Update the NVIDIA driver, make sure nvngx_dlss.dll \
-                 next to the exe is the one this tool placed (not an old copy), re-run Install \
-                 so DLSS5-Feeder is the current release, and attach dlss5-feed.log + ReShade.log \
-                 if it persists.",
-                line.trim()
-            )));
+        ngx_init_failure(&fd, &mut out);
+        // 32-bit games: the work happens in host64\, and its own log names the reason.
+        if let Some(hl) = read(&d.join(game::HOST_DIR), "dlss5-feed-host.log") {
+            if hl.contains("feature ready") {
+                out.push(ok(
+                    "The host64 helper built its DLSS feature (feature ready … DLAA).",
+                ));
+            }
+            ngx_init_failure(&hl, &mut out);
+        } else if st.is32() {
+            out.push(warn(
+                "No host64\\dlss5-feed-host.log yet: the 64-bit helper has not started. It is \
+                 spawned by the first fed frame, so enable Lumenite_Kernel + DLSS5_Feed in \
+                 ReShade's Home tab and play a moment first.",
+            ));
         }
         if let Some(ver) = fd
             .lines()

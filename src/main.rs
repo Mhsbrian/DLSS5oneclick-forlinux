@@ -8,6 +8,7 @@ mod installer;
 mod library;
 mod logo;
 mod net;
+mod ngx;
 mod renodx;
 mod reshade_ini;
 mod theme;

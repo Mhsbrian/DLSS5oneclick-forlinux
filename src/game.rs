@@ -249,6 +249,19 @@ pub fn detect_api(exe: &Path) -> Api {
     }
 }
 
+/// dgVoodoo2 next to the exe: its own config/control panel, or its name inside
+/// the wrapper DLL. It translates D3D9 to D3D11, which the Feeder supports.
+pub fn is_dgvoodoo(game_dir: &Path) -> bool {
+    if game_dir.join("dgVoodoo.conf").is_file() || game_dir.join("dgVoodooCpl.exe").is_file() {
+        return true;
+    }
+    let dll = game_dir.join("d3d9.dll");
+    match fs::read(&dll) {
+        Ok(b) => b.windows(8).any(|w| w.eq_ignore_ascii_case(b"dgVoodoo")),
+        Err(_) => false,
+    }
+}
+
 /// Anti-cheat present in the install tree, by the files those systems ship.
 /// ReShade add-on injection is exactly what they look for: kicks at best, bans
 /// at worst. Verified file names: EAC `EasyAntiCheat[_EOS]/EasyAntiCheat_EOS_Setup.exe`,
@@ -508,7 +521,10 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
             ));
         }
     }
-    if d.join("d3d9.dll").is_file() && !d.join(RESHADE_PROXY).is_file() {
+    // A d3d9.dll is usually a wrapper this tool cannot work behind — except
+    // dgVoodoo2, which is exactly how a D3D9 game reaches D3D11 and then the
+    // Feeder (verified working on Dead or Alive 5 Last Round, #17).
+    if d.join("d3d9.dll").is_file() && !d.join(RESHADE_PROXY).is_file() && !is_dgvoodoo(d) {
         problems
             .push("A d3d9.dll proxy is present; DirectX 9 games are not supported here.".into());
     }
@@ -889,6 +905,30 @@ mod tests {
         let exe = make_pe(&t.path().join("game.exe"), PE_X64);
         assert!(pe_imports(&exe).is_empty());
         assert_eq!(detect_api(&exe), Api::Unknown);
+    }
+
+    #[test]
+    fn dgvoodoo_d3d9_is_allowed_other_d3d9_is_not() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe(&d.join("game.exe"), PE_X86);
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+        fs::write(d.join("d3d9.dll"), b"MZ some other wrapper").unwrap();
+        assert!(inspect(&exe)
+            .unwrap()
+            .problems
+            .iter()
+            .any(|p| p.contains("d3d9.dll proxy")));
+        fs::write(d.join("dgVoodoo.conf"), b"[General]").unwrap();
+        assert!(is_dgvoodoo(d));
+        assert!(!inspect(&exe)
+            .unwrap()
+            .problems
+            .iter()
+            .any(|p| p.contains("d3d9.dll proxy")));
+        fs::remove_file(d.join("dgVoodoo.conf")).unwrap();
+        fs::write(d.join("d3d9.dll"), b"MZ...dgVoodoo2 wrapper...").unwrap();
+        assert!(is_dgvoodoo(d));
     }
 
     #[test]
