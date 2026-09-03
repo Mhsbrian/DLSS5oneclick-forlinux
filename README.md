@@ -26,6 +26,8 @@ Download: [latest release](https://github.com/faisalkindi/DLSS5oneclick/releases
 
 **Wrong path?** The DLSS detection is a folder scan, so a stray `nvngx_dlss.dll` (left by another tool, or by this one before it started marking its own copy) makes a game without DLSS look like a native-DLSS game. The dropdown next to the game line (**Auto / Force no-DLSS (Feeder) / Force native DLSS**), `--mode=feeder|native`, or `DLSS5ONECLICK_MODE` overrides it; the auto line still shows what was detected.
 
+**Hybrid machines (laptop iGPU + dGPU, or an AMD/Intel display adapter alongside the NVIDIA card).** Windows decides which GPU a process starts on, and a process started on the integrated GPU has no NGX at all — every `NVSDK_NGX_D3D12_Init` answers `0xBAD00001` (FeatureNotSupported) no matter how correct the install is. Install now writes the same preference the Settings app writes (`GpuPreference=2;` under `HKCU\Software\Microsoft\DirectX\UserGpuPreferences`) for the game exe, and for `host64\dlss5-feed-host64.exe` on a 32-bit game. Remove takes it away again, but only when it is still exactly what was written. `--check` prints the machine's adapters and the current preference.
+
 DX11 vs DX12 is read from the exe's import table, then from the engine DLLs next to it (`UnityPlayer.dll`, ...), and a `D3D12\D3D12Core.dll` (DirectX Agility SDK redist) next to the exe counts as DX12 even when only `d3d11.dll` is imported (RE Engine). When nothing says, DX12 is assumed and the status line says so. `dlss5oneclick.exe "<game folder>" --check` prints the detected mode, API and plan without installing anything.
 
 ### The no-DLSS path
