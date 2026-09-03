@@ -70,24 +70,29 @@ fn step_opti(
         );
     }
     progress(0, "Looking up latest OptiScaler DLSS-NR release");
-    let asset: String = match net::get_json_github(client, OPTI_RELEASES) {
-        Ok(releases) => releases
-            .as_array()
-            .and_then(|a| a.first())
-            .and_then(|r| r.get("assets"))
-            .and_then(Value::as_array)
-            .and_then(|a| a.first())
-            .and_then(|a| a.get("browser_download_url"))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| anyhow!("OptiScaler_DLSSNR has no release asset"))?,
-        Err(_) => {
-            let tags = net::github_release_tags_html(client, OPTI_REPO, "v", 2)?;
-            let tag = tags
-                .first()
-                .ok_or_else(|| anyhow!("no OptiScaler_DLSSNR release found"))?;
-            net::github_asset_url_html(client, OPTI_REPO, tag, r#"[^"]+\.zip"#)?
-        }
+    // Stable release only (releases/latest skips pre-releases); the API list
+    // and the releases page both put betas first.
+    let asset: String = match net::latest_tag(client, OPTI_REPO) {
+        Ok(tag) => net::github_asset_url_html(client, OPTI_REPO, &tag, r#"[^"]+\.zip"#)?,
+        Err(_) => match net::get_json_github(client, OPTI_RELEASES) {
+            Ok(releases) => releases
+                .as_array()
+                .and_then(|a| a.iter().find(|r| r["prerelease"] != Value::Bool(true)))
+                .and_then(|r| r.get("assets"))
+                .and_then(Value::as_array)
+                .and_then(|a| a.first())
+                .and_then(|a| a.get("browser_download_url"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow!("OptiScaler_DLSSNR has no release asset"))?,
+            Err(_) => {
+                let tags = net::github_release_tags_html(client, OPTI_REPO, "v", 2)?;
+                let tag = tags
+                    .first()
+                    .ok_or_else(|| anyhow!("no OptiScaler_DLSSNR release found"))?;
+                net::github_asset_url_html(client, OPTI_REPO, tag, r#"[^"]+\.zip"#)?
+            }
+        },
     };
     let asset = asset.as_str();
     let zip_path = work.join("optiscaler-dlssnr.zip");
@@ -634,10 +639,15 @@ fn step_feeder(
     progress(0, "Looking up latest DLSS5-Feeder");
     // Since 0.11 the project ships one zip per release instead of loose assets;
     // the file name carries the version, so the tag is read first.
-    let tags = net::github_release_tags_html(client, FEEDER_REPO, "v", 2)?;
-    let tag = tags
-        .first()
-        .ok_or_else(|| anyhow!("no DLSS5-Feeder release found"))?;
+    // Stable release only; the releases page lists betas first.
+    let tag = match net::latest_tag(client, FEEDER_REPO) {
+        Ok(t) => t,
+        Err(_) => net::github_release_tags_html(client, FEEDER_REPO, "v", 2)?
+            .into_iter()
+            .find(|t| !t.contains("beta") && !t.contains("rc"))
+            .ok_or_else(|| anyhow!("no DLSS5-Feeder release found"))?,
+    };
+    let tag = &tag;
     let url = net::github_asset_url_html(client, FEEDER_REPO, tag, r#"[^"]+\.zip"#)?;
     let zip_path = work.join("dlss5-feeder.zip");
     net::download(client, &url, &zip_path, "DLSS5-Feeder", progress)?;

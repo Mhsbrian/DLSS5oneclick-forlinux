@@ -138,6 +138,27 @@ pub fn get_text(client: &Client, url: &str) -> Result<String> {
     })
 }
 
+/// Tag of a repo's newest *non-prerelease* release: `releases/latest` redirects
+/// to `/releases/tag/<tag>`. The releases page lists betas first, so scraping it
+/// would hand out pre-releases (DLSS5-Feeder 0.12.1-beta.1).
+pub fn latest_tag(client: &Client, repo: &str) -> Result<String> {
+    with_retry(&|_, _| {}, repo, || {
+        let resp = client
+            .get(format!("https://github.com/{repo}/releases/latest"))
+            .send()
+            .with_context(|| format!("request failed: {repo} releases/latest"))?;
+        if !resp.status().is_success() {
+            bail!("{repo} releases/latest: HTTP {}", resp.status());
+        }
+        let url = resp.url().as_str().to_owned();
+        url.rsplit("/tag/")
+            .next()
+            .filter(|t| !t.is_empty() && !t.contains('/'))
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow!("{repo}: releases/latest did not land on a tag ({url})"))
+    })
+}
+
 /// Content-Length of `url` after redirects (GitHub's `latest/download` → CDN),
 /// or `None` when the server does not say.
 pub fn remote_len(client: &Client, url: &str) -> Result<Option<u64>> {
