@@ -3,6 +3,88 @@
 //! No D3D device is created; this is enough to say "not NVIDIA" or "GTX, no tensor
 //! cores" before anything is downloaded, and to show the expected cost tier.
 
+/// NVIDIA's own version number from the Windows driver version: the last five
+/// digits with a decimal before the last two (32.0.16.1656 -> 616.56). Verified
+/// against this machine, where the NVIDIA App reports 616.56.
+#[cfg_attr(not(windows), allow(dead_code))] // reachable from the registry reader
+pub fn nvidia_driver_number(windows_version: &str) -> Option<String> {
+    let digits: String = windows_version
+        .split('.')
+        .skip(2)
+        .collect::<Vec<_>>()
+        .join("");
+    let digits: String = digits.chars().filter(char::is_ascii_digit).collect();
+    if digits.len() < 5 {
+        return None;
+    }
+    let last5 = &digits[digits.len() - 5..];
+    Some(format!("{}.{}", &last5[..3], &last5[3..]))
+}
+
+/// NVIDIA's own driver number for the first NVIDIA adapter, or `None`.
+#[cfg(windows)]
+pub fn nvidia_driver() -> Option<String> {
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RRF_RT_REG_SZ,
+    };
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    fn read_sz(key: HKEY, name: &str) -> Option<String> {
+        let name_w = wide(name);
+        let mut buf = [0u16; 256];
+        let mut size: u32 = (buf.len() * 2) as u32;
+        let rc = unsafe {
+            RegGetValueW(
+                key,
+                std::ptr::null(),
+                name_w.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr() as *mut _,
+                &mut size,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        let n = (size as usize / 2).saturating_sub(1).min(buf.len());
+        Some(
+            String::from_utf16_lossy(&buf[..n])
+                .trim_end_matches(' ')
+                .to_owned(),
+        )
+    }
+    let base = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
+    for i in 0..64 {
+        let sub = wide(&format!("{base}\\{i:04}"));
+        let mut key: HKEY = std::ptr::null_mut();
+        if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub.as_ptr(), 0, KEY_READ, &mut key) } != 0 {
+            continue;
+        }
+        let provider = read_sz(key, "ProviderName").unwrap_or_default();
+        let ver = read_sz(key, "DriverVersion");
+        unsafe { RegCloseKey(key) };
+        if provider.to_ascii_lowercase().contains("nvidia") {
+            if let Some(v) = ver.as_deref().and_then(nvidia_driver_number) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// On Linux the kernel module reports NVIDIA's own number directly.
+#[cfg(target_os = "linux")]
+pub fn nvidia_driver() -> Option<String> {
+    driver_version()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn nvidia_driver() -> Option<String> {
+    None
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Gpu {
     pub name: String,

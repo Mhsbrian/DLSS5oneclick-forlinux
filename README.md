@@ -20,7 +20,7 @@ Works on any x86_64 gaming distro with glibc ≥ 2.35 (Arch/CachyOS/EndeavourOS,
 - **Linux GPU and driver checks.** The RTX tier (RTX 50 full speed · RTX 40 moderate cost · RTX 20/30 heavy cost) is read from the NVIDIA driver; non-NVIDIA and GTX cards are refused up front, exactly like on Windows. `--diagnose` also verifies the driver's Wine NGX DLLs (`/usr/lib/nvidia/wine`), the kernel driver version, the game's Proton mapping and its prefix — the usual "DLSS silently does nothing" causes on Linux.
 - **Self-updating from this repo**, AppImage included.
 
-Everything else — the two install paths, the OptiScaler engine, `--check`, `--remove`, anti-cheat refusals — is upstream, unchanged. See [upstream's README](https://github.com/faisalkindi/DLSS5oneclick#readme) for the full story of what gets installed and from where.
+Everything else is upstream (currently merged at 0.10.2), unchanged: the two install paths, the OptiScaler engine, the games grid with posters, optional per-game **RenoDX HDR mods** (`--renodx`), automatic **REFramework** for RE Engine games, component refresh on reinstall, 32-bit games via the host64 helper, the detection override (`--mode=feeder|native`), and `--check` / `--remove` / anti-cheat refusals (`--ignore-anticheat` to override at your own risk). See [upstream's README](https://github.com/faisalkindi/DLSS5oneclick#readme) for the full story of what gets installed and from where.
 
 ## Use
 
@@ -31,7 +31,7 @@ Everything else — the two install paths, the OptiScaler engine, `--check`, `--
 
 If nothing seems to happen in game, run `--diagnose` (button or CLI) — it reads the logs and the host setup and says exactly what is wrong.
 
-CLI: `dlss5oneclick <folder | name | appid>` installs · `--check` detect only · `--diagnose` · `--remove` / `--remove-all` · `--engine=opti` · `--launch-options` / `--revert-launch-options` · `--list-games` · `--update`.
+CLI: `dlss5oneclick <folder | name | appid>` installs · `--check` detect only · `--diagnose` · `--remove` / `--remove-all` · `--engine=opti` · `--renodx` · `--mode=feeder|native` · `--ignore-anticheat` · `--launch-options` / `--revert-launch-options` · `--list-games` · `--update`.
 
 ## Launch options details
 
@@ -53,7 +53,7 @@ NVIDIA RTX only (the DLSS 5 model needs tensor cores and NGX). The `310.8.SF` bu
 
 ## Not handled
 
-Same as upstream: 32-bit games, DirectX 9, Vulkan-native games (X4, most native Linux ports have no Windows exe at all and are skipped), and games with anti-cheat (EAC/BattlEye/GameGuard — refused; `DLSS5ONECLICK_IGNORE_ANTICHEAT=1` at your own risk, and under Proton that risk includes the anti-cheat's Linux path breaking outright).
+Same as upstream: DirectX 9 (except behind dgVoodoo2) and Vulkan-native games (X4, most native Linux ports have no Windows exe at all and are skipped), and games with anti-cheat (EAC/BattlEye/GameGuard — refused; `--ignore-anticheat` at your own risk, and under Proton that risk includes the anti-cheat's Linux path breaking outright). 32-bit DX11 games work since upstream 0.10.0 (Feeder + host64 helper, beta).
 
 - The DLSS 5 add-on and its model are a leaked, closed-source build. The tool downloads whatever the rhi-repo releases currently host and cannot vouch for them.
 - Heroic environment-variable writing is experimental (config format tolerances built in; falls back to showing you the variables).

@@ -835,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "dlss5oneclick"
-version = "0.8.0"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "eframe",
@@ -1782,6 +1782,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

@@ -15,6 +15,7 @@
 
 use crate::game::{self, GameStatus};
 use crate::net::{self, Progress};
+use crate::renodx;
 use crate::reshade_ini;
 use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
@@ -26,8 +27,6 @@ use std::path::{Path, PathBuf};
 pub const RESHADE_HOME: &str = "https://reshade.me";
 pub const RESHADE_SHADERS_RAW: &str =
     "https://raw.githubusercontent.com/crosire/reshade-shaders/slim/Shaders/";
-pub const FEEDER_DOWNLOAD: &str =
-    "https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest/download/";
 pub const FEEDER_REPO: &str = "jlrouzies-fr/DLSS5-Feeder";
 pub const LUMENITE_ZIP: &str =
     "https://codeload.github.com/umar-afzaal/LumeniteFX/zip/refs/heads/mainline";
@@ -71,24 +70,29 @@ fn step_opti(
         );
     }
     progress(0, "Looking up latest OptiScaler DLSS-NR release");
-    let asset: String = match net::get_json_github(client, OPTI_RELEASES) {
-        Ok(releases) => releases
-            .as_array()
-            .and_then(|a| a.first())
-            .and_then(|r| r.get("assets"))
-            .and_then(Value::as_array)
-            .and_then(|a| a.first())
-            .and_then(|a| a.get("browser_download_url"))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| anyhow!("OptiScaler_DLSSNR has no release asset"))?,
-        Err(_) => {
-            let tags = net::github_release_tags_html(client, OPTI_REPO, "v", 2)?;
-            let tag = tags
-                .first()
-                .ok_or_else(|| anyhow!("no OptiScaler_DLSSNR release found"))?;
-            net::github_asset_url_html(client, OPTI_REPO, tag, r#"[^"]+\.zip"#)?
-        }
+    // Stable release only (releases/latest skips pre-releases); the API list
+    // and the releases page both put betas first.
+    let asset: String = match net::latest_tag(client, OPTI_REPO) {
+        Ok(tag) => net::github_asset_url_html(client, OPTI_REPO, &tag, r#"[^"]+\.zip"#)?,
+        Err(_) => match net::get_json_github(client, OPTI_RELEASES) {
+            Ok(releases) => releases
+                .as_array()
+                .and_then(|a| a.iter().find(|r| r["prerelease"] != Value::Bool(true)))
+                .and_then(|r| r.get("assets"))
+                .and_then(Value::as_array)
+                .and_then(|a| a.first())
+                .and_then(|a| a.get("browser_download_url"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow!("OptiScaler_DLSSNR has no release asset"))?,
+            Err(_) => {
+                let tags = net::github_release_tags_html(client, OPTI_REPO, "v", 2)?;
+                let tag = tags
+                    .first()
+                    .ok_or_else(|| anyhow!("no OptiScaler_DLSSNR release found"))?;
+                net::github_asset_url_html(client, OPTI_REPO, tag, r#"[^"]+\.zip"#)?
+            }
+        },
     };
     let asset = asset.as_str();
     let zip_path = work.join("optiscaler-dlssnr.zip");
@@ -217,28 +221,221 @@ const STEP_FEEDER_CLEANUP: Step = Step {
     name: "Remove DLSS5-Feeder (game has native DLSS)",
     run: step_feeder_cleanup,
 };
+const STEP_REFRAMEWORK: Step = Step {
+    name: "REFramework (RE Engine needs it before ReShade)",
+    run: step_reframework,
+};
+const STEP_RENODX: Step = Step {
+    name: "RenoDX HDR mod for this game",
+    run: step_renodx,
+};
+const STEP_HOST_RESHADE: Step = Step {
+    name: "64-bit ReShade for the host64 helper",
+    run: step_host_reshade,
+};
 
-/// Steps for a game, by install path.
-pub fn plan(st: &GameStatus) -> Vec<Step> {
-    plan_with(st, Engine::ReShade)
+/// 32-bit games: the helper process needs its own 64-bit ReShade as
+/// `host64\dxgi.dll` (the Feeder README: "run the ReShade installer once
+/// against any 64-bit game and take it from there"). Same marker/refresh rule
+/// as the in-game copy.
+fn step_host_reshade(
+    client: &Client,
+    st: &GameStatus,
+    work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    let host = st.consumer_dir();
+    fs::create_dir_all(&host)?;
+    progress(0, "Looking up latest ReShade");
+    let (ver, url) = resolve_reshade_setup(client)?;
+    if st.host_reshade {
+        match fs::read_to_string(host.join(game::RESHADE_MARKER)) {
+            Ok(mine) if mine.trim() == ver => {
+                return Ok(vec![format!("host64/dxgi.dll already current ({ver})")]);
+            }
+            Ok(_) => progress(0, &format!("host64 ReShade {ver} is out, refreshing")),
+            Err(_) => {
+                return Ok(vec![
+                    "host64/dxgi.dll present (not placed by this tool)".into()
+                ])
+            }
+        }
+    }
+    let setup = work.join(format!("ReShade_Setup_{ver}_Addon.exe"));
+    net::download(client, &url, &setup, "ReShade (64-bit, host64)", progress)?;
+    install_reshade_from_setup(&setup, &host, 64, game::RESHADE_PROXY)?;
+    fs::write(host.join(game::RESHADE_MARKER), ver.as_bytes())?;
+    Ok(vec![format!("{}/{}", game::HOST_DIR, game::RESHADE_PROXY)])
 }
 
-pub fn plan_with(st: &GameStatus, engine: Engine) -> Vec<Step> {
-    if engine == Engine::Opti {
+const STEP_RESHADE_VIA_OPTI: Step = Step {
+    name: "ReShade loaded by OptiScaler (ReShade64.dll)",
+    run: step_reshade_via_opti,
+};
+
+/// ReShade beside OptiScaler, the way OptiScaler.ini documents it: the ReShade
+/// DLL as `ReShade64.dll` next to the exe and `[Plugins] LoadReshade=true`, so
+/// OptiScaler (which holds dxgi.dll) loads it and ReShade add-ons still work.
+fn step_reshade_via_opti(
+    client: &Client,
+    st: &GameStatus,
+    work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    let d = st.game_dir();
+    let ini = d.join(OPTI_INI);
+    if !ini.is_file() {
+        bail!("{OPTI_INI} not found — install the OptiScaler engine first");
+    }
+    let mut done = Vec::new();
+    let dll = d.join(RESHADE64);
+    if !dll.is_file() {
+        progress(0, "Looking up latest ReShade");
+        let (ver, url) = resolve_reshade_setup(client)?;
+        let setup = work.join(format!("ReShade_Setup_{ver}_Addon.exe"));
+        net::download(client, &url, &setup, "ReShade", progress)?;
+        install_reshade_from_setup(&setup, d, st.bitness, RESHADE64)?;
+        // Recorded in the OptiScaler manifest so Remove takes it out with the engine.
+        let mut m = fs::read_to_string(d.join(game::OPTI_MANIFEST)).unwrap_or_default();
+        if !m.lines().any(|l| l == RESHADE64) {
+            if !m.is_empty() && !m.ends_with('\n') {
+                m.push('\n');
+            }
+            m.push_str(RESHADE64);
+            fs::write(d.join(game::OPTI_MANIFEST), m)?;
+        }
+        done.push(RESHADE64.to_owned());
+    }
+    let text = fs::read_to_string(&ini)?;
+    if let Some(new) = set_load_reshade(&text) {
+        fs::write(&ini, new)?;
+        done.push(format!("{OPTI_INI}: LoadReshade=true"));
+    }
+    if done.is_empty() {
+        progress(100, "ReShade64.dll + LoadReshade already set");
+    }
+    Ok(done)
+}
+
+pub const OPTI_INI: &str = "OptiScaler.ini";
+pub const RESHADE64: &str = "ReShade64.dll";
+
+/// `LoadReshade=true` in OptiScaler.ini; `None` when already set.
+pub fn set_load_reshade(ini: &str) -> Option<String> {
+    let mut out = String::with_capacity(ini.len() + 32);
+    let mut seen = false;
+    let mut changed = false;
+    for line in ini.split_inclusive('\n') {
+        let t = line.trim_end_matches(['\r', '\n']);
+        let key = t.split('=').next().unwrap_or("").trim();
+        if key.eq_ignore_ascii_case("LoadReshade") {
+            seen = true;
+            if t.split('=').nth(1).map(str::trim) != Some("true") {
+                out.push_str("LoadReshade=true");
+                out.push_str(&line[t.len()..]);
+                changed = true;
+                continue;
+            }
+        }
+        out.push_str(line);
+    }
+    if !seen {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("\n[Plugins]\nLoadReshade=true\n");
+        changed = true;
+    }
+    changed.then_some(out)
+}
+
+pub const REFRAMEWORK_ZIP: &str =
+    "https://github.com/praydog/REFramework-nightly/releases/latest/download/REFramework.zip";
+
+/// praydog's monolithic nightly: one `dinput8.dll` that detects the RE Engine
+/// game at runtime (DMC5, RE2/3/4/7/8/9, MHRise, MHWilds, SF6, DD2, Pragmata...).
+/// Only the DLL is extracted, as its release notes insist.
+fn step_reframework(
+    client: &Client,
+    st: &GameStatus,
+    work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    if st.reframework {
+        progress(100, "REFramework already present");
+        return Ok(vec![]);
+    }
+    let d = st.game_dir();
+    let zip_path = work.join("REFramework.zip");
+    net::download(client, REFRAMEWORK_ZIP, &zip_path, "REFramework", progress)?;
+    let f = fs::File::open(&zip_path)?;
+    let mut zip = zip::ZipArchive::new(f).context("REFramework download is not a valid zip")?;
+    let member = zip
+        .file_names()
+        .find(|n| net::file_name(n).eq_ignore_ascii_case(game::REFRAMEWORK_DLL))
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("REFramework.zip has no {}", game::REFRAMEWORK_DLL))?;
+    net::extract_member(&mut zip, &member, &d.join(game::REFRAMEWORK_DLL))?;
+    fs::write(d.join(game::REFRAMEWORK_MARKER), b"")?;
+    Ok(vec![game::REFRAMEWORK_DLL.to_owned()])
+}
+
+fn step_renodx(
+    client: &Client,
+    st: &GameStatus,
+    _work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    progress(0, "Looking up the RenoDX mod for this game");
+    let m = renodx::lookup(client, &st.exe)?
+        .ok_or_else(|| anyhow!("no RenoDX mod is published for this game"))?;
+    renodx::install(client, &st.exe, &m, progress)
+}
+
+/// `with_renodx` adds the game's RenoDX HDR mod after the DLSS 5 add-on. On
+/// the OptiScaler engine that needs ReShade too, loaded by OptiScaler as
+/// `ReShade64.dll`. RE Engine games get REFramework first on either engine.
+pub fn plan_with(st: &GameStatus, engine: Engine, with_renodx: bool) -> Vec<Step> {
+    let mut v = if engine == Engine::Opti {
         // Only games with native DLSS: the NR pass reads the inputs the game
         // hands to DLSS. Callers gate on mode; return the plan regardless so
         // --check can show it.
-        return vec![STEP_OPTI, STEP_DLSSNR_ONLY];
+        let mut v = vec![STEP_OPTI, STEP_DLSSNR_ONLY];
+        if with_renodx {
+            v.push(STEP_RESHADE_VIA_OPTI);
+            v.push(STEP_RENODX);
+        }
+        v
+    } else {
+        let mut v = plan_reshade(st);
+        if with_renodx {
+            let at = v.len() - 1; // before ReShade config
+            v.insert(at, STEP_RENODX);
+        }
+        v
+    };
+    if st.re_engine {
+        v.insert(0, STEP_REFRAMEWORK);
     }
+    v
+}
+
+fn plan_reshade(st: &GameStatus) -> Vec<Step> {
     match st.mode {
-        game::Mode::Feeder => vec![
-            STEP_RESHADE,
-            STEP_HEADERS,
-            STEP_FEEDER,
-            STEP_LUMENITE,
-            STEP_DLSS5,
-            STEP_CONFIG,
-        ],
+        game::Mode::Feeder => {
+            let mut v = vec![STEP_RESHADE];
+            if st.is32() {
+                v.push(STEP_HOST_RESHADE);
+            }
+            v.extend([
+                STEP_HEADERS,
+                STEP_FEEDER,
+                STEP_LUMENITE,
+                STEP_DLSS5,
+                STEP_CONFIG,
+            ]);
+            v
+        }
         game::Mode::Native => {
             let mut v = vec![STEP_RESHADE];
             if st.feeder {
@@ -347,6 +544,7 @@ pub fn install_reshade_from_setup(
     setup_exe: &Path,
     game_dir: &Path,
     bitness: u8,
+    dest_name: &str,
 ) -> Result<Vec<String>> {
     let dll = if bitness == 64 {
         "ReShade64.dll"
@@ -355,9 +553,9 @@ pub fn install_reshade_from_setup(
     };
     let f = fs::File::open(setup_exe)?;
     let mut zip = zip::ZipArchive::new(f).context("ReShade installer has no readable archive")?;
-    net::extract_member(&mut zip, dll, &game::join_ci(game_dir, &[game::RESHADE_PROXY]))
+    net::extract_member(&mut zip, dll, &game_dir.join(dest_name))
         .with_context(|| format!("{} does not contain {dll}", setup_exe.display()))?;
-    Ok(vec![game::RESHADE_PROXY.into()])
+    Ok(vec![dest_name.into()])
 }
 
 fn step_reshade(
@@ -366,12 +564,9 @@ fn step_reshade(
     work: &Path,
     progress: Progress,
 ) -> Result<Vec<String>> {
-    if st.reshade {
-        progress(100, "ReShade already installed");
-        return Ok(vec![]);
-    }
-    let proxy = game::join_ci(st.game_dir(), &[game::RESHADE_PROXY]);
-    if proxy.is_file() {
+    let d = st.game_dir();
+    let proxy = game::join_ci(d, &[game::RESHADE_PROXY]);
+    if !st.reshade && proxy.is_file() {
         bail!(
             "{} exists but is not ReShade (DXVK, Special K, another injector?). Remove it first.",
             game::RESHADE_PROXY
@@ -379,9 +574,25 @@ fn step_reshade(
     }
     progress(0, "Looking up latest ReShade");
     let (ver, url) = resolve_reshade_setup(client)?;
+    if st.reshade {
+        // Only a copy this tool placed is refreshed; a user's own ReShade stays.
+        match fs::read_to_string(d.join(game::RESHADE_MARKER)) {
+            Ok(mine) if mine.trim() == ver => {
+                return Ok(vec![format!("ReShade already current ({ver})")]);
+            }
+            Ok(_) => progress(0, &format!("ReShade {ver} is out, refreshing")),
+            Err(_) => {
+                return Ok(vec![
+                    "ReShade present (not placed by this tool, left as is)".to_owned(),
+                ]);
+            }
+        }
+    }
     let setup = work.join(format!("ReShade_Setup_{ver}_Addon.exe"));
     net::download(client, &url, &setup, "ReShade", progress)?;
-    install_reshade_from_setup(&setup, st.game_dir(), st.bitness)
+    let out = install_reshade_from_setup(&setup, d, st.bitness, game::RESHADE_PROXY)?;
+    fs::write(d.join(game::RESHADE_MARKER), ver.as_bytes())?;
+    Ok(out)
 }
 
 // ── step 2: ReShade shader headers ────────────────────────────────
@@ -422,48 +633,69 @@ fn step_feeder(
     work: &Path,
     progress: Progress,
 ) -> Result<Vec<String>> {
-    if st.feeder {
-        progress(100, "DLSS5-Feeder already installed");
-        return Ok(vec![]);
-    }
-    progress(0, "Fetching latest DLSS5-Feeder");
+    // An installed Feeder used to be left alone forever (a 0.7.0 survived every
+    // reinstall while 0.12.0 was out, #6). The zip is small: fetch it and
+    // compare the add-on's size with what is on disk.
+    progress(0, "Looking up latest DLSS5-Feeder");
+    // Since 0.11 the project ships one zip per release instead of loose assets;
+    // the file name carries the version, so the tag is read first.
+    // Stable release only; the releases page lists betas first.
+    let tag = match net::latest_tag(client, FEEDER_REPO) {
+        Ok(t) => t,
+        Err(_) => net::github_release_tags_html(client, FEEDER_REPO, "v", 2)?
+            .into_iter()
+            .find(|t| !t.contains("beta") && !t.contains("rc"))
+            .ok_or_else(|| anyhow!("no DLSS5-Feeder release found"))?,
+    };
+    let tag = &tag;
+    let url = net::github_asset_url_html(client, FEEDER_REPO, tag, r#"[^"]+\.zip"#)?;
+    let zip_path = work.join("dlss5-feeder.zip");
+    net::download(client, &url, &zip_path, "DLSS5-Feeder", progress)?;
+
     let d = st.game_dir();
-    let shaders = game::join_ci(d, &["reshade-shaders", "Shaders"]);
-    // Older Feeder releases attach the two files loose; newer ones (0.11+)
-    // ship a single DLSS5-Feeder-<ver>.zip holding the same paths.
-    let loose = (|| -> Result<()> {
-        net::download(
-            client,
-            &format!("{FEEDER_DOWNLOAD}{}", game::FEEDER_ADDON),
-            &d.join(game::FEEDER_ADDON),
-            game::FEEDER_ADDON,
-            progress,
-        )?;
-        net::download(
-            client,
-            &format!("{FEEDER_DOWNLOAD}{}", game::FEEDER_FX),
-            &shaders.join(game::FEEDER_FX),
-            game::FEEDER_FX,
-            progress,
-        )
-    })();
-    if loose.is_err() {
-        progress(0, "No loose Feeder assets in the latest release; using its zip");
-        let tags = net::github_release_tags_html(client, FEEDER_REPO, "v", 2)?;
-        let tag = tags
-            .first()
-            .ok_or_else(|| anyhow!("no DLSS5-Feeder release found"))?;
-        let url =
-            net::github_asset_url_html(client, FEEDER_REPO, tag, r#"DLSS5-Feeder-[^"]+\.zip"#)?;
-        let z = work.join("dlss5-feeder.zip");
-        net::download(client, &url, &z, "DLSS5-Feeder", progress)?;
-        install_single_from_zip(&z, game::FEEDER_ADDON, &d.join(game::FEEDER_ADDON))?;
-        install_single_from_zip(&z, game::FEEDER_FX, &shaders.join(game::FEEDER_FX))?;
+    let f = fs::File::open(&zip_path)?;
+    let mut zip = zip::ZipArchive::new(f).context("DLSS5-Feeder download is not a valid zip")?;
+    let members: Vec<String> = zip.file_names().map(str::to_owned).collect();
+    let pick = |want: &str| -> Option<String> {
+        members
+            .iter()
+            .find(|m| net::file_name(&m.replace('\\', "/")).eq_ignore_ascii_case(want))
+            .cloned()
+    };
+    // 32-bit: the in-game half is addon32 and the 64-bit helper exe goes to
+    // host64\; both must come from the same zip (helper protocol).
+    let addon_name = if st.is32() {
+        game::FEEDER_ADDON32
+    } else {
+        game::FEEDER_ADDON
+    };
+    let addon =
+        pick(addon_name).ok_or_else(|| anyhow!("DLSS5-Feeder {tag} has no {addon_name}"))?;
+    let fx = pick(game::FEEDER_FX)
+        .ok_or_else(|| anyhow!("DLSS5-Feeder {tag} has no {}", game::FEEDER_FX))?;
+    let host_member = st.is32().then(|| pick(game::HOST_EXE)).flatten();
+    if st.is32() && host_member.is_none() {
+        bail!("DLSS5-Feeder {tag} has no {}", game::HOST_EXE);
     }
-    Ok(vec![
-        game::FEEDER_ADDON.into(),
-        format!("reshade-shaders/Shaders/{}", game::FEEDER_FX),
-    ])
+    let host_current = match &host_member {
+        Some(m) => same_size(&mut zip, m, &st.consumer_dir().join(game::HOST_EXE)),
+        None => true,
+    };
+    if st.feeder && host_current && same_size(&mut zip, &addon, &d.join(addon_name)) {
+        return Ok(vec![format!("DLSS5-Feeder already current ({tag})")]);
+    }
+    net::extract_member(&mut zip, &addon, &d.join(addon_name))?;
+    let mut out = vec![format!("{addon_name} ({tag})")];
+    if let Some(m) = &host_member {
+        let host = st.consumer_dir();
+        fs::create_dir_all(&host)?;
+        net::extract_member(&mut zip, m, &host.join(game::HOST_EXE))?;
+        out.push(format!("{}/{} ({tag})", game::HOST_DIR, game::HOST_EXE));
+    }
+    let shaders = game::join_ci(d, &["reshade-shaders", "Shaders"]);
+    net::extract_member(&mut zip, &fx, &game::join_ci(&shaders, &[game::FEEDER_FX]))?;
+    out.push(format!("reshade-shaders/Shaders/{}", game::FEEDER_FX));
+    Ok(out)
 }
 
 // ── step 4: LumeniteFX ─────────────────────────────────────────────
@@ -524,6 +756,18 @@ fn step_lumenite(
 
 // ── step 5: DLSS 5 add-on + models ─────────────────────────────────
 
+/// True when `dest` exists with the uncompressed size of `member`. Cheap
+/// "is this the same build" check for files whose names carry no version.
+pub fn same_size<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    member: &str,
+    dest: &Path,
+) -> bool {
+    let local = fs::metadata(dest).map(|m| m.len()).ok();
+    let remote = zip.by_name(member).ok().map(|f| f.size());
+    local.is_some() && local == remote
+}
+
 pub fn install_single_from_zip(zip_path: &Path, member_name: &str, dest: &Path) -> Result<()> {
     let f = fs::File::open(zip_path)?;
     let mut zip = zip::ZipArchive::new(f)
@@ -544,29 +788,69 @@ fn step_dlss5(
 ) -> Result<Vec<String>> {
     // A game with its own DLSS keeps its own nvngx_dlss.dll.
     let dlss_present = st.dlss || st.mode == game::Mode::Native;
+    // Every piece is re-checked: the add-on by comparing its (small) zip, the
+    // two NVIDIA DLLs by the release tag recorded when this tool placed them.
+    // A DLL without a marker is the game's or the user's and is left alone.
     let plan = [
-        ("renodx-dlss5-", game::DLSS5_ADDON, st.dlss5_addon),
-        ("dlssnr-", game::DLSSNR_DLL, st.dlssnr),
-        ("dlss-", game::DLSS_DLL, dlss_present),
+        ("renodx-dlss5-", game::DLSS5_ADDON, false, None),
+        (
+            "dlssnr-",
+            game::DLSSNR_DLL,
+            st.dlssnr,
+            Some(game::DLSSNR_MARKER),
+        ),
+        (
+            "dlss-",
+            game::DLSS_DLL,
+            dlss_present,
+            Some(game::DLSS_MARKER),
+        ),
     ];
-    if plan.iter().all(|(_, _, present)| *present) {
-        progress(100, "DLSS 5 add-on already present");
-        return Ok(vec![]);
-    }
     progress(0, "Looking up DLSS 5 add-on releases");
+    let cdir = st.consumer_dir();
+    fs::create_dir_all(&cdir)?;
     let mut installed = Vec::new();
-    for (prefix, fname, present) in plan {
-        if present {
-            continue;
-        }
+    for (prefix, fname, present, marker) in plan {
         let (tag, url) = rhi_latest(client, prefix)?;
+        if present {
+            match marker.map(|m| fs::read_to_string(cdir.join(m))) {
+                Some(Ok(mine)) if mine.trim() == tag => {
+                    installed.push(format!("{fname} already current ({tag})"));
+                    continue;
+                }
+                Some(Ok(_)) => progress(0, &format!("{fname}: {tag} is out, refreshing")),
+                _ => {
+                    installed.push(format!("{fname} present (not placed by this tool)"));
+                    continue;
+                }
+            }
+        }
         let z = work.join(format!("{tag}.zip"));
         net::download(client, &url, &z, fname, progress)?;
-        install_single_from_zip(&z, fname, &game::join_ci(st.game_dir(), &[fname]))?;
-        if fname == game::DLSS_DLL {
-            fs::write(st.game_dir().join(game::DLSS_MARKER), tag.as_bytes())?;
+        let dest = cdir.join(fname);
+        if fname == game::DLSS5_ADDON && st.dlss5_addon {
+            let f = fs::File::open(&z)?;
+            let mut zip =
+                zip::ZipArchive::new(f).context("DLSS 5 add-on download is not a valid zip")?;
+            let hit = zip
+                .file_names()
+                .find(|n| net::file_name(n).eq_ignore_ascii_case(fname))
+                .map(str::to_owned);
+            if hit.is_some_and(|h| same_size(&mut zip, &h, &dest)) {
+                installed.push(format!("{fname} already current ({tag})"));
+                continue;
+            }
         }
-        installed.push(format!("{fname} ({tag})"));
+        install_single_from_zip(&z, fname, &dest)?;
+        if let Some(m) = marker {
+            fs::write(cdir.join(m), tag.as_bytes())?;
+        }
+        let shown = if st.is32() {
+            format!("{}/{fname} ({tag})", game::HOST_DIR)
+        } else {
+            format!("{fname} ({tag})")
+        };
+        installed.push(shown);
     }
     Ok(installed)
 }
@@ -579,15 +863,32 @@ fn step_dlssnr_only(
     work: &Path,
     progress: Progress,
 ) -> Result<Vec<String>> {
-    if st.dlssnr {
-        progress(100, "nvngx_dlssnr.dll already present");
-        return Ok(vec![]);
-    }
     progress(0, "Looking up DLSS 5 model releases");
     let (tag, url) = rhi_latest(client, "dlssnr-")?;
+    if st.dlssnr {
+        match fs::read_to_string(st.game_dir().join(game::DLSSNR_MARKER)) {
+            Ok(mine) if mine.trim() == tag => {
+                return Ok(vec![format!(
+                    "{} already current ({tag})",
+                    game::DLSSNR_DLL
+                )]);
+            }
+            Ok(_) => progress(
+                0,
+                &format!("{}: {tag} is out, refreshing", game::DLSSNR_DLL),
+            ),
+            Err(_) => {
+                return Ok(vec![format!(
+                    "{} present (not placed by this tool)",
+                    game::DLSSNR_DLL
+                )]);
+            }
+        }
+    }
     let z = work.join(format!("{tag}.zip"));
     net::download(client, &url, &z, game::DLSSNR_DLL, progress)?;
-    install_single_from_zip(&z, game::DLSSNR_DLL, &game::join_ci(st.game_dir(), &[game::DLSSNR_DLL]))?;
+    install_single_from_zip(&z, game::DLSSNR_DLL, &st.game_dir().join(game::DLSSNR_DLL))?;
+    fs::write(st.game_dir().join(game::DLSSNR_MARKER), tag.as_bytes())?;
     Ok(vec![format!("{} ({tag})", game::DLSSNR_DLL)])
 }
 
@@ -632,18 +933,29 @@ fn step_bridge(
     _work: &Path,
     progress: Progress,
 ) -> Result<Vec<String>> {
-    if st.bridge {
-        progress(100, "DX11 bridge already installed");
-        return Ok(vec![]);
+    let dest = st.game_dir().join(game::BRIDGE_ADDON);
+    // The bridge has no version tag in its file name and its releases fix
+    // add-on-specific behaviour (1.4.0: the 2026-08-28 add-on build), so an
+    // existing copy is refreshed whenever the published file differs in size.
+    if st.bridge && dest.is_file() {
+        let local = fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+        match net::remote_len(client, BRIDGE_DOWNLOAD) {
+            Ok(Some(remote)) if remote != local => {
+                progress(0, "dlss5-bridge changed upstream, refreshing");
+            }
+            Ok(_) => {
+                return Ok(vec!["dlss5-bridge.addon64 already current".to_owned()]);
+            }
+            Err(_) => {
+                return Ok(vec![
+                    "dlss5-bridge.addon64 present (could not check for a newer one)".to_owned(),
+                ]);
+            }
+        }
+    } else {
+        progress(0, "Fetching latest dlss5-bridge");
     }
-    progress(0, "Fetching latest dlss5-bridge");
-    net::download(
-        client,
-        BRIDGE_DOWNLOAD,
-        &game::join_ci(st.game_dir(), &[game::BRIDGE_ADDON]),
-        game::BRIDGE_ADDON,
-        progress,
-    )?;
+    net::download(client, BRIDGE_DOWNLOAD, &dest, game::BRIDGE_ADDON, progress)?;
     Ok(vec![game::BRIDGE_ADDON.into()])
 }
 
@@ -673,12 +985,16 @@ pub enum StepState {
 pub fn run_all_with(
     exe: &Path,
     engine: Engine,
+    with_renodx: bool,
     progress: Progress,
     step_cb: &(dyn Fn(usize, usize, &str, StepState, &str) + Sync),
 ) -> Result<Vec<(String, Vec<String>)>> {
     let mut st = game::inspect(exe)?;
     if !st.problems.is_empty() {
         bail!("{}", st.problems.join("\n"));
+    }
+    if engine == Engine::Opti && st.is32() {
+        bail!("The OptiScaler engine is 64-bit only; a 32-bit game takes the Feeder path.");
     }
     if engine == Engine::Opti && st.mode != game::Mode::Feeder {
         // fine: native DLSS present
@@ -692,7 +1008,7 @@ pub fn run_all_with(
     let work = tempfile::Builder::new()
         .prefix("dlss5oneclick-")
         .tempdir()?;
-    let steps = plan_with(&st, engine);
+    let steps = plan_with(&st, engine, with_renodx);
     let n = steps.len();
     let mut results = Vec::new();
     for (i, step) in steps.iter().enumerate() {
@@ -725,6 +1041,7 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
     let include = game::join_ci(&shaders, &["include"]);
     let mut targets: Vec<PathBuf> = vec![
         game::join_ci(d, &[game::DLSS_MARKER]),
+        game::join_ci(d, &[game::DLSSNR_MARKER]),
         game::join_ci(d, &[game::FEEDER_ADDON]),
         game::join_ci(d, &[game::DLSS5_ADDON]),
         game::join_ci(d, &[game::DLSSNR_DLL]),
@@ -751,6 +1068,46 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
     if game::join_ci(d, &[game::DLSS_MARKER]).is_file() {
         targets.push(game::join_ci(d, &[game::DLSS_DLL]));
     }
+    // 32-bit layout: the in-game addon32 and everything in host64\.
+    targets.push(game::join_ci(d, &[game::FEEDER_ADDON32]));
+    let host = game::join_ci(d, &[game::HOST_DIR]);
+    if host.is_dir() {
+        for f in [
+            game::HOST_EXE,
+            game::DLSS5_ADDON,
+            game::DLSSNR_DLL,
+            game::DLSSNR_MARKER,
+            game::DLSS_MARKER,
+        ] {
+            targets.push(host.join(f));
+        }
+        if host.join(game::DLSS_MARKER).is_file() {
+            targets.push(host.join(game::DLSS_DLL));
+        }
+        if host.join(game::RESHADE_MARKER).is_file() {
+            targets.push(host.join(game::RESHADE_PROXY));
+            targets.push(host.join(game::RESHADE_MARKER));
+        }
+        for n in [
+            "ReShade.ini",
+            "ReShade.log",
+            "dlss5-feed-host.log",
+            "ReShadePreset.ini",
+        ] {
+            targets.push(host.join(n));
+        }
+    }
+    if let Ok(name) = fs::read_to_string(d.join(game::RENODX_MANIFEST)) {
+        let name = name.trim();
+        if name.starts_with("renodx-") && !name.contains(['/', '\\']) {
+            targets.push(d.join(name));
+        }
+        targets.push(d.join(game::RENODX_MANIFEST));
+    }
+    if d.join(game::REFRAMEWORK_MARKER).is_file() {
+        targets.push(d.join(game::REFRAMEWORK_DLL));
+        targets.push(d.join(game::REFRAMEWORK_MARKER));
+    }
     let mut removed = Vec::new();
     uninstall_opti(d, &mut removed)?;
     for t in targets {
@@ -766,6 +1123,11 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
     }
     if include.is_dir() && fs::read_dir(&include)?.next().is_none() {
         fs::remove_dir(&include)?;
+    }
+    let host = d.join(game::HOST_DIR);
+    if host.is_dir() && fs::read_dir(&host)?.next().is_none() {
+        fs::remove_dir(&host)?;
+        removed.push(format!("{}/", game::HOST_DIR));
     }
     Ok(removed)
 }
@@ -837,6 +1199,7 @@ pub fn uninstall_all(exe: &Path) -> Result<(Vec<String>, Option<String>)> {
     if game::is_reshade_dll(&proxy) {
         rm(proxy)?;
     }
+    rm(d.join(game::RESHADE_MARKER))?;
     if let Ok(rd) = fs::read_dir(d) {
         for e in rd.flatten() {
             let n = e.file_name().to_string_lossy().to_lowercase();
@@ -926,7 +1289,7 @@ mod tests {
             &[b'M', b'Z', 0, 0, 0, 0, 0, 0],
         );
         assert_eq!(
-            install_reshade_from_setup(&setup, t.path(), 64).unwrap(),
+            install_reshade_from_setup(&setup, t.path(), 64, game::RESHADE_PROXY).unwrap(),
             vec!["dxgi.dll"]
         );
         assert!(game::inspect(&exe).unwrap().reshade);
@@ -981,30 +1344,6 @@ mod tests {
     }
 
     #[test]
-    fn feeder_zip_layout_extracts_by_basename() {
-        // The 0.11+ Feeder release zip: files nested, matched by basename.
-        let t = tempfile::tempdir().unwrap();
-        let z = t.path().join("DLSS5-Feeder-0.11.0-beta.2.zip");
-        write_zip(
-            &z,
-            &[
-                ("dlss5-feed.addon64", b"addon"),
-                ("reshade-shaders/Shaders/DLSS5_Feed.fx", b"fx"),
-                ("host64/dlss5-feed-host64.exe", b"host"),
-            ],
-            &[],
-        );
-        install_single_from_zip(&z, game::FEEDER_ADDON, &t.path().join(game::FEEDER_ADDON))
-            .unwrap();
-        install_single_from_zip(&z, game::FEEDER_FX, &t.path().join(game::FEEDER_FX)).unwrap();
-        assert_eq!(
-            fs::read(t.path().join(game::FEEDER_ADDON)).unwrap(),
-            b"addon"
-        );
-        assert_eq!(fs::read(t.path().join(game::FEEDER_FX)).unwrap(), b"fx");
-    }
-
-    #[test]
     fn single_from_zip_and_uninstall() {
         let t = tempfile::tempdir().unwrap();
         let exe = make_pe(&t.path().join("game.exe"), game::PE_X64);
@@ -1024,16 +1363,148 @@ mod tests {
     }
 
     #[test]
+    fn thirty_two_bit_plan_status_and_uninstall() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe(&t.path().join("game32.exe"), game::PE_X86);
+        let st = game::inspect(&exe).unwrap();
+        assert!(st.is32());
+        assert_eq!(st.mode, game::Mode::Feeder);
+        assert!(st.problems.is_empty(), "{:?}", st.problems);
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false)
+            .iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names[0], "ReShade (add-on build)");
+        assert_eq!(names[1], "64-bit ReShade for the host64 helper");
+        assert_eq!(names.len(), 7);
+        // Lay the 32-bit result out by hand and check status + removal.
+        let d = t.path();
+        let host = d.join(game::HOST_DIR);
+        fs::create_dir_all(d.join("reshade-shaders").join("Shaders")).unwrap();
+        fs::create_dir_all(&host).unwrap();
+        fs::write(d.join(game::FEEDER_ADDON32), b"a32").unwrap();
+        fs::write(
+            d.join("reshade-shaders")
+                .join("Shaders")
+                .join(game::FEEDER_FX),
+            b"fx",
+        )
+        .unwrap();
+        fs::write(host.join(game::HOST_EXE), b"host").unwrap();
+        fs::write(host.join(game::DLSS5_ADDON), b"addon").unwrap();
+        fs::write(host.join(game::DLSSNR_DLL), b"nr").unwrap();
+        fs::write(host.join(game::DLSS_DLL), b"dlss").unwrap();
+        fs::write(host.join(game::DLSS_MARKER), b"dlss-1").unwrap();
+        make_reshade_dll(&host.join(game::RESHADE_PROXY));
+        fs::write(host.join(game::RESHADE_MARKER), b"6.8.0").unwrap();
+        let st = game::inspect(&exe).unwrap();
+        assert!(
+            st.feeder && st.dlss5_addon && st.dlssnr && st.dlss && st.host_exe && st.host_reshade
+        );
+        let removed = uninstall(&exe).unwrap();
+        assert!(removed.iter().any(|r| r.contains(game::HOST_EXE)));
+        assert!(!host.exists(), "host64 folder should be gone: {removed:?}");
+        assert!(!d.join(game::FEEDER_ADDON32).exists());
+    }
+
+    #[test]
+    fn plan_adds_reframework_first_and_renodx_before_config() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe(&t.path().join("re4.exe"), game::PE_X64);
+        fs::write(t.path().join(game::RE_ENGINE_PAK), b"pak").unwrap();
+        let mut st = game::inspect(&exe).unwrap();
+        assert!(st.re_engine && !st.reframework);
+        st.mode = game::Mode::Native;
+        st.api = game::Api::Dx12;
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, true)
+            .iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "REFramework (RE Engine needs it before ReShade)",
+                "ReShade (add-on build)",
+                "DLSS 5 add-on + models",
+                "RenoDX HDR mod for this game",
+                "ReShade config"
+            ]
+        );
+        let names: Vec<&str> = plan_with(&st, Engine::Opti, true)
+            .iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "REFramework (RE Engine needs it before ReShade)",
+                "OptiScaler + DLSS Neural Rendering",
+                "DLSS 5 model (nvngx_dlssnr.dll)",
+                "ReShade loaded by OptiScaler (ReShade64.dll)",
+                "RenoDX HDR mod for this game"
+            ]
+        );
+    }
+
+    #[test]
+    fn set_load_reshade_rewrites_or_appends() {
+        let ini = "[Plugins]\r\n; doc\r\nLoadReshade=auto\r\nOther=1\r\n";
+        assert_eq!(
+            set_load_reshade(ini).unwrap(),
+            "[Plugins]\r\n; doc\r\nLoadReshade=true\r\nOther=1\r\n"
+        );
+        assert!(set_load_reshade("LoadReshade=true\n").is_none());
+        assert_eq!(
+            set_load_reshade("[Upscalers]\nDx12Upscaler=auto\n").unwrap(),
+            "[Upscalers]\nDx12Upscaler=auto\n\n[Plugins]\nLoadReshade=true\n"
+        );
+    }
+
+    #[test]
+    fn uninstall_removes_recorded_renodx_mod_and_reframework_only() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe(&t.path().join("game.exe"), game::PE_X64);
+        fs::write(t.path().join("renodx-cp2077.addon64"), b"ours").unwrap();
+        fs::write(t.path().join("renodx-ff7rebirth.addon64"), b"theirs").unwrap();
+        fs::write(
+            t.path().join(game::RENODX_MANIFEST),
+            "renodx-cp2077.addon64\n",
+        )
+        .unwrap();
+        fs::write(t.path().join(game::REFRAMEWORK_DLL), b"ref").unwrap();
+        let st = game::inspect(&exe).unwrap();
+        assert_eq!(st.renodx_mod.as_deref(), Some("renodx-cp2077.addon64"));
+        assert_eq!(
+            st.foreign_renodx,
+            vec!["renodx-ff7rebirth.addon64".to_string()]
+        );
+        let removed = uninstall(&exe).unwrap();
+        assert!(removed.contains(&"renodx-cp2077.addon64".to_string()));
+        assert!(t.path().join("renodx-ff7rebirth.addon64").is_file());
+        // dinput8.dll without our marker is somebody else's REFramework: kept.
+        assert!(t.path().join(game::REFRAMEWORK_DLL).is_file());
+        fs::write(t.path().join(game::REFRAMEWORK_MARKER), b"").unwrap();
+        let removed = uninstall(&exe).unwrap();
+        assert!(removed.contains(&game::REFRAMEWORK_DLL.to_string()));
+    }
+
+    #[test]
     fn plan_follows_mode_and_api() {
         let t = tempfile::tempdir().unwrap();
         let exe = make_pe(&t.path().join("game.exe"), game::PE_X64);
         let mut st = game::inspect(&exe).unwrap();
-        let names: Vec<&str> = plan(&st).iter().map(|s| s.name).collect();
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false)
+            .iter()
+            .map(|s| s.name)
+            .collect();
         assert_eq!(names.len(), 6);
         assert_eq!(names[2], "DLSS5-Feeder");
         st.mode = game::Mode::Native;
         st.api = game::Api::Dx12;
-        let names: Vec<&str> = plan(&st).iter().map(|s| s.name).collect();
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false)
+            .iter()
+            .map(|s| s.name)
+            .collect();
         assert_eq!(
             names,
             [
@@ -1043,7 +1514,10 @@ mod tests {
             ]
         );
         st.api = game::Api::Dx11;
-        let names: Vec<&str> = plan(&st).iter().map(|s| s.name).collect();
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false)
+            .iter()
+            .map(|s| s.name)
+            .collect();
         assert_eq!(names[2], "DLSS 5 DX11 bridge");
     }
 
@@ -1096,7 +1570,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let exe = make_pe(&t.path().join("game.exe"), game::PE_X64);
         let st = game::inspect(&exe).unwrap();
-        let names: Vec<&str> = plan_with(&st, Engine::Opti)
+        let names: Vec<&str> = plan_with(&st, Engine::Opti, false)
             .iter()
             .map(|s| s.name)
             .collect();
@@ -1108,7 +1582,8 @@ mod tests {
             ]
         );
         // Feeder-mode game + Opti engine is refused before any network
-        let err = run_all_with(&exe, Engine::Opti, &|_, _| {}, &|_, _, _, _, _| {}).unwrap_err();
+        let err =
+            run_all_with(&exe, Engine::Opti, false, &|_, _| {}, &|_, _, _, _, _| {}).unwrap_err();
         assert!(err.to_string().contains("own DLSS"));
     }
 
@@ -1134,10 +1609,11 @@ mod tests {
     }
 
     #[test]
-    fn run_all_refuses_32bit_before_network() {
+    fn run_all_refuses_opti_on_32bit_before_network() {
         let t = tempfile::tempdir().unwrap();
         let exe = make_pe(&t.path().join("game.exe"), game::PE_X86);
-        let err = run_all_with(&exe, Engine::ReShade, &|_, _| {}, &|_, _, _, _, _| {}).unwrap_err();
-        assert!(err.to_string().contains("32-bit"));
+        let err =
+            run_all_with(&exe, Engine::Opti, false, &|_, _| {}, &|_, _, _, _, _| {}).unwrap_err();
+        assert!(err.to_string().contains("64-bit only"));
     }
 }

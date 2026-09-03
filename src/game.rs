@@ -10,6 +10,12 @@ pub const PE_X64: u16 = 0x8664;
 pub const PE_X86: u16 = 0x014C;
 
 pub const FEEDER_ADDON: &str = "dlss5-feed.addon64";
+/// 32-bit games: the in-game half of the Feeder, and the 64-bit helper folder
+/// beside the exe that holds everything a 32-bit process cannot load
+/// (a 64-bit ReShade, the DLSS 5 add-on, the two NVIDIA DLLs, the helper exe).
+pub const FEEDER_ADDON32: &str = "dlss5-feed.addon32";
+pub const HOST_DIR: &str = "host64";
+pub const HOST_EXE: &str = "dlss5-feed-host64.exe";
 pub const FEEDER_FX: &str = "DLSS5_Feed.fx";
 pub const DLSS5_ADDON: &str = "renodx-dlss5.addon64";
 pub const DLSSNR_DLL: &str = "nvngx_dlssnr.dll";
@@ -21,11 +27,22 @@ pub const BRIDGE_ADDON: &str = "dlss5-bridge.addon64";
 pub const OPTI_MANIFEST: &str = ".dlss5oneclick-optiscaler-manifest";
 /// Sidecar written next to an `nvngx_dlss.dll` this tool placed, so it is never mistaken for the game's own.
 pub const DLSS_MARKER: &str = "nvngx_dlss.dll.dlss5oneclick";
+/// Same idea for the neural model and for ReShade: the release tag / version this
+/// tool placed, so Install can tell "ours and stale" from "the user's own".
+pub const DLSSNR_MARKER: &str = "nvngx_dlssnr.dll.dlss5oneclick";
+pub const RESHADE_MARKER: &str = "dxgi.dll.dlss5oneclick";
 pub const RESHADE_PROXY: &str = "dxgi.dll";
 /// Shader headers the official installer fetches from crosire/reshade-shaders (branch `slim`).
 /// Not inside the setup exe. DLSS5_Feed.fx and every lumenite_*.fx include ReShade.fxh;
 /// DLSS5_Feed.fx also includes DrawText.fxh; ReShadeUI.fxh is the standard companion.
 pub const RESHADE_HEADERS: [&str; 3] = ["ReShade.fxh", "ReShadeUI.fxh", "DrawText.fxh"];
+/// Name of the RenoDX game mod this tool placed (one line), so Remove takes only that one.
+pub const RENODX_MANIFEST: &str = ".dlss5oneclick-renodx";
+/// REFramework (praydog) loads as dinput8.dll; RE Engine games crash under ReShade without it.
+pub const REFRAMEWORK_DLL: &str = "dinput8.dll";
+pub const REFRAMEWORK_MARKER: &str = ".dlss5oneclick-reframework";
+/// Every RE Engine game keeps its base archive under this name next to the exe.
+pub const RE_ENGINE_PAK: &str = "re_chunk_000.pak";
 pub const RESHADE_INI: &str = "ReShade.ini";
 pub const RESHADE_PRESET: &str = "ReShadePreset.ini";
 
@@ -210,6 +227,14 @@ pub fn detect_api(exe: &Path) -> Api {
         }
     }
     let api = classify(&pe_imports(exe));
+    let agility_sdk = exe
+        .parent()
+        .is_some_and(|d| d.join("D3D12").join("D3D12Core.dll").is_file());
+    if api == Api::Dx12 || (api == Api::Dx11 && agility_sdk) {
+        // The DirectX 12 Agility SDK redist ships only with D3D12 renderers;
+        // RE Engine exes import d3d11.dll statically and create D3D12 at runtime.
+        return Api::Dx12;
+    }
     if api != Api::Unknown {
         return api;
     }
@@ -252,6 +277,19 @@ pub fn detect_api(exe: &Path) -> Api {
         Api::Dx11
     } else {
         Api::Unknown
+    }
+}
+
+/// dgVoodoo2 next to the exe: its own config/control panel, or its name inside
+/// the wrapper DLL. It translates D3D9 to D3D11, which the Feeder supports.
+pub fn is_dgvoodoo(game_dir: &Path) -> bool {
+    if game_dir.join("dgVoodoo.conf").is_file() || game_dir.join("dgVoodooCpl.exe").is_file() {
+        return true;
+    }
+    let dll = game_dir.join("d3d9.dll");
+    match fs::read(&dll) {
+        Ok(b) => b.windows(8).any(|w| w.eq_ignore_ascii_case(b"dgVoodoo")),
+        Err(_) => false,
     }
 }
 
@@ -353,7 +391,27 @@ pub fn game_ships_dlss(game_dir: &Path) -> bool {
         }
         false
     }
-    walk(game_dir, 4)
+    if walk(game_dir, 4) {
+        return true;
+    }
+    // Unreal: exe in <Project>/Binaries/Win64, DLSS in
+    // <Project>/Plugins/NVIDIA/DLSS/Binaries/ThirdParty/Win64 (or Engine/Plugins/...).
+    let unreal_root = game_dir
+        .parent()
+        .filter(|b| {
+            b.file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("binaries"))
+        })
+        .and_then(Path::parent);
+    match unreal_root {
+        Some(proj) => {
+            walk(&proj.join("Plugins"), 7)
+                || proj
+                    .parent()
+                    .is_some_and(|root| walk(&root.join("Engine").join("Plugins"), 7))
+        }
+        None => false,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -372,12 +430,73 @@ pub struct GameStatus {
     pub dlss5_addon: bool,
     pub dlssnr: bool,
     pub dlss: bool,
+    /// What the folder scan said, before any override.
+    pub mode_detected: Mode,
+    /// 32-bit only: `host64\dlss5-feed-host64.exe` and a 64-bit ReShade beside it.
+    pub host_exe: bool,
+    pub host_reshade: bool,
+    /// Capcom RE Engine (needs REFramework before ReShade will run).
+    pub re_engine: bool,
+    pub reframework: bool,
+    /// RenoDX game mod this tool installed, from its manifest.
+    pub renodx_mod: Option<String>,
+    /// Other RenoDX game mods found in the folder (not ours, not the DLSS 5 add-on).
+    pub foreign_renodx: Vec<String>,
+    /// Anti-cheat found (files or exe name), whether or not the refusal is overridden.
+    pub anticheat: Option<&'static str>,
     pub problems: Vec<String>,
+}
+
+pub const IGNORE_ANTICHEAT_ENV: &str = "DLSS5ONECLICK_IGNORE_ANTICHEAT";
+/// `feeder` or `native`: override the DLSS detection (a stray `nvngx_dlss.dll`
+/// makes a game without DLSS look native; some games load DLSS from elsewhere).
+pub const MODE_ENV: &str = "DLSS5ONECLICK_MODE";
+
+pub fn mode_override() -> Option<Mode> {
+    match std::env::var(MODE_ENV).ok()?.to_ascii_lowercase().as_str() {
+        "feeder" | "nodlss" | "no-dlss" => Some(Mode::Feeder),
+        "native" | "dlss" => Some(Mode::Native),
+        _ => None,
+    }
+}
+
+/// GUI dropdown / `--mode=`: same switch as the environment variable.
+pub fn set_mode_override(m: Option<Mode>) {
+    match m {
+        Some(Mode::Feeder) => std::env::set_var(MODE_ENV, "feeder"),
+        Some(Mode::Native) => std::env::set_var(MODE_ENV, "native"),
+        None => std::env::remove_var(MODE_ENV),
+    }
+}
+
+pub fn ignore_anticheat() -> bool {
+    std::env::var_os(IGNORE_ANTICHEAT_ENV).is_some()
+}
+
+/// GUI checkbox / `--ignore-anticheat`: same switch as the environment variable.
+pub fn set_ignore_anticheat(on: bool) {
+    if on {
+        std::env::set_var(IGNORE_ANTICHEAT_ENV, "1");
+    } else {
+        std::env::remove_var(IGNORE_ANTICHEAT_ENV);
+    }
 }
 
 impl GameStatus {
     pub fn game_dir(&self) -> &Path {
         self.exe.parent().expect("exe has a parent")
+    }
+    pub fn is32(&self) -> bool {
+        self.bitness == 32
+    }
+    /// Where the DLSS 5 add-on and the NVIDIA DLLs live: beside the exe for a
+    /// 64-bit game, in `host64\` for a 32-bit one.
+    pub fn consumer_dir(&self) -> PathBuf {
+        if self.is32() {
+            self.game_dir().join(HOST_DIR)
+        } else {
+            self.game_dir().to_path_buf()
+        }
     }
     pub fn needs_bridge(&self) -> bool {
         self.mode == Mode::Native && self.api == Api::Dx11
@@ -392,6 +511,7 @@ impl GameStatus {
                     && self.dlss5_addon
                     && self.dlssnr
                     && self.dlss
+                    && (!self.is32() || (self.host_exe && self.host_reshade))
             }
             Mode::Native => {
                 (self.opti && self.dlssnr)
@@ -413,8 +533,9 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     let shaders = join_ci(d, &["reshade-shaders", "Shaders"]);
     let textures = join_ci(d, &["reshade-shaders", "Textures"]);
     let mut problems = Vec::new();
-    if let Some(ac) = detect_anticheat(d).or_else(|| known_anticheat_exe(exe)) {
-        if std::env::var_os("DLSS5ONECLICK_IGNORE_ANTICHEAT").is_none() {
+    let anticheat = detect_anticheat(d).or_else(|| known_anticheat_exe(exe));
+    if let Some(ac) = anticheat {
+        if !ignore_anticheat() {
             problems.push(format!(
                 "{ac} anti-cheat found in this game. ReShade add-on injection is what it detects: kick at best, ban at worst. Refused."
             ));
@@ -431,20 +552,47 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
             ));
         }
     }
-    if bitness != 64 {
-        problems.push("32-bit game: DLSS5-Feeder needs the host64 setup, which this tool does not automate yet.".into());
-    }
-    if file_ci(d, "d3d9.dll") && !file_ci(d, RESHADE_PROXY) {
+    // A d3d9.dll is usually a wrapper this tool cannot work behind — except
+    // dgVoodoo2, which is exactly how a D3D9 game reaches D3D11 and then the
+    // Feeder (verified working on Dead or Alive 5 Last Round, #17).
+    if file_ci(d, "d3d9.dll") && !file_ci(d, RESHADE_PROXY) && !is_dgvoodoo(d) {
         problems
             .push("A d3d9.dll proxy is present; DirectX 9 games are not supported here.".into());
     }
-    let feeder = file_ci(d, FEEDER_ADDON) && file_ci(&shaders, FEEDER_FX);
-    let mode = if game_ships_dlss(d) {
+    let api = detect_api(exe);
+    let is32 = bitness == 32;
+    if is32 && api == Api::Dx12 {
+        problems.push(
+            "32-bit game on Direct3D 12: DLSS5-Feeder's 32-bit add-on supports Direct3D 11 only."
+                .into(),
+        );
+    }
+    // 32-bit: NGX is 64-bit only, so the game can never carry its own DLSS;
+    // everything 64-bit goes to host64\ and the Feeder's addon32 sits in-game.
+    let cdir = if is32 {
+        join_ci(d, &[HOST_DIR])
+    } else {
+        d.to_path_buf()
+    };
+    let feeder = if is32 {
+        file_ci(d, FEEDER_ADDON32) && file_ci(&shaders, FEEDER_FX)
+    } else {
+        file_ci(d, FEEDER_ADDON) && file_ci(&shaders, FEEDER_FX)
+    };
+    let mode_detected = if !is32 && game_ships_dlss(d) {
         Mode::Native
     } else {
         Mode::Feeder
     };
-    let api = detect_api(exe);
+    let mode = if is32 {
+        Mode::Feeder
+    } else {
+        mode_override().unwrap_or(mode_detected)
+    };
+    let renodx_mod = fs::read_to_string(d.join(RENODX_MANIFEST))
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|n| !n.is_empty() && d.join(n).is_file());
     Ok(GameStatus {
         mode,
         api,
@@ -457,15 +605,23 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         headers: RESHADE_HEADERS.iter().all(|h| file_ci(&shaders, h)),
         feeder,
         lumenite: file_ci(&shaders, LUMENITE_KERNEL_FX) && file_ci(&textures, LUMENITE_BLUENOISE),
-        dlss5_addon: file_ci(d, DLSS5_ADDON),
-        dlssnr: file_ci(d, DLSSNR_DLL),
-        dlss: file_ci(d, DLSS_DLL),
+        dlss5_addon: file_ci(&cdir, DLSS5_ADDON),
+        dlssnr: file_ci(&cdir, DLSSNR_DLL),
+        dlss: file_ci(&cdir, DLSS_DLL),
+        mode_detected,
+        host_exe: is32 && file_ci(&cdir, HOST_EXE),
+        host_reshade: is32 && is_reshade_dll(&join_ci(&cdir, &[RESHADE_PROXY])),
+        re_engine: file_ci(d, RE_ENGINE_PAK),
+        reframework: file_ci(d, REFRAMEWORK_DLL),
+        renodx_mod: renodx_mod.clone(),
+        foreign_renodx: crate::renodx::foreign_mods(d, renodx_mod.as_deref()),
+        anticheat,
         problems,
     })
 }
 
 /// Helper/launcher executables that are never the game.
-const NOT_GAME: [&str; 14] = [
+const NOT_GAME: [&str; 15] = [
     "unitycrashhandler",
     "unrealcefsubprocess",
     "crashreportclient",
@@ -480,6 +636,7 @@ const NOT_GAME: [&str; 14] = [
     "installer",
     "uninstall",
     "unins",
+    "setup",
 ];
 
 fn is_helper_name(stem_lower: &str) -> bool {
@@ -497,8 +654,8 @@ fn norm(s: &str) -> String {
 ///
 /// Looks in the folder itself and in any `*/Binaries/Win64/` (Unreal layout,
 /// where ReShade must sit next to the `-Shipping.exe`, not the root launcher).
-/// Keeps 64-bit PEs only, drops known helpers, then ranks: name matches the
-/// folder name > Unreal shipping exe > larger file.
+/// Keeps 64-bit PEs only, drops known helpers, then ranks: Unreal shipping
+/// exe > name matches the folder name > larger file.
 pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = Vec::new();
     let mut push_dir = |d: &Path| {
@@ -530,6 +687,7 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
                 | "_commonredist"
                 | "commonredist"
                 | "redist"
+                | "redistributables"
         ) || n.ends_with("_data")
     };
     if let Ok(rd1) = fs::read_dir(dir) {
@@ -565,13 +723,15 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
             let size = fs::metadata(&p).map(|m| m.len()).unwrap_or(0) as i64;
             let mut score: i64 = 0;
             let n = norm(&stem);
+            // An Unreal `-Shipping.exe` is always the real game; the root exe
+            // named after the folder (Expedition33_Steam.exe, 700 KB) is a bootstrapper.
+            if stem.ends_with("-shipping") {
+                score += 2_000_000_000;
+            }
             if !folder.is_empty()
                 && (n == folder || n.starts_with(&folder) || folder.starts_with(&n))
             {
                 score += 1_000_000_000;
-            }
-            if stem.ends_with("-shipping") {
-                score += 500_000_000;
             }
             score += size.min(400_000_000);
             Some((score, p))
@@ -710,7 +870,8 @@ mod tests {
         assert!(st.problems.is_empty());
 
         let st = inspect(&make_pe(&t.path().join("g32.exe"), PE_X86)).unwrap();
-        assert!(st.problems.iter().any(|p| p.contains("32-bit")));
+        assert!(st.is32() && st.mode == Mode::Feeder);
+        assert!(!st.problems.iter().any(|p| p.contains("32-bit")));
     }
 
     #[test]
@@ -726,6 +887,34 @@ mod tests {
         let (exe, all) = resolve_target(&d).unwrap();
         assert_eq!(exe, d.join("Fell & Sell.exe"));
         assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn find_game_exes_skips_redistributables_and_setup_exes() {
+        // Red Dead Redemption 2: RDR2.exe in the root, a much larger
+        // Social-Club-Setup.exe under Redistributables\ (#22).
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("Red Dead Redemption 2");
+        fs::create_dir_all(d.join("Redistributables").join("SocialClub")).unwrap();
+        let game = make_pe(&d.join("RDR2.exe"), PE_X64);
+        let big = make_pe(
+            &d.join("Redistributables")
+                .join("SocialClub")
+                .join("Social-Club-Setup.exe"),
+            PE_X64,
+        );
+        fs::write(&big, [b"MZ".as_slice(), &[0u8; 4_000_000]].concat()).unwrap();
+        make_pe(
+            &d.join("Redistributables")
+                .join("SocialClub")
+                .join("Social-Club-Setup.exe"),
+            PE_X64,
+        );
+        let found = find_game_exes(&d);
+        assert_eq!(found.first(), Some(&game));
+        assert!(!found
+            .iter()
+            .any(|p| p.to_string_lossy().contains("Redistributables")));
     }
 
     #[test]
@@ -780,6 +969,30 @@ mod tests {
     }
 
     #[test]
+    fn dgvoodoo_d3d9_is_allowed_other_d3d9_is_not() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe(&d.join("game.exe"), PE_X86);
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+        fs::write(d.join("d3d9.dll"), b"MZ some other wrapper").unwrap();
+        assert!(inspect(&exe)
+            .unwrap()
+            .problems
+            .iter()
+            .any(|p| p.contains("d3d9.dll proxy")));
+        fs::write(d.join("dgVoodoo.conf"), b"[General]").unwrap();
+        assert!(is_dgvoodoo(d));
+        assert!(!inspect(&exe)
+            .unwrap()
+            .problems
+            .iter()
+            .any(|p| p.contains("d3d9.dll proxy")));
+        fs::remove_file(d.join("dgVoodoo.conf")).unwrap();
+        fs::write(d.join("d3d9.dll"), b"MZ...dgVoodoo2 wrapper...").unwrap();
+        assert!(is_dgvoodoo(d));
+    }
+
+    #[test]
     fn anticheat_detected_and_refused() {
         let t = tempfile::tempdir().unwrap();
         let d = t.path();
@@ -791,6 +1004,7 @@ mod tests {
         std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
         let st = inspect(&exe).unwrap();
         assert!(st.problems.iter().any(|p| p.contains("GameGuard")));
+        assert_eq!(st.anticheat, Some("GameGuard"));
         fs::remove_dir_all(d.join("tools")).unwrap();
         fs::create_dir_all(
             d.join("Game")

@@ -14,7 +14,6 @@ pub const HEADER: Color32 = Color32::from_rgb(0x12, 0x15, 0x1a);
 pub const TILE: Color32 = Color32::from_rgb(0x1a, 0x1e, 0x25);
 pub const BORDER: Color32 = Color32::from_rgb(0x26, 0x2a, 0x33);
 pub const BORDER_STRONG: Color32 = Color32::from_rgb(0x2a, 0x2f, 0x39);
-pub const BORDER_DASH: Color32 = Color32::from_rgb(0x34, 0x3a, 0x46);
 pub const TEXT: Color32 = Color32::from_rgb(0xe8, 0xe9, 0xec);
 pub const TEXT_SOFT: Color32 = Color32::from_rgb(0xc9, 0xcd, 0xd4);
 pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x7d, 0x85, 0x92);

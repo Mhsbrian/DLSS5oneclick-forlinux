@@ -1,6 +1,6 @@
 [package]
 name = "dlss5oneclick"
-version = "0.8.0"
+version = "0.10.2"
 edition = "2021"
 description = "One-click DLSS 5 neural rendering setup for DX11/DX12 games, on Linux with Steam and Proton"
 license = "MIT"
@@ -21,11 +21,11 @@ regex = "1"
 anyhow = "1"
 tempfile = "3"
 raw-window-handle = "0.6"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.61"
-features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging"]
+features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Console", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"]
 
 [profile.release]
 opt-level = "z"

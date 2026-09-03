@@ -13,23 +13,25 @@ Re-running only fetches what is missing. Since 0.5.1 downloads no longer go thro
 
 [b]New in 0.5.0 — engine choice for games with native DLSS:[/b] besides the default ReShade + RenoDX add-on, you can pick [url=https://github.com/Dagherbou/OptiScaler_DLSSNR]Dagherbou's OptiScaler_DLSSNR[/url] (OptiScaler with a built-in Neural Rendering pass). The tool extracts it as dxgi.dll, adds the DLSS 5 model, and Remove takes it out via a manifest. In game: [b]Insert[/b] opens the OptiScaler overlay, enable Neural Rendering there. The two engines cannot share one game.
 
+[b]New in 0.8.0 — RenoDX HDR mods and RE Engine games:[/b] when the tool recognises the game (Steam app id, else folder/exe name, matched against the RenoDX games index and wiki) a [b]RenoDX HDR mod[/b] checkbox appears with the mod's status and the wiki's note; tick it and the game's renodx-<game>.addon64 is installed beside the DLSS 5 add-on (they coexist: different add-on names, different ReShade.ini sections — verified in Expedition 33 and Dragon's Dogma 2). One RenoDX game mod per game; the tool refuses if another is already there and Remove only takes the one it placed. Works with either engine: on OptiScaler the ReShade DLL goes in as ReShade64.dll with LoadReshade=true in OptiScaler.ini (OptiScaler's documented way to run ReShade add-ons beside it; untested in-game by the author). Turn Windows AutoHDR / RTX HDR off with these mods. RE Engine games (Resident Evil, DMC5, Monster Hunter, SF6, Dragon's Dogma 2, Pragmata) now get praydog's REFramework dinput8.dll first, without which ReShade crashes them. Unreal games with a bootstrapper exe in the root (Expedition 33) now resolve to the -Shipping exe and find the DLSS the game keeps under Plugins.
+
 [b]Remove[/b] takes out what the tool added (ReShade stays); [b]Remove incl. ReShade[/b] also deletes dxgi.dll, the ReShade ini files and reshade-shaders — refused if it finds add-ons or shaders the tool did not install. The game's own nvngx_dlss.dll is never touched.
 
 [size=4][b]Use[/b][/size]
 [list=1]
 [*]Run dlss5oneclick.exe
-[*][b]Game folder…[/b] → pick the game's install folder
+[*][b]Games[/b] page: every installed Steam / Epic / GOG / Xbox game, newest first, with its poster, DirectX chip and DLSS status — click one. Or [b]Add a folder[/b] → pick any install folder
 [*][b]Install DLSS 5[/b]
 [*]In game: [b]Home[/b] opens ReShade → [b]DLSS 5 Neural Rendering[/b] panel → enable. [b]F6[/b] toggles neural rendering, [b]F5[/b] takes its screenshot. Keep the game's MSAA/SSAA off.
 [/list]
-Command line: [font=Courier New]dlss5oneclick.exe "C:\Games\Foo"[/font] · [font=Courier New]--check[/font] shows what it detected without installing · [font=Courier New]--remove[/font] uninstalls · [font=Courier New]--remove-all[/font] also removes ReShade · [font=Courier New]--engine=opti[/font] picks the OptiScaler engine.
+Command line: [font=Courier New]dlss5oneclick.exe "C:\Games\Foo"[/font] · [font=Courier New]--check[/font] shows what it detected without installing · [font=Courier New]--remove[/font] uninstalls · [font=Courier New]--remove-all[/font] also removes ReShade · [font=Courier New]--engine=opti[/font] picks the OptiScaler engine · [font=Courier New]--renodx[/font] also installs the game's RenoDX HDR mod · [font=Courier New]--mode=feeder|native[/font] overrides the DLSS detection (also a dropdown next to the game line).
 
 [size=4][b]Not handled[/b][/size]
 [list]
-[*]32-bit games (the Feeder's host64 setup is not automated — the tool refuses rather than half-install)
+[*]32-bit games: handled since 0.10.0 as a beta (Feeder path, D3D11 only) — addon32 + 32-bit ReShade beside the exe, a host64 folder with the 64-bit helper, ReShade, add-on and models. File layout verified, in-game reports wanted
 [*]DirectX 9 and Vulkan games — the Feeder and NIGos' bridge do support them by hand, this tool does not automate those setups yet
 [*]Non-NVIDIA and GTX/GT cards — refused up front: the model needs tensor cores and NGX. RTX 50 runs it at full speed, RTX 40 with a patched build at moderate cost, RTX 20/30 through an FP16 path at heavy cost (the status line shows your tier)
-[*]Online games — refused when Easy Anti-Cheat, BattlEye or GameGuard files are found in the install (Helldivers 2 etc.): ReShade add-on injection is what they flag, kick at best, ban at worst
+[*]Online games — refused when Easy Anti-Cheat, BattlEye or GameGuard files are found in the install (Helldivers 2 etc.): ReShade add-on injection is what they flag, kick at best, ban at worst. Games that let you switch the anti-cheat off for offline play (GTA V: BattlEye unticked in the Rockstar Games Launcher) get a checkbox under the warning to install anyway, at your own risk
 [*]API detection can come back unknown on monolithic Unreal exes; DX12 is then assumed (shown in the status line) — a DX11 game in that state would miss the bridge
 [/list]
 

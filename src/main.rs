@@ -5,9 +5,12 @@ mod game;
 mod gpu;
 mod gui;
 mod installer;
+mod library;
 mod logo;
 mod net;
+mod ngx;
 mod platform;
+mod renodx;
 mod reshade_ini;
 mod theme;
 mod update;
@@ -16,8 +19,9 @@ use std::io::Write;
 use std::path::PathBuf;
 
 /// `dlss5oneclick <GAME.exe | game folder | game name | appid> [--remove | --remove-all |
-/// --check | --diagnose | --engine=opti | --launch-options | --revert-launch-options]
-/// | --list-games | --update` runs headless; no args opens the GUI.
+/// --check | --diagnose | --engine=opti | --renodx | --ignore-anticheat | --mode=feeder|native |
+/// --launch-options | --revert-launch-options] | --list-games | --update` runs headless;
+/// no args opens the GUI.
 fn main() {
     update::cleanup_old();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -50,6 +54,32 @@ error: {e:#}"
         };
         std::process::exit(code);
     }
+    if args.iter().any(|a| a == "--posters") {
+        // Support/diagnostic: decode every poster the scan resolved and report failures.
+        attach_parent_console();
+        let client = net::client().expect("http client");
+        let (mut ok, mut bad) = (0usize, 0usize);
+        for g in library::scan() {
+            match library::poster_rgba(&client, &g.poster) {
+                Some(img) => {
+                    ok += 1;
+                    println!(
+                        "ok   {}x{} {} [{:?}]",
+                        img.width(),
+                        img.height(),
+                        g.title,
+                        g.poster
+                    );
+                }
+                None => {
+                    bad += 1;
+                    println!("FAIL {} [{:?}]", g.title, g.poster);
+                }
+            }
+        }
+        println!("{ok} decoded, {bad} failed");
+        std::process::exit(0);
+    }
     if args.iter().any(|a| a == "--update") {
         attach_parent_console();
         std::process::exit(cli_update());
@@ -57,6 +87,16 @@ error: {e:#}"
     if args.iter().any(|a| a == "--list-games") {
         attach_parent_console();
         std::process::exit(cli_list_games());
+    }
+    if args.iter().any(|a| a == "--ignore-anticheat") {
+        game::set_ignore_anticheat(true);
+    }
+    if let Some(m) = args.iter().find_map(|a| a.strip_prefix("--mode=")) {
+        std::env::set_var(game::MODE_ENV, m);
+        if game::mode_override().is_none() {
+            eprintln!("error: --mode must be feeder or native");
+            std::process::exit(1);
+        }
     }
     if let Some(first) = args.first().filter(|a| !a.starts_with('-')) {
         attach_parent_console();
@@ -83,6 +123,7 @@ error: {e:#}"
             } else {
                 installer::Engine::ReShade
             },
+            args.iter().any(|a| a == "--renodx"),
             if args.iter().any(|a| a == "--revert-launch-options") {
                 Some(true)
             } else if args.iter().any(|a| a == "--launch-options") {
@@ -94,7 +135,35 @@ error: {e:#}"
         std::process::exit(code);
     }
     if let Err(e) = gui::run() {
-        eprintln!("gui error: {e}");
+        // The release build has no console: say it in a box and leave a file (#23).
+        let msg = format!("{e:#}");
+        eprintln!("gui error: {msg}");
+        let log = std::env::var_os("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("dlss5oneclick")
+            .join("gui-error.txt");
+        if let Some(p) = log.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
+        let _ = std::fs::write(
+            &log,
+            format!(
+                "DLSS5oneclick {}
+{msg}
+",
+                env!("CARGO_PKG_VERSION")
+            ),
+        );
+        report_gui_error(&format!(
+            "DLSS5oneclick could not open its window.
+
+{msg}
+
+Written to {}
+Attach that file to a GitHub issue.",
+            log.display()
+        ));
         std::process::exit(2);
     }
 }
@@ -134,17 +203,31 @@ fn cli_update() -> i32 {
 }
 
 fn cli_list_games() -> i32 {
+    // Linux launchers first (they carry the ids the CLI accepts as targets);
+    // where that is empty (Windows), the store scan the GUI uses.
     let games = platform::scan_all();
-    if games.is_empty() {
-        println!("No games found through Steam, Heroic or Lutris.");
+    if !games.is_empty() {
+        for g in &games {
+            println!(
+                "[{:<6}] {:<40} ({})  {}",
+                g.launcher.label(),
+                g.name,
+                g.id,
+                g.dir.display()
+            );
+        }
         return 0;
     }
-    for g in &games {
+    let store = library::scan();
+    if store.is_empty() {
+        println!("No installed games found.");
+        return 0;
+    }
+    for g in &store {
         println!(
-            "[{:<6}] {:<40} ({})  {}",
-            g.launcher.label(),
-            g.name,
-            g.id,
+            "[{:<11}] {:<40} {}",
+            g.store.label(),
+            g.title.chars().take(40).collect::<String>(),
             g.dir.display()
         );
     }
@@ -253,6 +336,7 @@ fn cli(
     check: bool,
     diagnose_only: bool,
     engine: installer::Engine,
+    with_renodx: bool,
     launch_only: Option<bool>,
 ) -> i32 {
     let (exe, candidates) = match game::resolve_target(&target) {
@@ -330,8 +414,45 @@ fn cli(
                 for p in &st.problems {
                     println!("  ! {p}");
                 }
-                let names: Vec<&str> = installer::plan(&st).iter().map(|s| s.name).collect();
+                let names: Vec<&str> = installer::plan_with(&st, engine, with_renodx)
+                    .iter()
+                    .map(|s| s.name)
+                    .collect();
                 println!("  plan: {}", names.join(" -> "));
+                if st.re_engine {
+                    println!(
+                        "  RE Engine game: REFramework (dinput8.dll) {}",
+                        if st.reframework {
+                            "present"
+                        } else {
+                            "missing, will be installed"
+                        }
+                    );
+                }
+                if let Some(m) = &st.renodx_mod {
+                    println!("  RenoDX mod installed: {m}");
+                }
+                if !st.foreign_renodx.is_empty() {
+                    println!(
+                        "  RenoDX mod present (not installed by this tool): {}",
+                        st.foreign_renodx.join(", ")
+                    );
+                }
+                match net::client().and_then(|c| renodx::lookup(&c, &exe)) {
+                    Ok(Some(m)) => println!(
+                        "  RenoDX HDR mod available: {} -> {} ({}){}",
+                        m.title,
+                        m.file,
+                        m.status_label(),
+                        if m.note.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" | {}", m.note)
+                        }
+                    ),
+                    Ok(None) => println!("  RenoDX HDR mod: none for this game"),
+                    Err(e) => println!("  RenoDX lookup failed: {e:#}"),
+                }
                 0
             }
             Err(e) => {
@@ -383,7 +504,7 @@ fn cli(
             Error => println!("\n      FAILED: {detail}"),
         }
     };
-    match installer::run_all_with(&exe, engine, &progress, &step) {
+    match installer::run_all_with(&exe, engine, with_renodx, &progress, &step) {
         Ok(_) => {
             if engine == installer::Engine::Opti {
                 println!(
@@ -406,6 +527,23 @@ Done. In game: Home opens ReShade -> Add-ons tab -> DLSS 5 Neural Rendering -> e
         }
     }
 }
+
+#[cfg(windows)]
+fn report_gui_error(text: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let (t, c) = (wide(text), wide("DLSS5oneclick"));
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            t.as_ptr(),
+            c.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        )
+    };
+}
+#[cfg(not(windows))]
+fn report_gui_error(_text: &str) {}
 
 /// Release builds hide the console; when launched from a terminal, reattach so CLI output shows.
 fn attach_parent_console() {

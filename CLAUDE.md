@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Fork context
 
-This repo (`Mhsbrian/DLSS5oneclick-forlinux`) is the **Linux port** of `faisalkindi/DLSS5oneclick`, a Rust tool that automates installing the leaked DLSS 5 neural-rendering build into DX11/DX12 games. The port targets Steam/Proton gaming distros: launcher game discovery (Steam/Heroic/Lutris), automatic Steam launch-option handling, Linux GPU/driver detection, Linux self-update, and binary+AppImage releases from this fork. The crate still compiles on Windows — all Linux integration is `cfg(target_os = "linux")`-gated at the data-source edges, with parsers/mergers platform-neutral — so upstream changes merge cleanly. Windows binaries are not released from this fork (Windows users use upstream).
+This repo (`Mhsbrian/DLSS5oneclick-forlinux`) is the **Linux port** of `faisalkindi/DLSS5oneclick` (add it as git remote `upstream`; currently merged through upstream 0.10.2), a Rust tool that automates installing the leaked DLSS 5 neural-rendering build into DX11/DX12 games. The port targets Steam/Proton gaming distros: launcher game discovery (Steam/Heroic/Lutris), automatic Steam launch-option handling, Linux GPU/driver detection, Linux self-update, and binary+AppImage releases from this fork. The crate still compiles on Windows — all Linux integration is `cfg(target_os = "linux")`-gated at the data-source edges, with parsers/mergers platform-neutral — so upstream changes merge cleanly. Windows binaries are not released from this fork (Windows users use upstream).
 
 ## Commands
 
@@ -27,8 +27,8 @@ Single crate, no workspace. `main.rs` dispatches on argv: a path argument runs h
 The core pipeline, shared by CLI and GUI:
 
 1. `game::resolve_target` — accepts a folder or exe, finds candidate game exes (searches two levels deep, skips crash handlers/redist installers, prefers `*-Shipping.exe`).
-2. `game::inspect` → `GameStatus` — the central struct. Determines `Mode::Native` (game ships its own DLSS: an unmarked `nvngx_dlss.dll`, Streamline `sl.*.dll`, or dlssg/dlssd DLL up to 4 levels deep) vs `Mode::Feeder` (no DLSS); DX11/DX12 from the exe's PE import table (own minimal PE parser in `game.rs`, no external crate; unknown ⇒ assume DX12); which components are already installed; and `problems` — a non-empty `problems` vec is a refusal (anti-cheat detected, non-RTX GPU, 32-bit game, DX9 proxy) and `run_all_with` bails before any network I/O.
-3. `installer::plan_with(&status, engine)` → ordered `Vec<Step>`; each `Step` is a named fn pointer `(client, status, workdir, progress) -> Result<Vec<String>>` (files written). Steps are idempotent — a re-run only fetches what is missing. After each step the game folder is re-inspected.
+2. `game::inspect` → `GameStatus` — the central struct. Determines `Mode::Native` (game ships its own DLSS: an unmarked `nvngx_dlss.dll`, Streamline `sl.*.dll`, or dlssg/dlssd DLL up to 4 levels deep) vs `Mode::Feeder` (no DLSS; the user can override with `--mode=feeder|native` / `DLSS5ONECLICK_MODE`); DX11/DX12 from the exe's PE import table (own minimal PE parser in `game.rs`; unknown ⇒ assume DX12); 32-bit games take the Feeder path with a `host64\` helper tree; which components are already installed (version markers like `.dlss5oneclick-reshade` drive refresh-on-reinstall); and `problems` — a non-empty `problems` vec is a refusal (anti-cheat detected — `--ignore-anticheat` overrides, non-RTX GPU, 32-bit-on-DX12, DX9 proxy unless dgVoodoo2) and `run_all_with` bails before any network I/O.
+3. `installer::plan_with(&status, engine, with_renodx)` → ordered `Vec<Step>`; each `Step` is a named fn pointer `(client, status, workdir, progress) -> Result<Vec<String>>` (files written). Steps are idempotent, and refresh stale tool-placed components by version marker/size. RE Engine games (`re_chunk_000.pak`) get REFramework's `dinput8.dll` first; `renodx.rs` optionally adds the game-specific RenoDX HDR mod (matched via RenoDX's games-index/wiki). After each step the game folder is re-inspected.
 
 Two engines: `Engine::ReShade` (default; the six Feeder-README steps for no-DLSS games, or ReShade + RenoDX add-on + DX11 bridge for native-DLSS games) and `Engine::Opti` (OptiScaler fork, native-DLSS games only; extracts the release as `dxgi.dll` and records every written path in a `.dlss5oneclick-optiscaler-manifest` so uninstall is exact). Both engines load as `dxgi.dll`, so they are mutually exclusive per game.
 
@@ -42,6 +42,12 @@ The Linux layer lives in `src/platform/`:
 - `platform/mod.rs` — `GameEntry`/`scan_all`/`entry_for_path` (deepest dir-prefix match maps a manual folder back to its launcher), `ensure_launch_options` → `LaunchAdvice` (rendered by both CLI `print_advice` and the GUI panel), `host_context` → `diagnose::HostContext`.
 
 `gpu.rs` has a real Linux `list()`: `/proc/driver/nvidia/gpus/*/information` "Model:" lines (falls back to DRM vendor ids in `/sys/class/drm` — AMD/Intel-only ⇒ `NotNvidia` refusal parity; NVIDIA-without-driver ⇒ Unknown, never a false refusal — then `nvidia-smi`); `driver_version()` reads `/sys/module/nvidia/version`. `game.rs` adds `existing_ci`/`join_ci` (case-insensitive lookups that reuse on-disk casing) used at every inspect/install/uninstall boundary — ext4 is case-sensitive and other tools may have created differently-cased trees. `diagnose.rs` splits `run` (log-only, host-independent, what tests use) from `run_full` (host findings first — launch options vs required, NGX Wine DLLs, prefix nvngx, driver, Proton — then logs). `update.rs` self-updates from this fork with cfg'd asset names, ELF validation, chmod 0755, and `$APPIMAGE` redirection (the mounted image is read-only; the AppImage file itself is replaced).
+
+Upstream modules worth knowing (kept intact for mergeability, given Linux data sources where needed):
+
+- `library.rs` — the Games-page scan: Steam (iterates `steam_roots()` — on Linux `platform::steam::roots()`), Epic/GOG/Xbox on Windows, and `scan_linux_launchers` (Heroic ⇒ Epic/GOG rows, Lutris ⇒ `Store::Lutris`) on Linux. Posters from Steam's librarycache, the Steam CDN (cached under `~/.cache/dlss5oneclick/posters` on Linux), or the exe icon (Windows-only extraction; Linux renders no icon).
+- `ngx.rs` — NGX Core registry probe (Windows; `None` elsewhere), used by diagnose to explain `0xBAD00001`.
+- `renodx.rs` — RenoDX HDR mod lookup/install (game-id match against RenoDX's index; one mod per game, manifest-tracked).
 
 Supporting modules:
 
