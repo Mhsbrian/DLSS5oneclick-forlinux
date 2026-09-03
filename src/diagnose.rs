@@ -23,13 +23,31 @@ pub struct Finding {
 
 /// `NVSDK_NGX_*_Init -> 0xBAD00001` in a log: NGX itself refused. Add what the
 /// system says about NGX Core, which is the usual cause on capable hardware.
-fn ngx_init_failure(log: &str, out: &mut Vec<Finding>) {
+/// `exe` is the game (and, for a 32-bit game, its helper) whose Windows GPU
+/// preference is worth naming: on a hybrid machine a process started on the
+/// iGPU gets exactly this error, because NGX does not exist there (#25).
+fn ngx_init_failure_for(log: &str, exe: Option<&std::path::Path>, out: &mut Vec<Finding>) {
     let Some(line) = log
         .lines()
         .find(|l| l.contains("NVSDK_NGX") && l.contains("Init") && l.contains("0xBAD00001"))
     else {
         return;
     };
+    if crate::gpupref::hybrid() {
+        let set = exe.is_some_and(|e| {
+            crate::gpupref::get(e).is_some_and(|v| crate::gpupref::is_high_performance(&v))
+        });
+        let names: Vec<String> = crate::gpu::list().into_iter().map(|g| g.name).collect();
+        out.push(bad(format!(
+            "More than one GPU vendor on this machine ({}), and Windows decides which one              a process starts on. Started on the integrated GPU, NGX does not exist and              every Init answers 0xBAD00001 — this is the most likely cause here{}.              Settings ▸ System ▸ Display ▸ Graphics ▸ Add a desktop app ▸ pick the game's exe              (and, for a 32-bit game, host64\\dlss5-feed-host64.exe) ▸ Options ▸ High performance.              Install sets that for you from this version on.",
+            names.join(", "),
+            if set {
+                ", though the preference is already set to high performance for that exe"
+            } else {
+                ""
+            }
+        )));
+    }
     let system = crate::ngx::describe();
     // Reported on three machines (RTX 4070, 5080, 5090) with NGX Core present and
     // driver 616.56, always on the Feeder's own in-process D3D12 device. The same
@@ -209,7 +227,7 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
                  \"LUMENITE: Kernel 2.0\" ABOVE \"DLSS5_Feed\", then reload effects.",
             ));
         }
-        ngx_init_failure(&fd, &mut out);
+        ngx_init_failure_for(&fd, Some(&st.exe), &mut out);
         // 32-bit games: the work happens in host64\, and its own log names the reason.
         if let Some(hl) = read(&d.join(game::HOST_DIR), "dlss5-feed-host.log") {
             if hl.contains("feature ready") {
@@ -217,7 +235,7 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
                     "The host64 helper built its DLSS feature (feature ready … DLAA).",
                 ));
             }
-            ngx_init_failure(&hl, &mut out);
+            ngx_init_failure_for(&hl, Some(&st.consumer_dir().join(game::HOST_EXE)), &mut out);
         } else if st.is32() {
             out.push(warn(
                 "No host64\\dlss5-feed-host.log yet: the 64-bit helper has not started. It is \

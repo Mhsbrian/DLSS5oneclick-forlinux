@@ -3,6 +3,7 @@
 mod diagnose;
 mod game;
 mod gpu;
+mod gpupref;
 mod gui;
 mod installer;
 mod library;
@@ -279,6 +280,20 @@ fn cli(
                         } else {
                             "missing, will be installed"
                         }
+                    );
+                }
+                if gpupref::hybrid() {
+                    // Which GPU Windows starts the process on decides whether NGX
+                    // exists in it at all (#25).
+                    println!(
+                        "  hybrid machine ({}) · Windows GPU preference for {}: {}",
+                        gpu::list()
+                            .into_iter()
+                            .map(|g| g.name)
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        exe.file_name().unwrap_or_default().to_string_lossy(),
+                        gpupref::get(&exe).unwrap_or_else(|| "not set".into())
                     );
                 }
                 if let Some(m) = &st.renodx_mod {

@@ -14,6 +14,7 @@
 //! 6. ReShade.ini + ReShadePreset.ini: DLSS5_MV_PROVIDER=3, Lumenite_Kernel above DLSS5_Feed.
 
 use crate::game::{self, GameStatus};
+use crate::gpupref;
 use crate::net::{self, Progress};
 use crate::renodx;
 use crate::reshade_ini;
@@ -268,6 +269,10 @@ fn step_host_reshade(
     Ok(vec![format!("{}/{}", game::HOST_DIR, game::RESHADE_PROXY)])
 }
 
+const STEP_GPU_PREF: Step = Step {
+    name: "GPU preference",
+    run: step_gpu_pref,
+};
 const STEP_RESHADE_VIA_OPTI: Step = Step {
     name: "ReShade loaded by OptiScaler (ReShade64.dll)",
     run: step_reshade_via_opti,
@@ -417,6 +422,7 @@ pub fn plan_with(st: &GameStatus, engine: Engine, with_renodx: bool) -> Vec<Step
     if st.re_engine {
         v.insert(0, STEP_REFRAMEWORK);
     }
+    v.push(STEP_GPU_PREF);
     v
 }
 
@@ -979,6 +985,44 @@ fn step_config(_c: &Client, st: &GameStatus, _w: &Path, progress: Progress) -> R
     Ok(vec![game::RESHADE_INI.into(), game::RESHADE_PRESET.into()])
 }
 
+// ── step 7: which GPU Windows starts the process on ────────────
+
+/// On a hybrid machine Windows may start the game (or the 32-bit helper) on the
+/// iGPU, where NGX does not exist and `NVSDK_NGX_D3D12_Init` answers
+/// `0xBAD00001`. That is what a reporter fixed by hand in Settings ▸ System ▸
+/// Display ▸ Graphics (#25); this writes the same preference.
+fn step_gpu_pref(
+    _c: &Client,
+    st: &GameStatus,
+    _w: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    if !gpupref::hybrid() {
+        progress(100, "one GPU vendor on this machine, nothing to set");
+        return Ok(vec![]);
+    }
+    let mut targets = vec![st.exe.clone()];
+    if st.is32() {
+        targets.push(st.consumer_dir().join(game::HOST_EXE));
+    }
+    let mut out = Vec::new();
+    for exe in targets.into_iter().filter(|p| p.is_file()) {
+        let name = exe
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match gpupref::set_high_performance(&exe) {
+            Ok(true) => out.push(format!(
+                "{name}: Windows GPU preference set to high performance"
+            )),
+            Ok(false) => out.push(format!("{name}: already set to the high-performance GPU")),
+            Err(e) => out.push(format!("{name}: could not set the GPU preference ({e})")),
+        }
+    }
+    progress(100, "GPU preference checked");
+    Ok(out)
+}
+
 // ── driver ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1127,6 +1171,19 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
     }
     if include.is_dir() && fs::read_dir(&include)?.next().is_none() {
         fs::remove_dir(&include)?;
+    }
+    // The Windows GPU preference this tool wrote goes too, but only when it is
+    // still exactly what was written (a user's own choice is left alone).
+    for e in [
+        exe.to_path_buf(),
+        d.join(game::HOST_DIR).join(game::HOST_EXE),
+    ] {
+        if gpupref::clear_ours(&e).unwrap_or(false) {
+            removed.push(format!(
+                "Windows GPU preference for {}",
+                e.file_name().unwrap_or_default().to_string_lossy()
+            ));
+        }
     }
     let host = d.join(game::HOST_DIR);
     if host.is_dir() && fs::read_dir(&host)?.next().is_none() {
@@ -1380,8 +1437,8 @@ mod tests {
             .collect();
         assert_eq!(names[0], "ReShade (add-on build)");
         assert_eq!(names[1], "64-bit ReShade for the host64 helper");
-        assert_eq!(names.len(), 7);
-        // Lay the 32-bit result out by hand and check status + removal.
+        assert_eq!(names.len(), 8); // + the GPU-preference step
+                                    // Lay the 32-bit result out by hand and check status + removal.
         let d = t.path();
         let host = d.join(game::HOST_DIR);
         fs::create_dir_all(d.join("reshade-shaders").join("Shaders")).unwrap();
@@ -1431,7 +1488,8 @@ mod tests {
                 "ReShade (add-on build)",
                 "DLSS 5 add-on + models",
                 "RenoDX HDR mod for this game",
-                "ReShade config"
+                "ReShade config",
+                "GPU preference"
             ]
         );
         let names: Vec<&str> = plan_with(&st, Engine::Opti, true)
@@ -1445,7 +1503,8 @@ mod tests {
                 "OptiScaler + DLSS Neural Rendering",
                 "DLSS 5 model (nvngx_dlssnr.dll)",
                 "ReShade loaded by OptiScaler (ReShade64.dll)",
-                "RenoDX HDR mod for this game"
+                "RenoDX HDR mod for this game",
+                "GPU preference"
             ]
         );
     }
@@ -1501,7 +1560,7 @@ mod tests {
             .iter()
             .map(|s| s.name)
             .collect();
-        assert_eq!(names.len(), 6);
+        assert_eq!(names.len(), 7); // + the GPU-preference step
         assert_eq!(names[2], "DLSS5-Feeder");
         st.mode = game::Mode::Native;
         st.api = game::Api::Dx12;
@@ -1514,7 +1573,8 @@ mod tests {
             [
                 "ReShade (add-on build)",
                 "DLSS 5 add-on + models",
-                "ReShade config"
+                "ReShade config",
+                "GPU preference"
             ]
         );
         st.api = game::Api::Dx11;
@@ -1582,7 +1642,8 @@ mod tests {
             names,
             [
                 "OptiScaler + DLSS Neural Rendering",
-                "DLSS 5 model (nvngx_dlssnr.dll)"
+                "DLSS 5 model (nvngx_dlssnr.dll)",
+                "GPU preference"
             ]
         );
         // Feeder-mode game + Opti engine is refused before any network
