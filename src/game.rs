@@ -21,6 +21,10 @@ pub const BRIDGE_ADDON: &str = "dlss5-bridge.addon64";
 pub const OPTI_MANIFEST: &str = ".dlss5oneclick-optiscaler-manifest";
 /// Sidecar written next to an `nvngx_dlss.dll` this tool placed, so it is never mistaken for the game's own.
 pub const DLSS_MARKER: &str = "nvngx_dlss.dll.dlss5oneclick";
+/// Same idea for the neural model and for ReShade: the release tag / version this
+/// tool placed, so Install can tell "ours and stale" from "the user's own".
+pub const DLSSNR_MARKER: &str = "nvngx_dlssnr.dll.dlss5oneclick";
+pub const RESHADE_MARKER: &str = "dxgi.dll.dlss5oneclick";
 pub const RESHADE_PROXY: &str = "dxgi.dll";
 /// Shader headers the official installer fetches from crosire/reshade-shaders (branch `slim`).
 /// Not inside the setup exe. DLSS5_Feed.fx and every lumenite_*.fx include ReShade.fxh;

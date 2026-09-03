@@ -514,12 +514,9 @@ fn step_reshade(
     work: &Path,
     progress: Progress,
 ) -> Result<Vec<String>> {
-    if st.reshade {
-        progress(100, "ReShade already installed");
-        return Ok(vec![]);
-    }
-    let proxy = st.game_dir().join(game::RESHADE_PROXY);
-    if proxy.is_file() {
+    let d = st.game_dir();
+    let proxy = d.join(game::RESHADE_PROXY);
+    if !st.reshade && proxy.is_file() {
         bail!(
             "{} exists but is not ReShade (DXVK, Special K, another injector?). Remove it first.",
             game::RESHADE_PROXY
@@ -527,9 +524,25 @@ fn step_reshade(
     }
     progress(0, "Looking up latest ReShade");
     let (ver, url) = resolve_reshade_setup(client)?;
+    if st.reshade {
+        // Only a copy this tool placed is refreshed; a user's own ReShade stays.
+        match fs::read_to_string(d.join(game::RESHADE_MARKER)) {
+            Ok(mine) if mine.trim() == ver => {
+                return Ok(vec![format!("ReShade already current ({ver})")]);
+            }
+            Ok(_) => progress(0, &format!("ReShade {ver} is out, refreshing")),
+            Err(_) => {
+                return Ok(vec![
+                    "ReShade present (not placed by this tool, left as is)".to_owned(),
+                ]);
+            }
+        }
+    }
     let setup = work.join(format!("ReShade_Setup_{ver}_Addon.exe"));
     net::download(client, &url, &setup, "ReShade", progress)?;
-    install_reshade_from_setup(&setup, st.game_dir(), st.bitness, game::RESHADE_PROXY)
+    let out = install_reshade_from_setup(&setup, d, st.bitness, game::RESHADE_PROXY)?;
+    fs::write(d.join(game::RESHADE_MARKER), ver.as_bytes())?;
+    Ok(out)
 }
 
 // ── step 2: ReShade shader headers ────────────────────────────────
@@ -599,8 +612,7 @@ fn step_feeder(
     let fx = pick(game::FEEDER_FX)
         .ok_or_else(|| anyhow!("DLSS5-Feeder {tag} has no {}", game::FEEDER_FX))?;
     if st.feeder && same_size(&mut zip, &addon, &d.join(game::FEEDER_ADDON)) {
-        progress(100, &format!("DLSS5-Feeder already current ({tag})"));
-        return Ok(vec![]);
+        return Ok(vec![format!("DLSS5-Feeder already current ({tag})")]);
     }
     net::extract_member(&mut zip, &addon, &d.join(game::FEEDER_ADDON))?;
     net::extract_member(
@@ -706,20 +718,41 @@ fn step_dlss5(
 ) -> Result<Vec<String>> {
     // A game with its own DLSS keeps its own nvngx_dlss.dll.
     let dlss_present = st.dlss || st.mode == game::Mode::Native;
-    // The add-on is re-checked every time (its zip is small and its builds
-    // change weekly); the two NVIDIA DLLs only when missing.
+    // Every piece is re-checked: the add-on by comparing its (small) zip, the
+    // two NVIDIA DLLs by the release tag recorded when this tool placed them.
+    // A DLL without a marker is the game's or the user's and is left alone.
     let plan = [
-        ("renodx-dlss5-", game::DLSS5_ADDON, false),
-        ("dlssnr-", game::DLSSNR_DLL, st.dlssnr),
-        ("dlss-", game::DLSS_DLL, dlss_present),
+        ("renodx-dlss5-", game::DLSS5_ADDON, false, None),
+        (
+            "dlssnr-",
+            game::DLSSNR_DLL,
+            st.dlssnr,
+            Some(game::DLSSNR_MARKER),
+        ),
+        (
+            "dlss-",
+            game::DLSS_DLL,
+            dlss_present,
+            Some(game::DLSS_MARKER),
+        ),
     ];
     progress(0, "Looking up DLSS 5 add-on releases");
     let mut installed = Vec::new();
-    for (prefix, fname, present) in plan {
-        if present {
-            continue;
-        }
+    for (prefix, fname, present, marker) in plan {
         let (tag, url) = rhi_latest(client, prefix)?;
+        if present {
+            match marker.map(|m| fs::read_to_string(st.game_dir().join(m))) {
+                Some(Ok(mine)) if mine.trim() == tag => {
+                    installed.push(format!("{fname} already current ({tag})"));
+                    continue;
+                }
+                Some(Ok(_)) => progress(0, &format!("{fname}: {tag} is out, refreshing")),
+                _ => {
+                    installed.push(format!("{fname} present (not placed by this tool)"));
+                    continue;
+                }
+            }
+        }
         let z = work.join(format!("{tag}.zip"));
         net::download(client, &url, &z, fname, progress)?;
         let dest = st.game_dir().join(fname);
@@ -732,13 +765,13 @@ fn step_dlss5(
                 .find(|n| net::file_name(n).eq_ignore_ascii_case(fname))
                 .map(str::to_owned);
             if hit.is_some_and(|h| same_size(&mut zip, &h, &dest)) {
-                progress(100, &format!("{fname} already current ({tag})"));
+                installed.push(format!("{fname} already current ({tag})"));
                 continue;
             }
         }
         install_single_from_zip(&z, fname, &dest)?;
-        if fname == game::DLSS_DLL {
-            fs::write(st.game_dir().join(game::DLSS_MARKER), tag.as_bytes())?;
+        if let Some(m) = marker {
+            fs::write(st.game_dir().join(m), tag.as_bytes())?;
         }
         installed.push(format!("{fname} ({tag})"));
     }
@@ -753,15 +786,32 @@ fn step_dlssnr_only(
     work: &Path,
     progress: Progress,
 ) -> Result<Vec<String>> {
-    if st.dlssnr {
-        progress(100, "nvngx_dlssnr.dll already present");
-        return Ok(vec![]);
-    }
     progress(0, "Looking up DLSS 5 model releases");
     let (tag, url) = rhi_latest(client, "dlssnr-")?;
+    if st.dlssnr {
+        match fs::read_to_string(st.game_dir().join(game::DLSSNR_MARKER)) {
+            Ok(mine) if mine.trim() == tag => {
+                return Ok(vec![format!(
+                    "{} already current ({tag})",
+                    game::DLSSNR_DLL
+                )]);
+            }
+            Ok(_) => progress(
+                0,
+                &format!("{}: {tag} is out, refreshing", game::DLSSNR_DLL),
+            ),
+            Err(_) => {
+                return Ok(vec![format!(
+                    "{} present (not placed by this tool)",
+                    game::DLSSNR_DLL
+                )]);
+            }
+        }
+    }
     let z = work.join(format!("{tag}.zip"));
     net::download(client, &url, &z, game::DLSSNR_DLL, progress)?;
     install_single_from_zip(&z, game::DLSSNR_DLL, &st.game_dir().join(game::DLSSNR_DLL))?;
+    fs::write(st.game_dir().join(game::DLSSNR_MARKER), tag.as_bytes())?;
     Ok(vec![format!("{} ({tag})", game::DLSSNR_DLL)])
 }
 
@@ -818,15 +868,12 @@ fn step_bridge(
                 progress(0, "dlss5-bridge changed upstream, refreshing");
             }
             Ok(_) => {
-                progress(100, "DX11 bridge already installed (current)");
-                return Ok(vec![]);
+                return Ok(vec!["dlss5-bridge.addon64 already current".to_owned()]);
             }
             Err(_) => {
-                progress(
-                    100,
-                    "DX11 bridge already installed (could not check for a newer one)",
-                );
-                return Ok(vec![]);
+                return Ok(vec![
+                    "dlss5-bridge.addon64 present (could not check for a newer one)".to_owned(),
+                ]);
             }
         }
     } else {
@@ -915,6 +962,7 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
     let include = shaders.join("include");
     let mut targets: Vec<PathBuf> = vec![
         d.join(game::DLSS_MARKER),
+        d.join(game::DLSSNR_MARKER),
         d.join(game::FEEDER_ADDON),
         d.join(game::DLSS5_ADDON),
         d.join(game::DLSSNR_DLL),
@@ -1036,6 +1084,7 @@ pub fn uninstall_all(exe: &Path) -> Result<(Vec<String>, Option<String>)> {
     if game::is_reshade_dll(&proxy) {
         rm(proxy)?;
     }
+    rm(d.join(game::RESHADE_MARKER))?;
     if let Ok(rd) = fs::read_dir(d) {
         for e in rd.flatten() {
             let n = e.file_name().to_string_lossy().to_lowercase();
