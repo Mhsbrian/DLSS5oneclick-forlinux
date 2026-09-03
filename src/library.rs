@@ -27,6 +27,8 @@ pub enum Store {
     Epic,
     Gog,
     Xbox,
+    /// Pointed at by hand and remembered (#28).
+    Manual,
 }
 
 impl Store {
@@ -36,6 +38,7 @@ impl Store {
             Store::Epic => "Epic Games",
             Store::Gog => "GOG",
             Store::Xbox => "Xbox",
+            Store::Manual => "Added by you",
         }
     }
 }
@@ -385,8 +388,111 @@ pub fn scan() -> Vec<Game> {
     scan_epic(&mut v);
     scan_gog(&mut v);
     scan_xbox(&mut v);
+    // Last: a hand-added path that a store also lists loses to the store entry
+    // in sort_and_dedupe, which keeps the first of each folder.
+    scan_added(&mut v);
     sort_and_dedupe(&mut v);
     v
+}
+
+// -- added by hand ---------------------------------------------------
+
+/// Paths the user pointed at, one per line. Written next to the poster cache.
+pub fn added_list_file() -> PathBuf {
+    poster_cache_dir()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(std::env::temp_dir)
+        .join("added-games.txt")
+}
+
+pub fn added_paths() -> Vec<PathBuf> {
+    fs::read_to_string(added_list_file())
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn write_added(v: &[PathBuf]) {
+    let f = added_list_file();
+    if let Some(d) = f.parent() {
+        let _ = fs::create_dir_all(d);
+    }
+    let body = v
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let _ = fs::write(f, body);
+}
+
+/// Remember a path the user picked (a folder or an exe). No duplicates.
+pub fn remember_added(path: &Path) {
+    let mut v = added_paths();
+    let same = |a: &Path| {
+        a.to_string_lossy().to_ascii_lowercase() == path.to_string_lossy().to_ascii_lowercase()
+    };
+    if v.iter().any(|p| same(p)) {
+        return;
+    }
+    v.push(path.to_path_buf());
+    write_added(&v);
+}
+
+pub fn forget_added(path: &Path) {
+    let key = path.to_string_lossy().to_ascii_lowercase();
+    let mut v = added_paths();
+    // The list holds what was picked (maybe an exe); the card knows only the folder.
+    v.retain(|p| {
+        let s = p.to_string_lossy().to_ascii_lowercase();
+        s != key
+            && p.parent().map(|d| d.to_string_lossy().to_ascii_lowercase()) != Some(key.clone())
+    });
+    write_added(&v);
+}
+
+/// One `Game` per remembered path; a path that no longer exists is dropped.
+pub fn added_games(paths: &[PathBuf]) -> Vec<Game> {
+    let mut v = Vec::new();
+    for p in paths {
+        let (dir, exe_hint) = if p.is_file() {
+            (p.parent().unwrap_or(p).to_path_buf(), Some(p.clone()))
+        } else if p.is_dir() {
+            (
+                p.clone(),
+                crate::game::resolve_target(p).ok().map(|(e, _)| e),
+            )
+        } else {
+            continue;
+        };
+        let title = if p.is_file() {
+            p.file_stem()
+        } else {
+            p.file_name()
+        }
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.display().to_string());
+        let installed = fs::metadata(&dir)
+            .and_then(|m| m.created())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let poster = Poster::ExeIcon(exe_hint.clone().unwrap_or_else(|| dir.clone()));
+        v.push(Game {
+            title,
+            store: Store::Manual,
+            dir,
+            exe_hint,
+            installed,
+            poster,
+        });
+    }
+    v
+}
+
+fn scan_added(v: &mut Vec<Game>) {
+    v.extend(added_games(&added_paths()));
 }
 
 pub fn sort_and_dedupe(v: &mut Vec<Game>) {
@@ -667,6 +773,30 @@ mod tests {
             r#"{"bIsApplication":false,"DisplayName":"UE","InstallLocation":"x"}"#
         )
         .is_none());
+    }
+
+    /// #28: a path picked by hand survives a restart, and Forget removes it
+    /// whether the card knows the exe or only the folder.
+    #[test]
+    fn added_games_round_trip() {
+        let tmp = std::env::temp_dir().join("dlss5oneclick-test-added");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("Bin")).unwrap();
+        let exe = tmp.join("Bin").join("Game.exe");
+        fs::write(&exe, b"MZ").unwrap();
+
+        let list = added_games(&[tmp.clone(), exe.clone()]);
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().all(|g| g.store == Store::Manual));
+        assert_eq!(list[0].title, "dlss5oneclick-test-added");
+        assert_eq!(list[1].title, "Game");
+        assert_eq!(list[1].dir, tmp.join("Bin"));
+        assert_eq!(list[1].exe_hint.as_deref(), Some(exe.as_path()));
+
+        // A path that no longer exists is dropped, not shown as a dead card.
+        assert!(added_games(&[tmp.join("gone")]).is_empty());
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]

@@ -404,6 +404,20 @@ impl App {
         }
     }
 
+    /// Add a game by hand and keep it: it comes back on the next start (#28).
+    fn add_game(&mut self, path: PathBuf, ctx: &egui::Context) {
+        library::remember_added(&path);
+        let mut added = library::added_games(std::slice::from_ref(&path));
+        if let Some(g) = added.pop() {
+            self.games.insert(0, g);
+            library::sort_and_dedupe(&mut self.games);
+            self.posters.clear();
+            self.meta.clear();
+            self.start_game_details(ctx);
+        }
+        self.open_game(path);
+    }
+
     fn open_game(&mut self, path: PathBuf) {
         self.exe_text = path.to_string_lossy().into_owned();
         self.refresh();
@@ -911,7 +925,7 @@ impl App {
                         .set_title("Pick the game's install folder")
                         .pick_folder()
                     {
-                        self.open_game(p);
+                        self.add_game(p, ui.ctx());
                     }
                 }
                 if ui.add(btn("Add a game", false)).clicked() {
@@ -919,7 +933,7 @@ impl App {
                         .add_filter("Executables", &["exe"])
                         .pick_file()
                     {
-                        self.open_game(p);
+                        self.add_game(p, ui.ctx());
                     }
                 }
                 let search = egui::TextEdit::singleline(&mut self.search)
@@ -934,6 +948,7 @@ impl App {
         // ── grid, grouped by store ────────────────────────────────
         let needle = self.search.trim().to_ascii_lowercase();
         let mut clicked: Option<PathBuf> = None;
+        let mut forgotten: Option<PathBuf> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -945,7 +960,13 @@ impl App {
                 let card_w =
                     ((avail - CARD_GAP * (cols as f32 - 1.0)) / cols as f32).clamp(CARD_W, 190.0);
                 let poster_h = (card_w * 1.5).round();
-                for store in [Store::Steam, Store::Epic, Store::Gog, Store::Xbox] {
+                for store in [
+                    Store::Manual,
+                    Store::Steam,
+                    Store::Epic,
+                    Store::Gog,
+                    Store::Xbox,
+                ] {
                     let idx: Vec<usize> = self
                         .games
                         .iter()
@@ -998,7 +1019,11 @@ impl App {
                                 egui::pos2(x, row_rect.top()),
                                 Vec2::new(card_w, poster_h + CAPTION_H),
                             );
-                            if self.game_card(ui, rect, i) {
+                            let (hit, forget) = self.game_card(ui, rect, i);
+                            if forget {
+                                forgotten = Some(self.games[i].dir.clone());
+                            }
+                            if hit {
                                 let g = &self.games[i];
                                 // The store's own exe when it names one and it is readable;
                                 // else the folder, which the exe finder resolves.
@@ -1031,13 +1056,18 @@ impl App {
                     });
                 }
             });
+        if let Some(p) = forgotten {
+            library::forget_added(&p);
+            self.games
+                .retain(|g| !(g.store == Store::Manual && g.dir == p));
+        }
         if let Some(p) = clicked {
             self.open_game(p);
         }
     }
 
-    /// One poster card. Returns true when clicked.
-    fn game_card(&self, ui: &mut egui::Ui, rect: egui::Rect, i: usize) -> bool {
+    /// One poster card. Returns (clicked, forget requested).
+    fn game_card(&self, ui: &mut egui::Ui, rect: egui::Rect, i: usize) -> (bool, bool) {
         let g = &self.games[i];
         let resp = ui.interact(rect, ui.id().with(("card", i)), egui::Sense::click());
         let hovered = resp.hovered();
@@ -1169,7 +1199,16 @@ impl App {
             resp.clone()
                 .on_hover_text(format!("{}\n{}", g.title, g.dir.display()));
         }
-        resp.clicked()
+        let mut forget = false;
+        if g.store == Store::Manual {
+            resp.context_menu(|ui| {
+                if ui.button("Forget this game").clicked() {
+                    forget = true;
+                    ui.close();
+                }
+            });
+        }
+        (resp.clicked(), forget)
     }
 }
 
