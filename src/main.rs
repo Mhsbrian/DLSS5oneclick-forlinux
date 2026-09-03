@@ -126,7 +126,35 @@ error: {e:#}"
         std::process::exit(code);
     }
     if let Err(e) = gui::run() {
-        eprintln!("gui error: {e}");
+        // The release build has no console: say it in a box and leave a file (#23).
+        let msg = format!("{e:#}");
+        eprintln!("gui error: {msg}");
+        let log = std::env::var_os("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("dlss5oneclick")
+            .join("gui-error.txt");
+        if let Some(p) = log.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
+        let _ = std::fs::write(
+            &log,
+            format!(
+                "DLSS5oneclick {}
+{msg}
+",
+                env!("CARGO_PKG_VERSION")
+            ),
+        );
+        report_gui_error(&format!(
+            "DLSS5oneclick could not open its window.
+
+{msg}
+
+Written to {}
+Attach that file to a GitHub issue.",
+            log.display()
+        ));
         std::process::exit(2);
     }
 }
@@ -346,6 +374,23 @@ Done. In game: Home opens ReShade -> Add-ons tab -> DLSS 5 Neural Rendering -> e
         }
     }
 }
+
+#[cfg(windows)]
+fn report_gui_error(text: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let (t, c) = (wide(text), wide("DLSS5oneclick"));
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            t.as_ptr(),
+            c.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        )
+    };
+}
+#[cfg(not(windows))]
+fn report_gui_error(_text: &str) {}
 
 /// Release builds hide the console; when launched from a terminal, reattach so CLI output shows.
 fn attach_parent_console() {

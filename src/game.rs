@@ -532,7 +532,7 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
 }
 
 /// Helper/launcher executables that are never the game.
-const NOT_GAME: [&str; 14] = [
+const NOT_GAME: [&str; 15] = [
     "unitycrashhandler",
     "unrealcefsubprocess",
     "crashreportclient",
@@ -547,6 +547,7 @@ const NOT_GAME: [&str; 14] = [
     "installer",
     "uninstall",
     "unins",
+    "setup",
 ];
 
 fn is_helper_name(stem_lower: &str) -> bool {
@@ -597,6 +598,7 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
                 | "_commonredist"
                 | "commonredist"
                 | "redist"
+                | "redistributables"
         ) || n.ends_with("_data")
     };
     if let Ok(rd1) = fs::read_dir(dir) {
@@ -764,6 +766,34 @@ mod tests {
         let (exe, all) = resolve_target(&d).unwrap();
         assert_eq!(exe, d.join("Fell & Sell.exe"));
         assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn find_game_exes_skips_redistributables_and_setup_exes() {
+        // Red Dead Redemption 2: RDR2.exe in the root, a much larger
+        // Social-Club-Setup.exe under Redistributables\ (#22).
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("Red Dead Redemption 2");
+        fs::create_dir_all(d.join("Redistributables").join("SocialClub")).unwrap();
+        let game = make_pe(&d.join("RDR2.exe"), PE_X64);
+        let big = make_pe(
+            &d.join("Redistributables")
+                .join("SocialClub")
+                .join("Social-Club-Setup.exe"),
+            PE_X64,
+        );
+        fs::write(&big, [b"MZ".as_slice(), &[0u8; 4_000_000]].concat()).unwrap();
+        make_pe(
+            &d.join("Redistributables")
+                .join("SocialClub")
+                .join("Social-Club-Setup.exe"),
+            PE_X64,
+        );
+        let found = find_game_exes(&d);
+        assert_eq!(found.first(), Some(&game));
+        assert!(!found
+            .iter()
+            .any(|p| p.to_string_lossy().contains("Redistributables")));
     }
 
     #[test]
