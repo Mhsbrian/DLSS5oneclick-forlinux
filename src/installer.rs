@@ -224,6 +224,45 @@ const STEP_RENODX: Step = Step {
     name: "RenoDX HDR mod for this game",
     run: step_renodx,
 };
+const STEP_HOST_RESHADE: Step = Step {
+    name: "64-bit ReShade for the host64 helper",
+    run: step_host_reshade,
+};
+
+/// 32-bit games: the helper process needs its own 64-bit ReShade as
+/// `host64\dxgi.dll` (the Feeder README: "run the ReShade installer once
+/// against any 64-bit game and take it from there"). Same marker/refresh rule
+/// as the in-game copy.
+fn step_host_reshade(
+    client: &Client,
+    st: &GameStatus,
+    work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    let host = st.consumer_dir();
+    fs::create_dir_all(&host)?;
+    progress(0, "Looking up latest ReShade");
+    let (ver, url) = resolve_reshade_setup(client)?;
+    if st.host_reshade {
+        match fs::read_to_string(host.join(game::RESHADE_MARKER)) {
+            Ok(mine) if mine.trim() == ver => {
+                return Ok(vec![format!("host64/dxgi.dll already current ({ver})")]);
+            }
+            Ok(_) => progress(0, &format!("host64 ReShade {ver} is out, refreshing")),
+            Err(_) => {
+                return Ok(vec![
+                    "host64/dxgi.dll present (not placed by this tool)".into()
+                ])
+            }
+        }
+    }
+    let setup = work.join(format!("ReShade_Setup_{ver}_Addon.exe"));
+    net::download(client, &url, &setup, "ReShade (64-bit, host64)", progress)?;
+    install_reshade_from_setup(&setup, &host, 64, game::RESHADE_PROXY)?;
+    fs::write(host.join(game::RESHADE_MARKER), ver.as_bytes())?;
+    Ok(vec![format!("{}/{}", game::HOST_DIR, game::RESHADE_PROXY)])
+}
+
 const STEP_RESHADE_VIA_OPTI: Step = Step {
     name: "ReShade loaded by OptiScaler (ReShade64.dll)",
     run: step_reshade_via_opti,
@@ -378,14 +417,20 @@ pub fn plan_with(st: &GameStatus, engine: Engine, with_renodx: bool) -> Vec<Step
 
 fn plan_reshade(st: &GameStatus) -> Vec<Step> {
     match st.mode {
-        game::Mode::Feeder => vec![
-            STEP_RESHADE,
-            STEP_HEADERS,
-            STEP_FEEDER,
-            STEP_LUMENITE,
-            STEP_DLSS5,
-            STEP_CONFIG,
-        ],
+        game::Mode::Feeder => {
+            let mut v = vec![STEP_RESHADE];
+            if st.is32() {
+                v.push(STEP_HOST_RESHADE);
+            }
+            v.extend([
+                STEP_HEADERS,
+                STEP_FEEDER,
+                STEP_LUMENITE,
+                STEP_DLSS5,
+                STEP_CONFIG,
+            ]);
+            v
+        }
         game::Mode::Native => {
             let mut v = vec![STEP_RESHADE];
             if st.feeder {
@@ -607,14 +652,36 @@ fn step_feeder(
             .find(|m| net::file_name(&m.replace('\\', "/")).eq_ignore_ascii_case(want))
             .cloned()
     };
-    let addon = pick(game::FEEDER_ADDON)
-        .ok_or_else(|| anyhow!("DLSS5-Feeder {tag} has no {}", game::FEEDER_ADDON))?;
+    // 32-bit: the in-game half is addon32 and the 64-bit helper exe goes to
+    // host64\; both must come from the same zip (helper protocol).
+    let addon_name = if st.is32() {
+        game::FEEDER_ADDON32
+    } else {
+        game::FEEDER_ADDON
+    };
+    let addon =
+        pick(addon_name).ok_or_else(|| anyhow!("DLSS5-Feeder {tag} has no {addon_name}"))?;
     let fx = pick(game::FEEDER_FX)
         .ok_or_else(|| anyhow!("DLSS5-Feeder {tag} has no {}", game::FEEDER_FX))?;
-    if st.feeder && same_size(&mut zip, &addon, &d.join(game::FEEDER_ADDON)) {
+    let host_member = st.is32().then(|| pick(game::HOST_EXE)).flatten();
+    if st.is32() && host_member.is_none() {
+        bail!("DLSS5-Feeder {tag} has no {}", game::HOST_EXE);
+    }
+    let host_current = match &host_member {
+        Some(m) => same_size(&mut zip, m, &st.consumer_dir().join(game::HOST_EXE)),
+        None => true,
+    };
+    if st.feeder && host_current && same_size(&mut zip, &addon, &d.join(addon_name)) {
         return Ok(vec![format!("DLSS5-Feeder already current ({tag})")]);
     }
-    net::extract_member(&mut zip, &addon, &d.join(game::FEEDER_ADDON))?;
+    net::extract_member(&mut zip, &addon, &d.join(addon_name))?;
+    let mut out = vec![format!("{addon_name} ({tag})")];
+    if let Some(m) = &host_member {
+        let host = st.consumer_dir();
+        fs::create_dir_all(&host)?;
+        net::extract_member(&mut zip, m, &host.join(game::HOST_EXE))?;
+        out.push(format!("{}/{} ({tag})", game::HOST_DIR, game::HOST_EXE));
+    }
     net::extract_member(
         &mut zip,
         &fx,
@@ -622,10 +689,8 @@ fn step_feeder(
             .join("Shaders")
             .join(game::FEEDER_FX),
     )?;
-    Ok(vec![
-        format!("{} ({tag})", game::FEEDER_ADDON),
-        format!("reshade-shaders/Shaders/{}", game::FEEDER_FX),
-    ])
+    out.push(format!("reshade-shaders/Shaders/{}", game::FEEDER_FX));
+    Ok(out)
 }
 
 // ── step 4: LumeniteFX ─────────────────────────────────────────────
@@ -737,11 +802,13 @@ fn step_dlss5(
         ),
     ];
     progress(0, "Looking up DLSS 5 add-on releases");
+    let cdir = st.consumer_dir();
+    fs::create_dir_all(&cdir)?;
     let mut installed = Vec::new();
     for (prefix, fname, present, marker) in plan {
         let (tag, url) = rhi_latest(client, prefix)?;
         if present {
-            match marker.map(|m| fs::read_to_string(st.game_dir().join(m))) {
+            match marker.map(|m| fs::read_to_string(cdir.join(m))) {
                 Some(Ok(mine)) if mine.trim() == tag => {
                     installed.push(format!("{fname} already current ({tag})"));
                     continue;
@@ -755,7 +822,7 @@ fn step_dlss5(
         }
         let z = work.join(format!("{tag}.zip"));
         net::download(client, &url, &z, fname, progress)?;
-        let dest = st.game_dir().join(fname);
+        let dest = cdir.join(fname);
         if fname == game::DLSS5_ADDON && st.dlss5_addon {
             let f = fs::File::open(&z)?;
             let mut zip =
@@ -771,9 +838,14 @@ fn step_dlss5(
         }
         install_single_from_zip(&z, fname, &dest)?;
         if let Some(m) = marker {
-            fs::write(st.game_dir().join(m), tag.as_bytes())?;
+            fs::write(cdir.join(m), tag.as_bytes())?;
         }
-        installed.push(format!("{fname} ({tag})"));
+        let shown = if st.is32() {
+            format!("{}/{fname} ({tag})", game::HOST_DIR)
+        } else {
+            format!("{fname} ({tag})")
+        };
+        installed.push(shown);
     }
     Ok(installed)
 }
@@ -917,6 +989,9 @@ pub fn run_all_with(
     if !st.problems.is_empty() {
         bail!("{}", st.problems.join("\n"));
     }
+    if engine == Engine::Opti && st.is32() {
+        bail!("The OptiScaler engine is 64-bit only; a 32-bit game takes the Feeder path.");
+    }
     if engine == Engine::Opti && st.mode != game::Mode::Feeder {
         // fine: native DLSS present
     } else if engine == Engine::Opti {
@@ -987,6 +1062,35 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
     if d.join(game::DLSS_MARKER).is_file() {
         targets.push(d.join(game::DLSS_DLL));
     }
+    // 32-bit layout: the in-game addon32 and everything in host64\.
+    targets.push(d.join(game::FEEDER_ADDON32));
+    let host = d.join(game::HOST_DIR);
+    if host.is_dir() {
+        for f in [
+            game::HOST_EXE,
+            game::DLSS5_ADDON,
+            game::DLSSNR_DLL,
+            game::DLSSNR_MARKER,
+            game::DLSS_MARKER,
+        ] {
+            targets.push(host.join(f));
+        }
+        if host.join(game::DLSS_MARKER).is_file() {
+            targets.push(host.join(game::DLSS_DLL));
+        }
+        if host.join(game::RESHADE_MARKER).is_file() {
+            targets.push(host.join(game::RESHADE_PROXY));
+            targets.push(host.join(game::RESHADE_MARKER));
+        }
+        for n in [
+            "ReShade.ini",
+            "ReShade.log",
+            "dlss5-feed-host.log",
+            "ReShadePreset.ini",
+        ] {
+            targets.push(host.join(n));
+        }
+    }
     if let Ok(name) = fs::read_to_string(d.join(game::RENODX_MANIFEST)) {
         let name = name.trim();
         if name.starts_with("renodx-") && !name.contains(['/', '\\']) {
@@ -1013,6 +1117,11 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
     }
     if include.is_dir() && fs::read_dir(&include)?.next().is_none() {
         fs::remove_dir(&include)?;
+    }
+    let host = d.join(game::HOST_DIR);
+    if host.is_dir() && fs::read_dir(&host)?.next().is_none() {
+        fs::remove_dir(&host)?;
+        removed.push(format!("{}/", game::HOST_DIR));
     }
     Ok(removed)
 }
@@ -1248,6 +1357,51 @@ mod tests {
     }
 
     #[test]
+    fn thirty_two_bit_plan_status_and_uninstall() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe(&t.path().join("game32.exe"), game::PE_X86);
+        let st = game::inspect(&exe).unwrap();
+        assert!(st.is32());
+        assert_eq!(st.mode, game::Mode::Feeder);
+        assert!(st.problems.is_empty(), "{:?}", st.problems);
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false)
+            .iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names[0], "ReShade (add-on build)");
+        assert_eq!(names[1], "64-bit ReShade for the host64 helper");
+        assert_eq!(names.len(), 7);
+        // Lay the 32-bit result out by hand and check status + removal.
+        let d = t.path();
+        let host = d.join(game::HOST_DIR);
+        fs::create_dir_all(d.join("reshade-shaders").join("Shaders")).unwrap();
+        fs::create_dir_all(&host).unwrap();
+        fs::write(d.join(game::FEEDER_ADDON32), b"a32").unwrap();
+        fs::write(
+            d.join("reshade-shaders")
+                .join("Shaders")
+                .join(game::FEEDER_FX),
+            b"fx",
+        )
+        .unwrap();
+        fs::write(host.join(game::HOST_EXE), b"host").unwrap();
+        fs::write(host.join(game::DLSS5_ADDON), b"addon").unwrap();
+        fs::write(host.join(game::DLSSNR_DLL), b"nr").unwrap();
+        fs::write(host.join(game::DLSS_DLL), b"dlss").unwrap();
+        fs::write(host.join(game::DLSS_MARKER), b"dlss-1").unwrap();
+        make_reshade_dll(&host.join(game::RESHADE_PROXY));
+        fs::write(host.join(game::RESHADE_MARKER), b"6.8.0").unwrap();
+        let st = game::inspect(&exe).unwrap();
+        assert!(
+            st.feeder && st.dlss5_addon && st.dlssnr && st.dlss && st.host_exe && st.host_reshade
+        );
+        let removed = uninstall(&exe).unwrap();
+        assert!(removed.iter().any(|r| r.contains(game::HOST_EXE)));
+        assert!(!host.exists(), "host64 folder should be gone: {removed:?}");
+        assert!(!d.join(game::FEEDER_ADDON32).exists());
+    }
+
+    #[test]
     fn plan_adds_reframework_first_and_renodx_before_config() {
         let t = tempfile::tempdir().unwrap();
         let exe = make_pe(&t.path().join("re4.exe"), game::PE_X64);
@@ -1449,17 +1603,11 @@ mod tests {
     }
 
     #[test]
-    fn run_all_refuses_32bit_before_network() {
+    fn run_all_refuses_opti_on_32bit_before_network() {
         let t = tempfile::tempdir().unwrap();
         let exe = make_pe(&t.path().join("game.exe"), game::PE_X86);
-        let err = run_all_with(
-            &exe,
-            Engine::ReShade,
-            false,
-            &|_, _| {},
-            &|_, _, _, _, _| {},
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("32-bit"));
+        let err =
+            run_all_with(&exe, Engine::Opti, false, &|_, _| {}, &|_, _, _, _, _| {}).unwrap_err();
+        assert!(err.to_string().contains("64-bit only"));
     }
 }

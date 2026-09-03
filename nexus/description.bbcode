@@ -28,7 +28,7 @@ Command line: [font=Courier New]dlss5oneclick.exe "C:\Games\Foo"[/font] · [font
 
 [size=4][b]Not handled[/b][/size]
 [list]
-[*]32-bit games (the Feeder's host64 setup is not automated — the tool refuses rather than half-install)
+[*]32-bit games: handled since 0.10.0 as a beta (Feeder path, D3D11 only) — addon32 + 32-bit ReShade beside the exe, a host64 folder with the 64-bit helper, ReShade, add-on and models. File layout verified, in-game reports wanted
 [*]DirectX 9 and Vulkan games — the Feeder and NIGos' bridge do support them by hand, this tool does not automate those setups yet
 [*]Non-NVIDIA and GTX/GT cards — refused up front: the model needs tensor cores and NGX. RTX 50 runs it at full speed, RTX 40 with a patched build at moderate cost, RTX 20/30 through an FP16 path at heavy cost (the status line shows your tier)
 [*]Online games — refused when Easy Anti-Cheat, BattlEye or GameGuard files are found in the install (Helldivers 2 etc.): ReShade add-on injection is what they flag, kick at best, ban at worst. Games that let you switch the anti-cheat off for offline play (GTA V: BattlEye unticked in the Rockstar Games Launcher) get a checkbox under the warning to install anyway, at your own risk

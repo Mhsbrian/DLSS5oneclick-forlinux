@@ -591,6 +591,13 @@ const TILES_NATIVE: [Tile; 4] = [
     },
 ];
 
+const TILE_HOST: Tile = Tile {
+    title: "host64 helper (32-bit game)",
+    detail: "dlss5-feed-host64.exe + 64-bit ReShade · add-on and models live in host64\\",
+    ok: |s| s.host_exe && s.host_reshade,
+    optional: false,
+};
+
 const TILE_RENODX: Tile = Tile {
     title: "RenoDX HDR mod",
     detail: "game-specific renodx-*.addon64 · Home → Add-ons → RenoDX",
@@ -609,6 +616,9 @@ fn tiles_for(st: Option<&GameStatus>, engine: Engine, renodx_on: bool) -> Vec<&'
     let mut v = base_tiles(st, engine);
     if st.is_some_and(|s| s.re_engine) {
         v.insert(0, &TILE_REFRAMEWORK);
+    }
+    if st.is_some_and(|s| s.is32()) {
+        v.insert(1, &TILE_HOST);
     }
     if renodx_on || st.is_some_and(|s| s.renodx_mod.is_some()) {
         v.push(&TILE_RENODX);

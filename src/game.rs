@@ -10,6 +10,12 @@ pub const PE_X64: u16 = 0x8664;
 pub const PE_X86: u16 = 0x014C;
 
 pub const FEEDER_ADDON: &str = "dlss5-feed.addon64";
+/// 32-bit games: the in-game half of the Feeder, and the 64-bit helper folder
+/// beside the exe that holds everything a 32-bit process cannot load
+/// (a 64-bit ReShade, the DLSS 5 add-on, the two NVIDIA DLLs, the helper exe).
+pub const FEEDER_ADDON32: &str = "dlss5-feed.addon32";
+pub const HOST_DIR: &str = "host64";
+pub const HOST_EXE: &str = "dlss5-feed-host64.exe";
 pub const FEEDER_FX: &str = "DLSS5_Feed.fx";
 pub const DLSS5_ADDON: &str = "renodx-dlss5.addon64";
 pub const DLSSNR_DLL: &str = "nvngx_dlssnr.dll";
@@ -382,6 +388,9 @@ pub struct GameStatus {
     pub dlss: bool,
     /// What the folder scan said, before any override.
     pub mode_detected: Mode,
+    /// 32-bit only: `host64\dlss5-feed-host64.exe` and a 64-bit ReShade beside it.
+    pub host_exe: bool,
+    pub host_reshade: bool,
     /// Capcom RE Engine (needs REFramework before ReShade will run).
     pub re_engine: bool,
     pub reframework: bool,
@@ -433,6 +442,18 @@ impl GameStatus {
     pub fn game_dir(&self) -> &Path {
         self.exe.parent().expect("exe has a parent")
     }
+    pub fn is32(&self) -> bool {
+        self.bitness == 32
+    }
+    /// Where the DLSS 5 add-on and the NVIDIA DLLs live: beside the exe for a
+    /// 64-bit game, in `host64\` for a 32-bit one.
+    pub fn consumer_dir(&self) -> PathBuf {
+        if self.is32() {
+            self.game_dir().join(HOST_DIR)
+        } else {
+            self.game_dir().to_path_buf()
+        }
+    }
     pub fn needs_bridge(&self) -> bool {
         self.mode == Mode::Native && self.api == Api::Dx11
     }
@@ -446,6 +467,7 @@ impl GameStatus {
                     && self.dlss5_addon
                     && self.dlssnr
                     && self.dlss
+                    && (!self.is32() || (self.host_exe && self.host_reshade))
             }
             Mode::Native => {
                 (self.opti && self.dlssnr)
@@ -486,21 +508,40 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
             ));
         }
     }
-    if bitness != 64 {
-        problems.push("32-bit game: DLSS5-Feeder needs the host64 setup, which this tool does not automate yet.".into());
-    }
     if d.join("d3d9.dll").is_file() && !d.join(RESHADE_PROXY).is_file() {
         problems
             .push("A d3d9.dll proxy is present; DirectX 9 games are not supported here.".into());
     }
-    let feeder = d.join(FEEDER_ADDON).is_file() && shaders.join(FEEDER_FX).is_file();
-    let mode_detected = if game_ships_dlss(d) {
+    let api = detect_api(exe);
+    let is32 = bitness == 32;
+    if is32 && api == Api::Dx12 {
+        problems.push(
+            "32-bit game on Direct3D 12: DLSS5-Feeder's 32-bit add-on supports Direct3D 11 only."
+                .into(),
+        );
+    }
+    // 32-bit: NGX is 64-bit only, so the game can never carry its own DLSS;
+    // everything 64-bit goes to host64\ and the Feeder's addon32 sits in-game.
+    let cdir = if is32 {
+        d.join(HOST_DIR)
+    } else {
+        d.to_path_buf()
+    };
+    let feeder = if is32 {
+        d.join(FEEDER_ADDON32).is_file() && shaders.join(FEEDER_FX).is_file()
+    } else {
+        d.join(FEEDER_ADDON).is_file() && shaders.join(FEEDER_FX).is_file()
+    };
+    let mode_detected = if !is32 && game_ships_dlss(d) {
         Mode::Native
     } else {
         Mode::Feeder
     };
-    let mode = mode_override().unwrap_or(mode_detected);
-    let api = detect_api(exe);
+    let mode = if is32 {
+        Mode::Feeder
+    } else {
+        mode_override().unwrap_or(mode_detected)
+    };
     let renodx_mod = fs::read_to_string(d.join(RENODX_MANIFEST))
         .ok()
         .map(|s| s.trim().to_owned())
@@ -518,10 +559,12 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         feeder,
         lumenite: shaders.join(LUMENITE_KERNEL_FX).is_file()
             && textures.join(LUMENITE_BLUENOISE).is_file(),
-        dlss5_addon: d.join(DLSS5_ADDON).is_file(),
-        dlssnr: d.join(DLSSNR_DLL).is_file(),
-        dlss: d.join(DLSS_DLL).is_file(),
+        dlss5_addon: cdir.join(DLSS5_ADDON).is_file(),
+        dlssnr: cdir.join(DLSSNR_DLL).is_file(),
+        dlss: cdir.join(DLSS_DLL).is_file(),
         mode_detected,
+        host_exe: is32 && cdir.join(HOST_EXE).is_file(),
+        host_reshade: is32 && is_reshade_dll(&cdir.join(RESHADE_PROXY)),
         re_engine: d.join(RE_ENGINE_PAK).is_file(),
         reframework: d.join(REFRAMEWORK_DLL).is_file(),
         renodx_mod: renodx_mod.clone(),
@@ -750,7 +793,8 @@ mod tests {
         assert!(st.problems.is_empty());
 
         let st = inspect(&make_pe(&t.path().join("g32.exe"), PE_X86)).unwrap();
-        assert!(st.problems.iter().any(|p| p.contains("32-bit")));
+        assert!(st.is32() && st.mode == Mode::Feeder);
+        assert!(!st.problems.iter().any(|p| p.contains("32-bit")));
     }
 
     #[test]
