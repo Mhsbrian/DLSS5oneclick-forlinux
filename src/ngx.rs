@@ -70,6 +70,36 @@ pub fn ngx_core() -> Option<NgxCore> {
     None
 }
 
+/// NGX Core registered, its folder present, and the driver at or past the
+/// version the neural runtime needs (616.56, the minimum OptiScaler's fork
+/// documents for DLSS-NR). When this is true, an NGX init failure is not the
+/// system's NGX being absent.
+pub fn healthy() -> bool {
+    // Linux: NGX Core is not a registry entry — the driver ships its Wine NGX
+    // DLLs instead, and Linux driver numbering does not follow the Windows
+    // 616.56 scheme, so their presence is the whole check.
+    #[cfg(target_os = "linux")]
+    {
+        crate::platform::nvngx_wine_dir().is_some()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let core_ok =
+            ngx_core().is_some_and(|c| c.installed && std::path::Path::new(&c.path).is_dir());
+        let driver_ok = crate::gpu::nvidia_driver()
+            .as_deref()
+            .and_then(version_key)
+            .is_some_and(|v| v >= (616, 56));
+        core_ok && driver_ok
+    }
+}
+
+#[cfg_attr(target_os = "linux", allow(dead_code))] // the Windows healthy() arm
+fn version_key(v: &str) -> Option<(u32, u32)> {
+    let (a, b) = v.split_once('.')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
+}
+
 /// One line for a report: driver number, NGX Core state and where it points.
 pub fn describe() -> String {
     let driver = match crate::gpu::nvidia_driver() {
@@ -102,6 +132,14 @@ fn describe_core() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn version_key_orders_driver_numbers() {
+        assert!(super::version_key("616.56").unwrap() >= (616, 56));
+        assert!(super::version_key("620.10").unwrap() > (616, 56));
+        assert!(super::version_key("572.83").unwrap() < (616, 56));
+        assert_eq!(super::version_key("nope"), None);
+    }
+
     #[test]
     fn describe_says_something() {
         assert!(!super::describe().is_empty());

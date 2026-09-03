@@ -712,6 +712,12 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
             }
         }
     }
+    // The Engine tree is skipped above because it is full of helper exes, but
+    // Satisfactory keeps its shipping exe in exactly one place inside it (#29).
+    let eng = join_ci(dir, &["Engine", "Binaries", "Win64"]);
+    if eng.is_dir() {
+        push_dir(&eng);
+    }
     let folder = norm(dir.file_name().and_then(|n| n.to_str()).unwrap_or(""));
     let mut scored: Vec<(i64, PathBuf)> = found
         .into_iter()
@@ -887,6 +893,22 @@ mod tests {
         let (exe, all) = resolve_target(&d).unwrap();
         assert_eq!(exe, d.join("Fell & Sell.exe"));
         assert_eq!(all.len(), 1);
+    }
+
+    /// Satisfactory (Epic): the launcher names FactoryGameEGS.exe in the root,
+    /// but the real game is the shipping exe under Engine\Binaries\Win64 (#29).
+    #[test]
+    fn find_game_exes_finds_shipping_exe_under_engine_binaries() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("SatisfactoryEarlyAccess");
+        let eng = d.join("Engine").join("Binaries").join("Win64");
+        fs::create_dir_all(&eng).unwrap();
+        make_pe(&d.join("FactoryGameEGS.exe"), PE_X64);
+        let real = make_pe(&eng.join("FactoryGameEGS-Win64-Shipping.exe"), PE_X64);
+        make_pe(&eng.join("CrashReportClient.exe"), PE_X64);
+        let (exe, all) = resolve_target(&d).unwrap();
+        assert_eq!(exe, real);
+        assert!(all.contains(&d.join("FactoryGameEGS.exe")));
     }
 
     #[test]

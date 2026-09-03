@@ -24,7 +24,7 @@ Everything else is upstream (currently merged at 0.10.2), unchanged: the two ins
 
 ## Use
 
-1. Run the binary. Your games appear in the library panel; pick one (or paste any game folder — Proton games from any launcher work).
+1. Run the binary. The **Games** page lists your installed games with artwork; pick one (or **Add a folder** / **Add a game** for anything else — a hand-added game is remembered in an **Added by you** section; right-click its card to forget it).
 2. **Install DLSS 5**.
 3. Let it set the launch options (or paste the shown string into Steam → right-click the game → Properties → Launch Options yourself). Restart Steam if it edited the file.
 4. In game: **Home** opens ReShade → **Add-ons** tab → **DLSS 5 Neural Rendering** panel → enable it. **F6** toggles, **F5** saves the add-on's screenshot. On the OptiScaler engine: **Insert** opens the overlay instead.

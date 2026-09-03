@@ -1,6 +1,6 @@
 [package]
 name = "dlss5oneclick"
-version = "0.10.2"
+version = "0.10.6"
 edition = "2021"
 description = "One-click DLSS 5 neural rendering setup for DX11/DX12 games, on Linux with Steam and Proton"
 license = "MIT"

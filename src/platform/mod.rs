@@ -180,6 +180,17 @@ const NVNGX_WINE_DIRS: [&str; 4] = [
     "/usr/lib/extra/nvidia/wine",
 ];
 
+/// Where the NVIDIA driver's Wine NGX DLLs live on this system, if anywhere —
+/// the Linux equivalent of Windows' NGX Core presence.
+#[cfg(target_os = "linux")]
+pub fn nvngx_wine_dir() -> Option<std::path::PathBuf> {
+    NVNGX_WINE_DIRS
+        .iter()
+        .map(Path::new)
+        .find(|d| d.join("nvngx.dll").is_file())
+        .map(Path::to_path_buf)
+}
+
 /// Assemble the Linux facts `diagnose::host_findings` reports on. Cheap, pure
 /// reads; anything unknown stays None/empty.
 #[cfg(target_os = "linux")]
@@ -196,11 +207,7 @@ pub fn host_context(st: &crate::game::GameStatus) -> crate::diagnose::HostContex
     let mut ctx = HostContext {
         relevant: true,
         launcher: entry.as_ref().map(|e| e.launcher.label()),
-        nvngx_wine_dir: NVNGX_WINE_DIRS
-            .iter()
-            .map(Path::new)
-            .find(|d| d.join("nvngx.dll").is_file())
-            .map(Path::to_path_buf),
+        nvngx_wine_dir: nvngx_wine_dir(),
         driver_version: crate::gpu::driver_version(),
         steam_running: steam::is_running(),
         ..HostContext::default()
