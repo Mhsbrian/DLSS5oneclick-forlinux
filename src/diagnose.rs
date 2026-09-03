@@ -166,7 +166,11 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
                  github.com/NIGos/dlss5-bridge.",
                 line.trim()
             )));
-        } else if bl.contains("frames:") && !bl.contains("session failed") {
+        } else if bl.contains("session failed") {
+            out.push(bad(
+                "The DX11 bridge could not open its private D3D12 session. Under Proton that                  device runs on vkd3d-proton, which the bridge supports since 1.4.6 — re-run                  Install (it refreshes the bridge to the current build) and use a recent Proton;                  if it persists, attach dlss5-bridge.log to an issue at                  github.com/NIGos/dlss5-bridge.",
+            ));
+        } else if bl.contains("frames:") {
             out.push(ok(
                 "The DX11 bridge opened its D3D12 session and is delivering frames.",
             ));
@@ -406,6 +410,17 @@ pub fn host_findings(st: &GameStatus, ctx: &HostContext) -> Vec<Finding> {
             "NVIDIA kernel module not loaded (no /sys/module/nvidia/version).",
         )),
     }
+    if st.mode == game::Mode::Native && st.api == game::Api::Dx11 {
+        if st.bridge {
+            out.push(ok(
+                "DX11 bridge installed (this game's own DLSS is D3D11; the bridge mirrors it                  onto a private D3D12 device — vkd3d-proton under Proton, supported by bridge                  1.4.6+; Install refreshes the bridge when a newer build is published).",
+            ));
+        } else {
+            out.push(bad(
+                "This game's own DLSS runs on D3D11, so the dlss5-bridge is required and it is                  not installed — run Install to add it.",
+            ));
+        }
+    }
     if ctx.d3dcompiler_missing_feeder && st.mode == game::Mode::Feeder {
         out.push(warn(
             "No d3dcompiler_47.dll next to the game exe; ReShade falls back to Proton's builtin \
@@ -507,6 +522,52 @@ mod tests {
         let (_t, exe) = setup(true);
         let st = game::inspect(&exe).unwrap();
         assert!(host_findings(&st, &HostContext::default()).is_empty());
+    }
+
+    #[test]
+    fn bridge_session_failure_is_bad() {
+        let (t, exe) = setup(false);
+        fs::write(
+            t.path().join("ReShade.log"),
+            "Initializing crosire's ReShade version '6.8.0'\nRegistered add-on \"DLSS 5 Neural Rendering\"\ninline feature 18 evaluation succeeded\n",
+        )
+        .unwrap();
+        fs::write(
+            t.path().join("dlss5-bridge.log"),
+            "bridge 1.4.5\nsession failed: D3D12CreateDevice returned E_NOINTERFACE\n",
+        )
+        .unwrap();
+        let f = run(&exe).unwrap();
+        let bad = f
+            .iter()
+            .find(|x| x.level == Level::Bad && x.text.contains("private D3D12 session"))
+            .expect("session failure finding");
+        assert!(bad.text.contains("vkd3d-proton"));
+    }
+
+    #[test]
+    fn host_findings_flag_missing_bridge_on_native_dx11() {
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+        let t = tempfile::tempdir().unwrap();
+        let exe = game::testutil::make_pe_with_imports(
+            &t.path().join("game.exe"),
+            &["d3d11.dll"],
+            2_000_000,
+        );
+        fs::write(t.path().join(game::DLSS_DLL), b"x").unwrap(); // native mode
+        let st = game::inspect(&exe).unwrap();
+        assert_eq!(st.api, game::Api::Dx11);
+        assert_eq!(st.mode, game::Mode::Native);
+        let f = host_findings(&st, &host_ctx());
+        assert!(f
+            .iter()
+            .any(|x| x.level == Level::Bad && x.text.contains("dlss5-bridge is required")));
+        fs::write(t.path().join(game::BRIDGE_ADDON), b"x").unwrap();
+        let st = game::inspect(&exe).unwrap();
+        let f = host_findings(&st, &host_ctx());
+        assert!(f
+            .iter()
+            .any(|x| x.level == Level::Ok && x.text.contains("DX11 bridge installed")));
     }
 
     #[test]

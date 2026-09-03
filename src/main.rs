@@ -19,7 +19,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 /// `dlss5oneclick <GAME.exe | game folder | game name | appid> [--remove | --remove-all |
-/// --check | --diagnose | --engine=opti | --renodx | --ignore-anticheat | --mode=feeder|native |
+/// --check | --diagnose | --engine=opti | --renodx | --ignore-anticheat | --mode=feeder|native | --bridge |
 /// --launch-options | --revert-launch-options] | --list-games | --update` runs headless;
 /// no args opens the GUI.
 fn main() {
@@ -97,6 +97,9 @@ error: {e:#}"
             eprintln!("error: --mode must be feeder or native");
             std::process::exit(1);
         }
+    }
+    if args.iter().any(|a| a == "--bridge") {
+        std::env::set_var(game::BRIDGE_ENV, "1");
     }
     if let Some(first) = args.first().filter(|a| !a.starts_with('-')) {
         attach_parent_console();
@@ -419,6 +422,14 @@ fn cli(
                     .map(|s| s.name)
                     .collect();
                 println!("  plan: {}", names.join(" -> "));
+                if st.mode == game::Mode::Native
+                    && st.api == game::Api::Unknown
+                    && !st.needs_bridge()
+                {
+                    println!(
+                        "  ! renderer not provable from the exe: if this game actually renders                          D3D11, re-run with --bridge to include the DX11 bridge"
+                    );
+                }
                 if st.re_engine {
                     println!(
                         "  RE Engine game: REFramework (dinput8.dll) {}",

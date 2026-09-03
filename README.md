@@ -31,7 +31,9 @@ Everything else is upstream (currently merged at 0.10.2), unchanged: the two ins
 
 If nothing seems to happen in game, run `--diagnose` (button or CLI) — it reads the logs and the host setup and says exactly what is wrong.
 
-CLI: `dlss5oneclick <folder | name | appid>` installs · `--check` detect only · `--diagnose` · `--remove` / `--remove-all` · `--engine=opti` · `--renodx` · `--mode=feeder|native` · `--ignore-anticheat` · `--launch-options` / `--revert-launch-options` · `--list-games` · `--update`.
+CLI: `dlss5oneclick <folder | name | appid>` installs · `--check` detect only · `--diagnose` · `--remove` / `--remove-all` · `--engine=opti` · `--renodx` · `--mode=feeder|native` · `--bridge` (force the DX11 bridge when the renderer can't be proven) · `--ignore-anticheat` · `--launch-options` / `--revert-launch-options` · `--list-games` · `--update`.
+
+**Games with a DX11/Vulkan choice** (Baldur's Gate 3 and friends): the exe picker prefers the exe that provably renders Direct3D — BG3 resolves to `bg3_dx11.exe`, gets the [dlss5-bridge](https://github.com/NIGos/dlss5-bridge) (D3D11 DLSS mirrored onto D3D12; under Proton that lands on vkd3d-proton, supported by bridge 1.4.6+), and you pick **DirectX 11** in the game's launcher. The Vulkan exe cannot carry this stack. `--diagnose` verifies the bridge is present and that its D3D12 session opened.
 
 ## Launch options details
 

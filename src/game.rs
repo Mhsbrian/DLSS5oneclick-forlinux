@@ -215,18 +215,20 @@ pub fn pe_imports(exe: &Path) -> Vec<String> {
     parse().unwrap_or_default()
 }
 
-pub fn detect_api(exe: &Path) -> Api {
-    fn classify(imports: &[String]) -> Api {
-        let has = |n: &str| imports.iter().any(|i| i == n);
-        if has("d3d12.dll") {
-            Api::Dx12
-        } else if has("d3d11.dll") {
-            Api::Dx11
-        } else {
-            Api::Unknown
-        }
+/// What the import table alone proves about the renderer.
+pub fn api_from_imports(imports: &[String]) -> Api {
+    let has = |n: &str| imports.iter().any(|i| i == n);
+    if has("d3d12.dll") {
+        Api::Dx12
+    } else if has("d3d11.dll") {
+        Api::Dx11
+    } else {
+        Api::Unknown
     }
-    let api = classify(&pe_imports(exe));
+}
+
+pub fn detect_api(exe: &Path) -> Api {
+    let api = api_from_imports(&pe_imports(exe));
     let agility_sdk = exe
         .parent()
         .is_some_and(|d| d.join("D3D12").join("D3D12Core.dll").is_file());
@@ -267,7 +269,7 @@ pub fn detect_api(exe: &Path) -> Api {
     dlls.sort_by_key(|(size, _)| std::cmp::Reverse(*size));
     let mut seen_dx11 = false;
     for (_, dll) in dlls.into_iter().take(12) {
-        match classify(&pe_imports(&dll)) {
+        match api_from_imports(&pe_imports(&dll)) {
             Api::Dx12 => return Api::Dx12,
             Api::Dx11 => seen_dx11 = true,
             Api::Unknown => {}
@@ -482,6 +484,15 @@ pub fn set_ignore_anticheat(on: bool) {
     }
 }
 
+pub const BRIDGE_ENV: &str = "DLSS5ONECLICK_BRIDGE";
+
+/// `--bridge` / `DLSS5ONECLICK_BRIDGE=1`: include the DX11 bridge for a
+/// native-DLSS game even when the import table could not prove D3D11 (some
+/// monolithic exes load D3D at runtime and read as "assume DX12").
+pub fn bridge_override() -> bool {
+    std::env::var(BRIDGE_ENV).is_ok_and(|v| v == "1")
+}
+
 impl GameStatus {
     pub fn game_dir(&self) -> &Path {
         self.exe.parent().expect("exe has a parent")
@@ -499,7 +510,7 @@ impl GameStatus {
         }
     }
     pub fn needs_bridge(&self) -> bool {
-        self.mode == Mode::Native && self.api == Api::Dx11
+        self.mode == Mode::Native && (self.api == Api::Dx11 || bridge_override())
     }
     pub fn complete(&self) -> bool {
         match self.mode {
@@ -719,6 +730,9 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
         push_dir(&eng);
     }
     let folder = norm(dir.file_name().and_then(|n| n.to_str()).unwrap_or(""));
+    // Import-table scoring reads each exe in full; only pay for it when there
+    // is an actual choice to make.
+    let contested = found.len() > 1;
     let mut scored: Vec<(i64, PathBuf)> = found
         .into_iter()
         .filter_map(|p| {
@@ -738,6 +752,15 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
                 && (n == folder || n.starts_with(&folder) || folder.starts_with(&n))
             {
                 score += 1_000_000_000;
+            }
+            // Between sibling variants, an exe whose own import table proves a
+            // D3D renderer beats one that does not: BG3 ships bg3.exe (Vulkan,
+            // no D3D imports) beside bg3_dx11.exe, and only the D3D11 one can
+            // carry ReShade and the DX11 bridge. Outranks size, yields to the
+            // -Shipping and folder-name signals (Witcher 3's two D3D exes both
+            // get it, so their order is unchanged).
+            if contested && matches!(api_from_imports(&pe_imports(&p)), Api::Dx11 | Api::Dx12) {
+                score += 500_000_000;
             }
             score += size.min(400_000_000);
             Some((score, p))
@@ -776,6 +799,61 @@ pub mod testutil {
         pe.extend_from_slice(&[0u8; 18]);
         head.extend_from_slice(&pe);
         fs::write(path, head).unwrap();
+        path.to_path_buf()
+    }
+
+    /// A minimal PE32+ whose import table names `dlls`, padded to `pad` bytes
+    /// so size-based scoring can be exercised. Parsed by `pe_imports`.
+    pub fn make_pe_with_imports(path: &Path, dlls: &[&str], pad: usize) -> PathBuf {
+        let mut head = vec![0u8; 0x40];
+        head[..2].copy_from_slice(b"MZ");
+        head[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        let coff_start = 0x40;
+        let opt_start = coff_start + 24; // sig(4) + coff(20)
+        let opt_size = 240u16; // PE32+ standard: 112 + 16 dirs * 8
+        let sec_start = opt_start + opt_size as usize;
+        let raw_start = sec_start + 40; // one section header
+        let va = 0x1000u32;
+
+        // Section payload: import descriptors (20 B each + null), then names.
+        let ndesc = dlls.len();
+        let names_off = (ndesc + 1) * 20;
+        let mut payload = vec![0u8; names_off];
+        let mut name_pos = names_off;
+        for (i, dll) in dlls.iter().enumerate() {
+            let name_rva = va + name_pos as u32;
+            payload[i * 20 + 12..i * 20 + 16].copy_from_slice(&name_rva.to_le_bytes());
+            payload.extend_from_slice(dll.as_bytes());
+            payload.push(0);
+            name_pos = payload.len();
+        }
+
+        let mut out = head;
+        out.extend_from_slice(b"PE\0\0");
+        let mut coff = Vec::new();
+        coff.extend_from_slice(&PE_X64.to_le_bytes()); // machine
+        coff.extend_from_slice(&1u16.to_le_bytes()); // one section
+        coff.extend_from_slice(&[0u8; 12]); // ts, symtab, nsyms
+        coff.extend_from_slice(&opt_size.to_le_bytes());
+        coff.extend_from_slice(&0u16.to_le_bytes()); // characteristics
+        out.extend_from_slice(&coff);
+        let mut opt = vec![0u8; opt_size as usize];
+        opt[..2].copy_from_slice(&0x20Bu16.to_le_bytes()); // PE32+
+        opt[120..124].copy_from_slice(&va.to_le_bytes()); // import dir RVA
+        opt[124..128].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&opt);
+        let mut sec = vec![0u8; 40];
+        sec[8..12].copy_from_slice(&(payload.len() as u32).to_le_bytes()); // vsize
+        sec[12..16].copy_from_slice(&va.to_le_bytes()); // vaddr
+        sec[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes()); // raw size
+        sec[20..24].copy_from_slice(&(raw_start as u32).to_le_bytes()); // raw ptr
+        out.extend_from_slice(&sec);
+        assert_eq!(out.len(), raw_start);
+        out.extend_from_slice(&payload);
+        if out.len() < pad {
+            out.resize(pad, 0);
+        }
+        fs::write(path, out).unwrap();
         path.to_path_buf()
     }
 
@@ -909,6 +987,39 @@ mod tests {
         let (exe, all) = resolve_target(&d).unwrap();
         assert_eq!(exe, real);
         assert!(all.contains(&d.join("FactoryGameEGS.exe")));
+    }
+
+    /// BG3 ships bg3.exe (Vulkan, no D3D imports) beside bg3_dx11.exe: only
+    /// the D3D11 exe can carry ReShade and the DX11 bridge, so it must win
+    /// even against a larger Vulkan sibling.
+    #[test]
+    fn find_game_exes_prefers_d3d_importing_sibling() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("Baldurs Gate 3").join("bin");
+        fs::create_dir_all(&d).unwrap();
+        make_pe_with_imports(&d.join("bg3.exe"), &["vulkan-1.dll"], 3_000_000);
+        let dx11 = make_pe_with_imports(&d.join("bg3_dx11.exe"), &["d3d11.dll"], 2_000_000);
+        let (exe, all) = resolve_target(t.path().join("Baldurs Gate 3").as_path()).unwrap();
+        assert_eq!(exe, dx11);
+        assert_eq!(all.len(), 2);
+        // Sanity: the helper's import table really parses.
+        assert_eq!(detect_api(&dx11), Api::Dx11);
+    }
+
+    #[test]
+    fn bridge_override_forces_needs_bridge() {
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe(&t.path().join("game.exe"), PE_X64);
+        fs::write(t.path().join(DLSS_DLL), b"x").unwrap(); // native mode
+        let st = inspect(&exe).unwrap();
+        assert_eq!(st.mode, Mode::Native);
+        assert_ne!(st.api, Api::Dx11);
+        assert!(!st.needs_bridge());
+        std::env::set_var(BRIDGE_ENV, "1");
+        let forced = inspect(&exe).unwrap().needs_bridge();
+        std::env::remove_var(BRIDGE_ENV);
+        assert!(forced);
     }
 
     #[test]
