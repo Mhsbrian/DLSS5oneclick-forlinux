@@ -30,12 +30,20 @@ fn ngx_init_failure(log: &str, out: &mut Vec<Finding>) {
     else {
         return;
     };
+    let system = crate::ngx::describe();
+    // Reported on three machines (RTX 4070, 5080, 5090) with NGX Core present and
+    // driver 616.56, always on the Feeder's own in-process D3D12 device. The same
+    // chain initialises NGX fine in the 32-bit host64 helper (a separate process)
+    // and on the native path where the game owns the device, so the installed
+    // files are not what decides it.
+    let advice = if crate::ngx::healthy() {
+        "Your NGX runtime and driver are fine, so this is NGX refusing the Feeder's private          D3D12 device inside the game process, which has been reported on several machines.          Worth doing: install into a game that ships its own DLSS (that path opens no private          device) to confirm NGX works for you, then report this log at          github.com/jlrouzies-fr/DLSS5-Feeder, where that device is created."
+    } else {
+        "Fix that first, then run Install again: reinstall the NVIDIA driver with a Custom          install that keeps every component (616.56 or newer)."
+    };
     out.push(bad(format!(
-        "NGX refused to initialise: {}. 0xBAD00001 is FeatureNotSupported, which NGX also \
-         answers when its runtime is not on the system — not a ReShade, shader or add-on \
-         problem. {}. Then update the NVIDIA driver (616.56 or newer) and re-run Install.",
-        line.trim(),
-        crate::ngx::describe()
+        "NGX refused to initialise: {}. 0xBAD00001 is FeatureNotSupported, which NGX also          answers when its runtime is not on the system — not a ReShade, shader or add-on          problem. {system}. {advice}",
+        line.trim()
     )));
 }
 
