@@ -98,6 +98,17 @@ pub fn download_and_swap(av: &Available, progress: &(dyn Fn(u8, &str) + Sync)) -
         let _ = std::fs::remove_file(&fresh);
         bail!("downloaded file is not a valid executable");
     }
+    // The release asset must actually carry the version the tag promises. A
+    // release built before its version bump would otherwise be installed over
+    // and over, each start offering the same update again (#26).
+    if !carries_version(&head, &av.version) {
+        let _ = std::fs::remove_file(&fresh);
+        bail!(
+            "the {} download does not identify itself as {}: the release asset is not the              version its tag claims. Nothing was changed; please report it on the issue tracker.",
+            av.tag,
+            av.version
+        );
+    }
     let old = dir.join("dlss5oneclick.exe.old");
     let _ = std::fs::remove_file(&old);
     std::fs::rename(&me, &old).context("cannot move the running exe aside")?;
@@ -108,6 +119,16 @@ pub fn download_and_swap(av: &Available, progress: &(dyn Fn(u8, &str) + Sync)) -
     }
     progress(100, "Updated; restarting");
     Ok(me)
+}
+
+/// Does this binary identify itself as `version`? Every build embeds
+/// `DLSS5oneclick <version>` (window title and About page) through
+/// `CARGO_PKG_VERSION`, as UTF-8 and as UTF-16.
+fn carries_version(bytes: &[u8], version: &str) -> bool {
+    let needle = format!("DLSS5oneclick {version}");
+    let utf16: Vec<u8> = needle.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    bytes.windows(needle.len()).any(|w| w == needle.as_bytes())
+        || bytes.windows(utf16.len()).any(|w| w == utf16)
 }
 
 /// Launch `exe` detached and return; the caller exits afterwards.
@@ -130,6 +151,20 @@ pub fn cleanup_old() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_is_checked_before_the_swap() {
+        let mut utf8 = b"MZ padding ".to_vec();
+        utf8.extend_from_slice(b"DLSS5oneclick 0.10.4 ready");
+        assert!(carries_version(&utf8, "0.10.4"));
+        assert!(!carries_version(&utf8, "0.10.5"));
+        let utf16: Vec<u8> = "DLSS5oneclick 0.10.4"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert!(carries_version(&utf16, "0.10.4"));
+        assert!(!carries_version(b"MZ nothing here", "0.10.4"));
+    }
 
     #[test]
     fn version_compare() {
