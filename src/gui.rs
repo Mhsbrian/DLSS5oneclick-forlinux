@@ -754,10 +754,13 @@ const TILES_NATIVE: [Tile; 4] = [
         optional: false,
     },
     Tile {
+        // Only listed at all when needs_bridge() (D3D11 game with its own
+        // DLSS), and complete() requires it then — so it is never optional:
+        // "optional" would render the misleading "not needed" while missing.
         title: "DX11 bridge",
-        detail: "dlss5-bridge.addon64 (NIGos) · D3D11 games",
+        detail: "dlss5-bridge.addon64 (NIGos) · required for D3D11 games with their own DLSS",
         ok: |s| s.bridge,
-        optional: true,
+        optional: false,
     },
 ];
 
