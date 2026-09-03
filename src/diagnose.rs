@@ -150,7 +150,16 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
 
     // ── DX11 bridge (native DLSS on D3D11) ──────────────────────────
     if let Some(bl) = read(d, "dlss5-bridge.log") {
-        if let Some(line) = bl.lines().rev().find(|l| l.contains("stopped:")) {
+        if bl.contains("### CRASH RECORDED ###") {
+            let exc = bl
+                .lines()
+                .find(|l| l.contains("exception 0x"))
+                .map(str::trim)
+                .unwrap_or("see the log");
+            out.push(bad(format!(
+                "The DX11 bridge recorded a crash during its work ({exc}) — its \"game renders                  normally\" stop message notwithstanding, an exception like this can take the                  game down with it. To play now: set stage=0 in dlss5-bridge.cfg (bridge off, no                  neural rendering) or Remove. Please attach dlss5-bridge.log to an issue at                  github.com/NIGos/dlss5-bridge — the crash block in it is exactly what its                  author asks for. The OptiScaler engine is an alternative path that needs no                  bridge."
+            )));
+        } else if let Some(line) = bl.lines().rev().find(|l| l.contains("stopped:")) {
             out.push(bad(format!("The DX11 bridge stopped: {}", line.trim())));
         }
         if let Some(line) = bl
@@ -522,6 +531,30 @@ mod tests {
         let (_t, exe) = setup(true);
         let st = game::inspect(&exe).unwrap();
         assert!(host_findings(&st, &HostContext::default()).is_empty());
+    }
+
+    #[test]
+    fn bridge_recorded_crash_is_named() {
+        let (t, exe) = setup(false);
+        fs::write(
+            t.path().join("ReShade.log"),
+            "Initializing crosire's ReShade version '6.8.0'\nRegistered add-on \"DLSS 5 Neural Rendering\"\ninline feature 18 evaluation succeeded\n",
+        )
+        .unwrap();
+        fs::write(
+            t.path().join("dlss5-bridge.log"),
+            "stopped: NGX raised an exception inside the D3D12 evaluate. The game renders normally.\n### CRASH RECORDED ###\n  exception 0xE06D7363 at 00006FFFFFBFD947\n",
+        )
+        .unwrap();
+        let f = run(&exe).unwrap();
+        let bad = f
+            .iter()
+            .find(|x| x.level == Level::Bad && x.text.contains("recorded a crash"))
+            .expect("crash finding");
+        assert!(bad.text.contains("0xE06D7363"));
+        assert!(bad.text.contains("stage=0"));
+        // The misleading "stopped" line is superseded, not duplicated.
+        assert!(!f.iter().any(|x| x.text.starts_with("The DX11 bridge stopped:")));
     }
 
     #[test]
