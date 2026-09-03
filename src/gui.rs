@@ -1025,13 +1025,19 @@ impl App {
                             }
                             if hit {
                                 let g = &self.games[i];
-                                // The store's own exe when it names one and it is readable;
-                                // else the folder, which the exe finder resolves.
-                                clicked = Some(match &g.exe_hint {
-                                    Some(e) if e.is_file() && game::exe_bitness(e).is_ok() => {
-                                        e.clone()
-                                    }
-                                    _ => g.dir.clone(),
+                                // The folder, so the exe finder ranks every candidate:
+                                // a store's launch exe can be a bootstrapper (Epic names
+                                // Satisfactory's FactoryGameEGS.exe, the real one is the
+                                // -Shipping.exe under Engine\Binaries\Win64, #29). The
+                                // store's exe is the fallback when nothing is found.
+                                clicked = Some(match game::resolve_target(&g.dir) {
+                                    Ok(_) => g.dir.clone(),
+                                    Err(_) => match &g.exe_hint {
+                                        Some(e) if e.is_file() && game::exe_bitness(e).is_ok() => {
+                                            e.clone()
+                                        }
+                                        _ => g.dir.clone(),
+                                    },
                                 });
                             }
                         }
