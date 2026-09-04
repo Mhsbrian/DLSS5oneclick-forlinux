@@ -57,6 +57,13 @@ pub struct App {
     update: UpdateState,
     update_rx: Option<Receiver<UpdateState>>,
     skipped_version: String,
+    /// The user pressed "Check for updates": the answer is worth showing even
+    /// when it is "nothing new", which a background check never says.
+    checked_manually: bool,
+    /// When the last update check ran. The check used to happen once, at
+    /// startup, so a release published while the window was open was never
+    /// noticed -- the tool sat there saying it was current for days.
+    last_update_check: std::time::Instant,
     /// "Also install the RenoDX HDR mod" checkbox.
     renodx_on: bool,
     renodx: RenodxLookup,
@@ -164,6 +171,8 @@ impl App {
             search: String::new(),
             store_icons: HashMap::new(),
             kofi_icon: None,
+            checked_manually: false,
+            last_update_check: std::time::Instant::now(),
             skipped_version: cc
                 .storage
                 .and_then(|s| s.get_string("skip_version"))
@@ -473,7 +482,22 @@ impl App {
         self.page = Page::Setup;
     }
 
+    /// Re-check at most this often while the window is open.
+    const UPDATE_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+    /// Called every frame: cheap, and only starts a request when the interval
+    /// has passed and nothing else is in flight.
+    fn maybe_recheck_update(&mut self) {
+        if self.update_rx.is_some() || !matches!(self.update, UpdateState::Idle) {
+            return;
+        }
+        if self.last_update_check.elapsed() >= Self::UPDATE_CHECK_EVERY {
+            self.start_update_check();
+        }
+    }
+
     fn start_update_check(&mut self) {
+        self.last_update_check = std::time::Instant::now();
         let (tx, rx) = channel::<UpdateState>();
         self.update_rx = Some(rx);
         thread::spawn(move || {
@@ -1435,6 +1459,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.pump();
         self.pump_renodx();
+        self.maybe_recheck_update();
         if self.running || matches!(self.renodx, RenodxLookup::Pending) {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
@@ -1753,6 +1778,39 @@ impl eframe::App for App {
                     }
                     Page::About => {
                         about_page(ui);
+                        ui.add_space(10.0);
+                        let busy = self.update_rx.is_some()
+                            || !matches!(self.update, UpdateState::Idle);
+                        let btn = egui::Button::new(
+                            RichText::new("Check for updates")
+                                .font(t::plex_medium(12.5))
+                                .color(t::TEXT),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::new(1.0, t::BORDER_STRONG))
+                        .corner_radius(CornerRadius::same(8))
+                        .min_size(Vec2::new(150.0, 34.0));
+                        if ui.add_enabled(!busy, btn).clicked() {
+                            // An explicit check also clears a skipped version:
+                            // asking is asking.
+                            self.skipped_version.clear();
+                            self.checked_manually = true;
+                            self.start_update_check();
+                        }
+                        if self.checked_manually
+                            && matches!(self.update, UpdateState::Idle)
+                            && self.update_rx.is_none()
+                        {
+                            ui.label(
+                                RichText::new(concat!(
+                                    "You are on the newest release (v",
+                                    env!("CARGO_PKG_VERSION"),
+                                    ")."
+                                ))
+                                .font(t::plex(12.0))
+                                .color(t::TEXT_MUTED),
+                            );
+                        }
                         return;
                     }
                     Page::Setup => {}
