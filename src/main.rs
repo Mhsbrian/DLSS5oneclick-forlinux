@@ -281,6 +281,22 @@ fn cli(
                         gpupref::get(&exe).unwrap_or_else(|| "not set".into())
                     );
                 }
+                if game::installed_by_tool(st.game_dir()) {
+                    // Same comparison the Games page makes, so a stale install
+                    // can be seen without opening the window.
+                    let latest = net::client()
+                        .map(|c| installer::Latest::fetch(&c))
+                        .unwrap_or_default();
+                    match installer::stale_components(st.game_dir(), &latest).as_slice() {
+                        [] => println!("  installed by this tool · everything current"),
+                        stale => {
+                            println!("  installed by this tool · out of date:");
+                            for s in stale {
+                                println!("    {s}");
+                            }
+                        }
+                    }
+                }
                 if let Some(m) = &st.renodx_mod {
                     println!("  RenoDX mod installed: {m}");
                 }

@@ -96,6 +96,11 @@ struct GameMeta {
     has_dlss: bool,
     addon: bool,
     ready: bool,
+    /// This tool installed into that folder: the game is listed in its own
+    /// section at the top rather than under its store.
+    installed: bool,
+    /// Components this tool placed that upstream has since moved past.
+    stale: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -318,6 +323,11 @@ impl App {
         let ctx2 = ctx.clone();
         let g2 = games.clone();
         thread::spawn(move || {
+            // One lookup for the whole scan; every game is then compared
+            // against it by reading the markers this tool wrote.
+            let latest = net::client()
+                .map(|c| installer::Latest::fetch(&c))
+                .unwrap_or_default();
             for (i, g) in g2.iter().enumerate() {
                 let meta = game::resolve_target(&g.dir)
                     .and_then(|(exe, _)| game::inspect(&exe))
@@ -332,6 +342,8 @@ impl App {
                         has_dlss: st.mode == game::Mode::Native,
                         addon: st.dlss5_addon || st.opti,
                         ready: st.complete(),
+                        installed: game::installed_by_tool(st.game_dir()),
+                        stale: installer::stale_components(st.game_dir(), &latest),
                     });
                 if let Some(m) = meta {
                     let _ = mtx.send((i, m));
@@ -961,19 +973,29 @@ impl App {
                 let card_w =
                     ((avail - CARD_GAP * (cols as f32 - 1.0)) / cols as f32).clamp(CARD_W, 190.0);
                 let poster_h = (card_w * 1.5).round();
-                for store in [
-                    Store::Manual,
-                    Store::Steam,
-                    Store::Epic,
-                    Store::Gog,
-                    Store::Xbox,
-                ] {
+                // None = "Installed by this tool", always first: the whole
+                // point is to see at a glance what has been modified and
+                // what has fallen behind.
+                let sections: [Option<Store>; 6] = [
+                    None,
+                    Some(Store::Manual),
+                    Some(Store::Steam),
+                    Some(Store::Epic),
+                    Some(Store::Gog),
+                    Some(Store::Xbox),
+                ];
+                for section in sections {
                     let idx: Vec<usize> = self
                         .games
                         .iter()
                         .enumerate()
-                        .filter(|(_, g)| {
-                            g.store == store
+                        .filter(|(i, g)| {
+                            let ours = self.meta.get(i).is_some_and(|m| m.installed);
+                            let in_section = match section {
+                                None => ours,
+                                Some(st) => g.store == st && !ours,
+                            };
+                            in_section
                                 && (needle.is_empty()
                                     || g.title.to_ascii_lowercase().contains(&needle))
                         })
@@ -986,13 +1008,20 @@ impl App {
                         .iter()
                         .filter(|i| self.meta.get(i).is_some_and(|m| m.ready))
                         .count();
+                    let stale = idx
+                        .iter()
+                        .filter(|i| self.meta.get(i).is_some_and(|m| !m.stale.is_empty()))
+                        .count();
                     ui.horizontal(|ui| {
                         ui.set_max_width(avail);
                         ui.spacing_mut().item_spacing.x = 8.0;
                         ui.label(
-                            RichText::new(store.label())
-                                .font(t::plex_semibold(13.0))
-                                .color(t::TEXT),
+                            RichText::new(match section {
+                                None => "Installed by this tool",
+                                Some(st) => st.label(),
+                            })
+                            .font(t::plex_semibold(13.0))
+                            .color(t::TEXT),
                         );
                         ui.label(
                             RichText::new(idx.len().to_string())
@@ -1000,7 +1029,13 @@ impl App {
                                 .color(t::TEXT_DIM),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ready > 0 {
+                            if stale > 0 {
+                                ui.label(
+                                    RichText::new(format!("{stale} need updating"))
+                                        .font(t::plex(11.5))
+                                        .color(t::WARN),
+                                );
+                            } else if ready > 0 {
                                 ui.label(
                                     RichText::new(format!("{ready} ready for DLSS 5"))
                                         .font(t::plex(11.5))
@@ -1150,6 +1185,16 @@ impl App {
             );
             p.rect_filled(chip, CornerRadius::same(6), t::ACCENT);
             p.galley(chip.min + pad, galley, t::BG);
+            // A game this tool set up whose files upstream has moved past.
+            if !m.stale.is_empty() {
+                let galley = p.layout_no_wrap("UPDATE".to_owned(), font, t::BG);
+                let badge = egui::Rect::from_min_size(
+                    egui::pos2(poster.left() + 8.0, poster.top() + 8.0),
+                    galley.size() + pad * 2.0,
+                );
+                p.rect_filled(badge, CornerRadius::same(6), t::WARN);
+                p.galley(badge.min + pad, galley, t::BG);
+            }
             // Status line over the bottom of the poster.
             let band = egui::Rect::from_min_max(
                 egui::pos2(poster.left(), poster.bottom() - 26.0),
@@ -1203,8 +1248,14 @@ impl App {
             StrokeKind::Inside,
         );
         if hovered {
+            let stale = self
+                .meta
+                .get(&i)
+                .filter(|m| !m.stale.is_empty())
+                .map(|m| format!("\n\nOut of date:\n  {}", m.stale.join("\n  ")))
+                .unwrap_or_default();
             resp.clone()
-                .on_hover_text(format!("{}\n{}", g.title, g.dir.display()));
+                .on_hover_text(format!("{}\n{}{stale}", g.title, g.dir.display()));
         }
         let mut forget = false;
         if g.store == Store::Manual {

@@ -31,6 +31,9 @@ pub const DLSS_MARKER: &str = "nvngx_dlss.dll.dlss5oneclick";
 /// tool placed, so Install can tell "ours and stale" from "the user's own".
 pub const DLSSNR_MARKER: &str = "nvngx_dlssnr.dll.dlss5oneclick";
 pub const RESHADE_MARKER: &str = "dxgi.dll.dlss5oneclick";
+/// The DLSS5-Feeder release tag this tool placed, so a stale install can be
+/// spotted without downloading the zip to compare sizes.
+pub const FEEDER_MARKER: &str = "dlss5-feed.dlss5oneclick";
 pub const RESHADE_PROXY: &str = "dxgi.dll";
 /// Shader headers the official installer fetches from crosire/reshade-shaders (branch `slim`).
 /// Not inside the setup exe. DLSS5_Feed.fx and every lumenite_*.fx include ReShade.fxh;
@@ -731,6 +734,23 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
 
 /// Accepts either a game exe or a game folder; returns the exe to use plus
 /// every candidate found (empty when the input was already an exe).
+/// Did this tool install into this folder? True when any marker or manifest
+/// it writes is present. Used to group those games together (#nn) and to
+/// decide whether a component may be refreshed.
+pub fn installed_by_tool(dir: &Path) -> bool {
+    [
+        OPTI_MANIFEST,
+        RENODX_MANIFEST,
+        REFRAMEWORK_MARKER,
+        DLSS_MARKER,
+        DLSSNR_MARKER,
+        RESHADE_MARKER,
+        FEEDER_MARKER,
+    ]
+    .iter()
+    .any(|m| dir.join(m).is_file())
+}
+
 pub fn resolve_target(input: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
     if input.is_file() {
         return Ok((input.to_path_buf(), Vec::new()));

@@ -53,16 +53,79 @@ const STEP_OPTI: Step = Step {
 /// Extract the whole OptiScaler_DLSSNR release into the game folder,
 /// writing `OptiScaler.dll` as `dxgi.dll` (the fork's default load name for
 /// DX11/DX12 games) and recording every path in a manifest for uninstall.
+/// The release tag recorded in an OptiScaler manifest, from its `# tag v…`
+/// header. A manifest written before this was recorded has none.
+/// The newest release of every component, fetched once and compared against
+/// what each game has recorded. Empty fields mean "could not check".
+#[derive(Debug, Clone, Default)]
+pub struct Latest {
+    pub reshade: Option<String>,
+    pub feeder: Option<String>,
+    pub opti: Option<String>,
+    pub dlss: Option<String>,
+    pub dlssnr: Option<String>,
+}
+
+impl Latest {
+    pub fn fetch(client: &Client) -> Self {
+        Latest {
+            reshade: resolve_reshade_setup(client).ok().map(|(v, _)| v),
+            feeder: net::latest_tag(client, FEEDER_REPO).ok(),
+            opti: net::latest_tag(client, OPTI_REPO).ok(),
+            dlss: rhi_latest(client, "dlss-").ok().map(|(t, _)| t),
+            dlssnr: rhi_latest(client, "dlssnr-").ok().map(|(t, _)| t),
+        }
+    }
+}
+
+/// Components this tool placed in `dir` whose recorded version is behind
+/// `latest`. A component with no marker was not placed by this tool and is
+/// never reported, so a user's own ReShade never shows up as "out of date".
+pub fn stale_components(dir: &Path, latest: &Latest) -> Vec<String> {
+    let mine = |marker: &str| fs::read_to_string(dir.join(marker)).ok();
+    let mut out = Vec::new();
+    let mut check = |name: &str, have: Option<String>, want: &Option<String>| {
+        if let (Some(h), Some(w)) = (have, want) {
+            if h.trim() != w.trim() {
+                out.push(format!("{name} {} → {w}", h.trim()));
+            }
+        }
+    };
+    check("ReShade", mine(game::RESHADE_MARKER), &latest.reshade);
+    check("DLSS5-Feeder", mine(game::FEEDER_MARKER), &latest.feeder);
+    check("nvngx_dlss.dll", mine(game::DLSS_MARKER), &latest.dlss);
+    check(
+        "nvngx_dlssnr.dll",
+        mine(game::DLSSNR_MARKER),
+        &latest.dlssnr,
+    );
+    if let Ok(m) = fs::read_to_string(dir.join(game::OPTI_MANIFEST)) {
+        match (manifest_tag(&m), &latest.opti) {
+            (Some(have), Some(want)) if have.trim() != want.trim() => {
+                out.push(format!("OptiScaler {} → {want}", have.trim()))
+            }
+            // Installed before the version was recorded (0.11.0), so what is on
+            // disk cannot be compared: an Install settles it either way.
+            (None, Some(want)) => out.push(format!("OptiScaler unknown version → {want}")),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn manifest_tag(manifest: &str) -> Option<String> {
+    manifest
+        .lines()
+        .find_map(|l| l.strip_prefix("# tag "))
+        .map(|t| t.trim().to_owned())
+}
+
 fn step_opti(
     client: &Client,
     st: &GameStatus,
     work: &Path,
     progress: Progress,
 ) -> Result<Vec<String>> {
-    if st.opti {
-        progress(100, "OptiScaler already installed");
-        return Ok(vec![]);
-    }
     let d = st.game_dir();
     if game::is_reshade_dll(&d.join(game::RESHADE_PROXY)) {
         bail!(
@@ -71,11 +134,38 @@ fn step_opti(
         );
     }
     progress(0, "Looking up latest OptiScaler DLSS-NR release");
+    // An installed OptiScaler used to be left alone forever, so a game set up
+    // in August still ran August's build after every reinstall. The tag is
+    // recorded in the manifest; a copy this tool placed is refreshed when
+    // upstream moves on, and one it did not place is never touched.
+    let latest = net::latest_tag(client, OPTI_REPO).ok();
+    if st.opti {
+        // No manifest at all: somebody else put OptiScaler there. A manifest
+        // without a "# tag" line is ours, from before the tag was recorded --
+        // refresh it, which also writes the tag for next time.
+        let Some(manifest) = fs::read_to_string(d.join(game::OPTI_MANIFEST)).ok() else {
+            return Ok(vec![
+                "OptiScaler present (not placed by this tool, left as is)".to_owned(),
+            ]);
+        };
+        match (manifest_tag(&manifest), &latest) {
+            (Some(a), Some(b)) if &a == b => {
+                return Ok(vec![format!("OptiScaler already current ({a})")]);
+            }
+            (Some(a), Some(b)) => progress(0, &format!("OptiScaler {a} is out, {b} available")),
+            (Some(_), None) => {
+                return Ok(vec![
+                    "OptiScaler present (could not check for a newer one)".to_owned()
+                ]);
+            }
+            (None, _) => progress(0, "OptiScaler version not recorded, refreshing"),
+        }
+    }
     // Stable release only (releases/latest skips pre-releases); the API list
     // and the releases page both put betas first.
-    let asset: String = match net::latest_tag(client, OPTI_REPO) {
-        Ok(tag) => net::github_asset_url_html(client, OPTI_REPO, &tag, r#"[^"]+\.zip"#)?,
-        Err(_) => match net::get_json_github(client, OPTI_RELEASES) {
+    let asset: String = match latest.clone() {
+        Some(tag) => net::github_asset_url_html(client, OPTI_REPO, &tag, r#"[^"]+\.zip"#)?,
+        None => match net::get_json_github(client, OPTI_RELEASES) {
             Ok(releases) => releases
                 .as_array()
                 .and_then(|a| a.iter().find(|r| r["prerelease"] != Value::Bool(true)))
@@ -137,7 +227,14 @@ fn step_opti(
     if !installed.iter().any(|p| p == game::RESHADE_PROXY) {
         bail!("the OptiScaler release had no OptiScaler.dll — layout changed upstream");
     }
-    fs::write(d.join(game::OPTI_MANIFEST), installed.join("\n"))?;
+    let header = latest
+        .as_deref()
+        .map(|t| format!("# tag {t}\n"))
+        .unwrap_or_default();
+    fs::write(
+        d.join(game::OPTI_MANIFEST),
+        format!("{header}{}", installed.join("\n")),
+    )?;
     installed.push(game::OPTI_MANIFEST.into());
     Ok(installed)
 }
@@ -148,7 +245,10 @@ fn uninstall_opti(d: &Path, removed: &mut Vec<String>) -> Result<()> {
     let Ok(list) = fs::read_to_string(&manifest) else {
         return Ok(());
     };
-    for rel in list.lines().filter(|l| !l.trim().is_empty()) {
+    for rel in list
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+    {
         let clean: Vec<&str> = rel
             .split('/')
             .filter(|p| !p.is_empty() && *p != "." && *p != "..")
@@ -709,6 +809,7 @@ fn step_feeder(
         return Ok(vec![format!("DLSS5-Feeder already current ({tag}{note})")]);
     }
     net::extract_member(&mut zip, &addon, &d.join(addon_name))?;
+    fs::write(d.join(game::FEEDER_MARKER), tag.as_bytes())?;
     let mut out = vec![format!("{addon_name} ({tag}{note})")];
     if let Some(m) = &host_member {
         let host = st.consumer_dir();
@@ -1114,6 +1215,7 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
     let mut targets: Vec<PathBuf> = vec![
         d.join(game::DLSS_MARKER),
         d.join(game::DLSSNR_MARKER),
+        d.join(game::FEEDER_MARKER),
         d.join(game::FEEDER_ADDON),
         d.join(game::DLSS5_ADDON),
         d.join(game::DLSSNR_DLL),
@@ -1575,6 +1677,54 @@ mod tests {
 
     /// Upstream publishes some "-beta" tags with prerelease=false, so the tag
     /// name is what decides whether the install log says beta.
+    /// Only a component this tool recorded can be reported as out of date;
+    /// a user's own ReShade has no marker and must stay invisible.
+    #[test]
+    fn stale_components_reports_only_what_we_placed() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let latest = Latest {
+            reshade: Some("6.8.0".into()),
+            feeder: Some("v0.13.1-beta.1".into()),
+            opti: Some("v0.2.0-dlssnr".into()),
+            dlss: Some("dlss-310.9.0".into()),
+            dlssnr: Some("dlssnr-310.8.SF-v2".into()),
+        };
+        assert!(stale_components(d, &latest).is_empty());
+
+        fs::write(d.join(game::FEEDER_MARKER), "v0.12.0").unwrap();
+        fs::write(d.join(game::DLSS_MARKER), "dlss-310.9.0").unwrap();
+        fs::write(
+            d.join(game::OPTI_MANIFEST),
+            "# tag v0.1.2-dlssnr\ndxgi.dll\n",
+        )
+        .unwrap();
+        let stale = stale_components(d, &latest);
+        assert_eq!(
+            stale,
+            vec![
+                "DLSS5-Feeder v0.12.0 → v0.13.1-beta.1".to_string(),
+                "OptiScaler v0.1.2-dlssnr → v0.2.0-dlssnr".to_string(),
+            ]
+        );
+
+        // A manifest from before the tag was recorded cannot be compared, and
+        // saying nothing would leave a stale install looking current.
+        fs::write(d.join(game::OPTI_MANIFEST), "dxgi.dll\nOptiScaler.ini\n").unwrap();
+        assert!(stale_components(d, &latest)
+            .iter()
+            .any(|s| s == "OptiScaler unknown version → v0.2.0-dlssnr"));
+    }
+
+    /// The manifest carries the tag on a comment line, and older manifests
+    /// (written before that) must read as "unknown" rather than as a path.
+    #[test]
+    fn manifest_tag_is_read_from_the_header() {
+        let m = "# tag v0.2.0-dlssnr\nOptiScaler.dll\ndxgi.dll\n";
+        assert_eq!(manifest_tag(m).as_deref(), Some("v0.2.0-dlssnr"));
+        assert_eq!(manifest_tag("OptiScaler.dll\ndxgi.dll\n"), None);
+    }
+
     #[test]
     fn prerelease_tags_are_named_by_their_tag() {
         assert!(is_prerelease_tag("v0.13.1-beta.1"));
