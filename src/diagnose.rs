@@ -37,7 +37,7 @@ fn ngx_init_failure_for(log: &str, exe: Option<&std::path::Path>, out: &mut Vec<
         let set = exe.is_some_and(|e| {
             crate::gpupref::get(e).is_some_and(|v| crate::gpupref::is_high_performance(&v))
         });
-        let names: Vec<String> = crate::gpu::list().into_iter().map(|g| g.name).collect();
+        let names = crate::gpupref::real_adapters();
         out.push(bad(format!(
             "More than one GPU vendor on this machine ({}), and Windows decides which one              a process starts on. Started on the integrated GPU, NGX does not exist and              every Init answers 0xBAD00001 — this is the most likely cause here{}.              Settings ▸ System ▸ Display ▸ Graphics ▸ Add a desktop app ▸ pick the game's exe              (and, for a 32-bit game, host64\\dlss5-feed-host64.exe) ▸ Options ▸ High performance.              Install sets that for you from this version on.",
             names.join(", "),

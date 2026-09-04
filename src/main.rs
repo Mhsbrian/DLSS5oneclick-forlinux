@@ -272,11 +272,7 @@ fn cli(
                     // exists in it at all (#25).
                     println!(
                         "  hybrid machine ({}) · Windows GPU preference for {}: {}",
-                        gpu::list()
-                            .into_iter()
-                            .map(|g| g.name)
-                            .collect::<Vec<_>>()
-                            .join(", "),
+                        gpupref::real_adapters().join(", "),
                         exe.file_name().unwrap_or_default().to_string_lossy(),
                         gpupref::get(&exe).unwrap_or_else(|| "not set".into())
                     );

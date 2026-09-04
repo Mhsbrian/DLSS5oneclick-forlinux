@@ -22,14 +22,27 @@ pub const HIGH_PERFORMANCE: &str = "GpuPreference=2;";
 /// True when a non-NVIDIA display adapter sits next to an NVIDIA one, i.e. the
 /// machine can start a process on a GPU that has no NGX.
 pub fn hybrid() -> bool {
-    let list = crate::gpu::list();
-    let nvidia = list
+    hybrid_from(&real_adapters())
+}
+
+/// Display adapters that are actual graphics hardware. A machine with a VR
+/// runtime or a virtual-monitor driver lists several that are not (#30).
+pub fn real_adapters() -> Vec<String> {
+    crate::gpu::list()
+        .into_iter()
+        .map(|g| g.name)
+        .filter(|n| !crate::gpu::is_virtual_adapter(n))
+        .collect()
+}
+
+pub fn hybrid_from(names: &[String]) -> bool {
+    let nvidia = names
         .iter()
-        .any(|g| g.name.to_ascii_lowercase().contains("nvidia"));
+        .any(|n| n.to_ascii_lowercase().contains("nvidia"));
     nvidia
-        && list
+        && names
             .iter()
-            .any(|g| crate::gpu::classify(&g.name) == crate::gpu::Tier::NotNvidia)
+            .any(|n| crate::gpu::classify(n) == crate::gpu::Tier::NotNvidia)
 }
 
 /// Replace (or add) the `GpuPreference` token, keeping every other token.
@@ -174,6 +187,30 @@ pub use imp::{clear_ours, get, set_high_performance};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A VR runtime or a virtual-monitor driver adds adapters that are not
+    /// graphics cards; counting them told a single-GPU owner his game was
+    /// starting on an integrated GPU (#30).
+    #[test]
+    fn virtual_monitors_are_not_a_second_gpu() {
+        let names: Vec<String> = [
+            "Meta Virtual Monitor",
+            "LuminonCore IDDCX Adapter",
+            "NVIDIA GeForce RTX 4060 Ti",
+            "MrIdd Device",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert!(!hybrid_from(&names));
+
+        // A real iGPU beside the card still counts.
+        let names: Vec<String> = ["NVIDIA GeForce RTX 4070", "AMD Radeon(TM) Graphics"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(hybrid_from(&names));
+    }
 
     #[test]
     fn preference_token_is_replaced_not_appended() {
