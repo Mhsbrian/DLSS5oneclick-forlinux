@@ -32,6 +32,8 @@ DX11 vs DX12 is read from the exe's import table, then from the engine DLLs next
 
 ### The no-DLSS path
 
+**Every component is taken from its project's latest release.** For DLSS5-Feeder that can be a tag named `-beta`: upstream publishes builds it means people to run with `prerelease=false` (v0.13.1-beta.1, v0.12.1-beta.2) while flagging the ones it does not, and those carry fixes the last plain-numbered release lacks. Install names the tag it took, with `(beta)` after it, so you always know what you are running.
+
 It does, in order, exactly what the [DLSS5-Feeder README](https://github.com/jlrouzies-fr/DLSS5-Feeder#install-for-a-64-bit-game) tells you to do by hand:
 
 | Step | What | From |

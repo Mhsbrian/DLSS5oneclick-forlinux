@@ -633,6 +633,13 @@ fn step_headers(
 
 // ── step 3: DLSS5-Feeder ───────────────────────────────────────────
 
+/// A release whose tag says beta or rc. Upstream does not flag all of them
+/// as prereleases, so the name is what the install log goes by.
+fn is_prerelease_tag(tag: &str) -> bool {
+    let t = tag.to_ascii_lowercase();
+    t.contains("beta") || t.contains("-rc") || t.contains("alpha")
+}
+
 fn step_feeder(
     client: &Client,
     st: &GameStatus,
@@ -645,15 +652,26 @@ fn step_feeder(
     progress(0, "Looking up latest DLSS5-Feeder");
     // Since 0.11 the project ships one zip per release instead of loose assets;
     // the file name carries the version, so the tag is read first.
-    // Stable release only; the releases page lists betas first.
+    //
+    // Whatever upstream marks as the latest release is what gets installed,
+    // including a tag named "-beta": that project publishes builds it means
+    // people to run with prerelease=false (v0.13.1-beta.1, v0.12.1-beta.2)
+    // while flagging the ones it does not (v0.13.0-beta.1). Those carry
+    // fixes the stable v0.12.0 lacks. The name is reported, so a beta is
+    // never installed silently.
     let tag = match net::latest_tag(client, FEEDER_REPO) {
         Ok(t) => t,
-        Err(_) => net::github_release_tags_html(client, FEEDER_REPO, "v", 2)?
+        Err(_) => net::github_release_tags_html(client, FEEDER_REPO, "v", 1)?
             .into_iter()
-            .find(|t| !t.contains("beta") && !t.contains("rc"))
+            .next()
             .ok_or_else(|| anyhow!("no DLSS5-Feeder release found"))?,
     };
     let tag = &tag;
+    let note = if is_prerelease_tag(tag) {
+        " (beta)"
+    } else {
+        ""
+    };
     let url = net::github_asset_url_html(client, FEEDER_REPO, tag, r#"[^"]+\.zip"#)?;
     let zip_path = work.join("dlss5-feeder.zip");
     net::download(client, &url, &zip_path, "DLSS5-Feeder", progress)?;
@@ -688,15 +706,19 @@ fn step_feeder(
         None => true,
     };
     if st.feeder && host_current && same_size(&mut zip, &addon, &d.join(addon_name)) {
-        return Ok(vec![format!("DLSS5-Feeder already current ({tag})")]);
+        return Ok(vec![format!("DLSS5-Feeder already current ({tag}{note})")]);
     }
     net::extract_member(&mut zip, &addon, &d.join(addon_name))?;
-    let mut out = vec![format!("{addon_name} ({tag})")];
+    let mut out = vec![format!("{addon_name} ({tag}{note})")];
     if let Some(m) = &host_member {
         let host = st.consumer_dir();
         fs::create_dir_all(&host)?;
         net::extract_member(&mut zip, m, &host.join(game::HOST_EXE))?;
-        out.push(format!("{}/{} ({tag})", game::HOST_DIR, game::HOST_EXE));
+        out.push(format!(
+            "{}/{} ({tag}{note})",
+            game::HOST_DIR,
+            game::HOST_EXE
+        ));
     }
     net::extract_member(
         &mut zip,
@@ -1549,6 +1571,17 @@ mod tests {
         fs::write(t.path().join(game::REFRAMEWORK_MARKER), b"").unwrap();
         let removed = uninstall(&exe).unwrap();
         assert!(removed.contains(&game::REFRAMEWORK_DLL.to_string()));
+    }
+
+    /// Upstream publishes some "-beta" tags with prerelease=false, so the tag
+    /// name is what decides whether the install log says beta.
+    #[test]
+    fn prerelease_tags_are_named_by_their_tag() {
+        assert!(is_prerelease_tag("v0.13.1-beta.1"));
+        assert!(is_prerelease_tag("v0.12.1-beta.2"));
+        assert!(is_prerelease_tag("v1.0.0-rc.1"));
+        assert!(!is_prerelease_tag("v0.12.0"));
+        assert!(!is_prerelease_tag("v1.4.8"));
     }
 
     #[test]
