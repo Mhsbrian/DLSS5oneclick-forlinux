@@ -97,6 +97,18 @@ fn read(dir: &Path, name: &str) -> Option<String> {
     fs::read_to_string(dir.join(name)).ok()
 }
 
+/// The exe ReShade actually loaded into, from its first line:
+/// `... loaded from '...dxgi.dll' into 'C:\\...bg3_dx11.exe' (0x...)`.
+fn reshade_host_exe(log: &str) -> Option<String> {
+    let line = log
+        .lines()
+        .find(|l| l.contains("loaded from") && l.contains(" into "))?;
+    let path = line.split(" into ").nth(1)?.split('\'').nth(1)?;
+    std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+}
+
 /// Findings for a game folder, in reading order.
 pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
     let d = st.game_dir();
@@ -182,11 +194,41 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
              in the add-on panel.",
         ));
     } else if st.mode == game::Mode::Native {
-        out.push(bad(
-            "No NGX call was intercepted: this game's own DLSS never ran. Turn DLSS on in the \
-             game's graphics settings (the add-on hooks the game's DLSS calls; without them it has \
-             nothing to work with).",
-        ));
+        // The add-on hooks NVSDK_NGX_D3D12_*. A game whose DLSS runs on D3D11
+        // calls the D3D11 entry points, which it never sees, so "no create"
+        // is expected until the bridge is installed (#33, BG3 DX11).
+        if st.api == game::Api::Dx11 && !st.bridge {
+            out.push(bad(
+                "No NGX call was intercepted, and this is a Direct3D 11 game with its own \
+                 DLSS: the add-on hooks the D3D12 NGX entry points, but the game calls the \
+                 D3D11 ones, so it can never see them. The DX11 bridge covers exactly this \
+                 and is not installed here — run Install on this exe.",
+            ));
+        } else {
+            out.push(bad(
+                "No NGX call was intercepted: this game's own DLSS never ran. Turn DLSS on \
+                 in the game's graphics settings (the add-on hooks the game's DLSS calls; \
+                 without them it has nothing to work with).",
+            ));
+        }
+    }
+
+    // A game with more than one executable (a Vulkan build and a DX11 build,
+    // a launcher and the game) can be installed for one and played through
+    // another: ReShade loads, everything looks right, nothing is hooked (#33).
+    if let Some(loaded) = reshade_host_exe(&rs) {
+        let ours = st
+            .exe
+            .file_name()
+            .map(|n| n.to_string_lossy().to_ascii_lowercase());
+        if ours.is_some_and(|o| o != loaded.to_ascii_lowercase()) {
+            out.push(warn(format!(
+                "ReShade loaded into {loaded}, but this install was set up for {}. Those are \
+                 different executables, and the install is tuned to the one you picked (the \
+                 DX11 bridge in particular). Point the tool at {loaded} and run Install again.",
+                st.exe.file_name().unwrap_or_default().to_string_lossy()
+            )));
+        }
     }
 
     // ── DX11 bridge (native DLSS on D3D11) ──────────────────────────
@@ -325,6 +367,19 @@ pub fn run(exe: &Path) -> Result<Vec<Finding>> {
 
 #[cfg(test)]
 mod tests {
+    /// Baldur's Gate 3 ships bg3.exe (Vulkan) and bg3_dx11.exe; installing for
+    /// one and playing the other leaves everything looking right and nothing
+    /// hooked (#33). The exe name is in ReShade's first line.
+    #[test]
+    fn reshade_host_exe_reads_the_first_line() {
+        let log = "01:30:11:810 [17792] | INFO  | Initializing crosire's ReShade version '6.8.0.2155' (64-bit) loaded from 'C:\\\\Program Files (x86)\\\\Steam\\\\steamapps\\\\common\\\\Baldurs Gate 3\\\\bin\\\\dxgi.dll' into 'C:\\\\Program Files (x86)\\\\Steam\\\\steamapps\\\\common\\\\Baldurs Gate 3\\\\bin\\\\bg3_dx11.exe' (0x64317982) ...";
+        assert_eq!(
+            super::reshade_host_exe(log).as_deref(),
+            Some("bg3_dx11.exe")
+        );
+        assert!(super::reshade_host_exe("nothing useful here").is_none());
+    }
+
     use super::*;
     use crate::game::testutil::*;
 
