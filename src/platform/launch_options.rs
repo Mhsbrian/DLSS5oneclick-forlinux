@@ -32,6 +32,14 @@ pub fn required(game_dir: &Path, engine: Engine, proton: Option<&ProtonInfo>) ->
             .push(("d3dcompiler_47".into(), "n".into()));
     }
     req.overrides.push(("dxgi".into(), "n,b".into()));
+    // When the RTX 40 MFG unlock is installed, its Ultimate ASI Loader sits
+    // under a proxy DLL the game imports (version/winmm/…); Proton loads it only
+    // with its own override. The proxy is recorded in the MFG manifest.
+    if let Some(proxy) = crate::mfg::manifest_proxy(game_dir) {
+        if !req.overrides.iter().any(|(n, _)| n == &proxy) {
+            req.overrides.push((proxy, "n,b".into()));
+        }
+    }
     if super::steam::nvapi_env_needed(proton) {
         req.env.push(("PROTON_ENABLE_NVAPI".into(), "1".into()));
     }

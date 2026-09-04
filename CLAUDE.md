@@ -48,6 +48,7 @@ Upstream modules worth knowing (kept intact for mergeability, given Linux data s
 - `library.rs` — the Games-page scan: Steam (iterates `steam_roots()` — on Linux `platform::steam::roots()`), Epic/GOG/Xbox on Windows, and `scan_linux_launchers` (Heroic ⇒ Epic/GOG rows, Lutris ⇒ `Store::Lutris`) on Linux. Posters from Steam's librarycache, the Steam CDN (cached under `~/.cache/dlss5oneclick/posters` on Linux), or the exe icon (Windows-only extraction; Linux renders no icon).
 - `ngx.rs` — NGX Core registry probe (Windows; `None` elsewhere), used by diagnose to explain `0xBAD00001`.
 - `renodx.rs` — RenoDX HDR mod lookup/install (game-id match against RenoDX's index; one mod per game, manifest-tracked).
+- `mfg.rs` — optional RTX 40 DLSS Multi-Frame-Generation unlock (dashdogy/RTX40MFG-Unlock, MIT). Gated on `Tier::Rtx40` + Streamline FG present (`has_streamline_fg`) + a usable ASI-loader proxy the exe imports (`pick_proxy`: version/winmm/dinput8/wininet, never dxgi). `install` places the 3 mod files + Ultimate ASI Loader as `<proxy>.dll`, merges `global.ini` into `<proxy>.ini` (via `reshade_ini::Ini`), and writes a `# proxy`-headed manifest so uninstall is exact. `platform::launch_options::required` reads that manifest and adds `<proxy>=n,b`. Toggled by `--mfg` / a GUI checkbox; experimental under Proton.
 
 Supporting modules:
 

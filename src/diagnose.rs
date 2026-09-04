@@ -435,6 +435,12 @@ pub struct HostContext {
     /// Feeder path without a native d3dcompiler_47.dll next to the exe.
     pub d3dcompiler_missing_feeder: bool,
     pub steam_running: bool,
+    /// The RTX 40 MFG unlock is installed in this game.
+    pub mfg_installed: bool,
+    /// Last meaningful line of the MFG unlock's own log in the Proton prefix,
+    /// when it wrote one (proof its ASI + core loaded under Proton); `None`
+    /// means installed but no log found yet.
+    pub mfg_log_tail: Option<String>,
 }
 
 /// Findings about the host setup (launch options, driver, Proton) — pure and
@@ -540,6 +546,21 @@ pub fn host_findings(st: &GameStatus, ctx: &HostContext) -> Vec<Finding> {
              WINEDLLOVERRIDES.",
         ));
     }
+    if ctx.mfg_installed {
+        match &ctx.mfg_log_tail {
+            Some(tail) => out.push(ok(format!(
+                "RTX 40 MFG unlock loaded under Proton (its ASI wrote a log). Last line: {tail}. \
+                 Set the multiplier in ReShade → DLSS MFG; if it will not go above 1X the mod \
+                 has failed closed on this Streamline wrapper — report the log to \
+                 github.com/dashdogy/RTX40MFG-Unlock."
+            ))),
+            None => out.push(warn(
+                "RTX 40 MFG unlock is installed but its ASI has written no log yet — it may not \
+                 have attached. Confirm the game imports the proxy DLL and that its \
+                 WINEDLLOVERRIDE is in the launch options (--launch-options), then play once.",
+            )),
+        }
+    }
     out
 }
 
@@ -584,6 +605,8 @@ mod tests {
             driver_version: Some("610.57.04".into()),
             d3dcompiler_missing_feeder: false,
             steam_running: false,
+            mfg_installed: false,
+            mfg_log_tail: None,
         }
     }
 

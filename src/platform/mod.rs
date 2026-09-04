@@ -210,6 +210,7 @@ pub fn host_context(st: &crate::game::GameStatus) -> crate::diagnose::HostContex
         nvngx_wine_dir: nvngx_wine_dir(),
         driver_version: crate::gpu::driver_version(),
         steam_running: steam::is_running(),
+        mfg_installed: st.mfg,
         ..HostContext::default()
     };
     let proton = entry.as_ref().and_then(|e| {
@@ -248,12 +249,46 @@ pub fn host_context(st: &crate::game::GameStatus) -> crate::diagnose::HostContex
                     .to_path_buf(),
                 root: e.root.clone(),
             };
-            ctx.prefix_nvngx = steam::compatdata(&g).map(|cd| {
-                cd.join("pfx/drive_c/windows/system32/nvngx.dll").is_file()
-            });
+            if let Some(cd) = steam::compatdata(&g) {
+                ctx.prefix_nvngx =
+                    Some(cd.join("pfx/drive_c/windows/system32/nvngx.dll").is_file());
+                if st.mfg {
+                    ctx.mfg_log_tail = newest_mfg_log_tail(&cd);
+                }
+            }
         }
     }
     ctx
+}
+
+/// The last meaningful line of the newest `MfgUnlock-*.log` the mod wrote into
+/// the game's Proton prefix TEMP — proof its ASI loaded under Proton, and the
+/// single best signal of whether the unlock actually engaged.
+#[cfg(target_os = "linux")]
+fn newest_mfg_log_tail(compatdata: &Path) -> Option<String> {
+    let temp = compatdata.join("pfx/drive_c/users/steamuser/Temp");
+    let mut logs: Vec<std::path::PathBuf> = std::fs::read_dir(&temp)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("MfgUnlock-") && n.ends_with(".log"))
+        })
+        .collect();
+    logs.sort_by_key(|p| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH)
+    });
+    let newest = logs.last()?;
+    let text = std::fs::read_to_string(newest).ok()?;
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_owned)
 }
 
 #[cfg(not(target_os = "linux"))]

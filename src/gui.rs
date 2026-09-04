@@ -78,6 +78,8 @@ pub struct App {
     last_update_check: std::time::Instant,
     /// "Also install the RenoDX HDR mod" checkbox.
     renodx_on: bool,
+    /// "Also unlock RTX 40 DLSS MFG" checkbox.
+    mfg_on: bool,
     renodx: RenodxLookup,
     renodx_rx: Option<Receiver<RenodxLookup>>,
     /// Exe the current lookup belongs to, so a refresh does not re-fetch.
@@ -171,6 +173,7 @@ impl App {
             launch_panel: None,
             finishing_install: false,
             renodx_on: false,
+            mfg_on: false,
             renodx: RenodxLookup::Idle,
             renodx_rx: None,
             renodx_for: None,
@@ -245,6 +248,7 @@ impl App {
         if self.resolved_exe != self.renodx_for {
             self.renodx_for = self.resolved_exe.clone();
             self.renodx_on = false;
+            self.mfg_on = false;
             self.start_renodx_lookup();
         }
     }
@@ -281,6 +285,7 @@ impl App {
         self.launch_panel = None;
         let engine = self.engine;
         let with_renodx = self.renodx_on;
+        let with_mfg = self.mfg_on;
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
         self.rx = Some(rx);
         self.running = true;
@@ -316,6 +321,7 @@ impl App {
                     &exe,
                     engine,
                     with_renodx,
+                    with_mfg,
                     &move |pct, msg| {
                         let _ = p_tx.send(Msg::Progress(pct, msg.to_owned()));
                     },
@@ -906,6 +912,13 @@ const TILE_RENODX: Tile = Tile {
     optional: true,
 };
 
+const TILE_MFG: Tile = Tile {
+    title: "RTX 40 DLSS MFG unlock",
+    detail: "multi-frame-gen 2X–6X · ReShade → DLSS MFG · experimental under Proton",
+    ok: |s| s.mfg,
+    optional: true,
+};
+
 const TILE_REFRAMEWORK: Tile = Tile {
     title: "REFramework",
     detail: "dinput8.dll · RE Engine games need it before ReShade",
@@ -913,7 +926,7 @@ const TILE_REFRAMEWORK: Tile = Tile {
     optional: false,
 };
 
-fn tiles_for(st: Option<&GameStatus>, engine: Engine, renodx_on: bool) -> Vec<&'static Tile> {
+fn tiles_for(st: Option<&GameStatus>, engine: Engine, renodx_on: bool, mfg_on: bool) -> Vec<&'static Tile> {
     let mut v = base_tiles(st, engine);
     if st.is_some_and(|s| s.re_engine) {
         v.insert(0, &TILE_REFRAMEWORK);
@@ -923,6 +936,9 @@ fn tiles_for(st: Option<&GameStatus>, engine: Engine, renodx_on: bool) -> Vec<&'
     }
     if renodx_on || st.is_some_and(|s| s.renodx_mod.is_some()) {
         v.push(&TILE_RENODX);
+    }
+    if mfg_on || st.is_some_and(|s| s.mfg) {
+        v.push(&TILE_MFG);
     }
     v
 }
@@ -2292,7 +2308,7 @@ impl eframe::App for App {
                 let tile_h = 44.0;
                 let row_w = ui.available_width();
                 let col_w = ((row_w - gap) / 2.0).floor();
-                let tiles = tiles_for(ok_status.as_ref(), self.engine, self.renodx_on);
+                let tiles = tiles_for(ok_status.as_ref(), self.engine, self.renodx_on, self.mfg_on);
                 for row in tiles.chunks(2) {
                     let (row_rect, _) =
                         ui.allocate_exact_size(Vec2::new(row_w, tile_h), egui::Sense::hover());
@@ -2343,6 +2359,40 @@ impl eframe::App for App {
                                         dim(ui, format!("— {}", m.note));
                                     }
                                 }
+                            }
+                        }
+                    });
+                }
+
+                // ── RTX 40 DLSS MFG unlock ────────────────────────
+                if let Some(s) = &ok_status {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(
+                            RichText::new("DLSS MFG UNLOCK")
+                                .font(t::plex_semibold(11.0))
+                                .color(t::TEXT_MUTED),
+                        );
+                        let dim = |ui: &mut egui::Ui, text: String| {
+                            ui.label(RichText::new(text).font(t::plex(11.0)).color(t::TEXT_DIM));
+                        };
+                        if s.mfg {
+                            dim(ui, "— installed (Remove takes it out too)".into());
+                        } else {
+                            match crate::mfg::eligible(s) {
+                                crate::mfg::Eligibility::Ready(proxy) => {
+                                    let cb = egui::Checkbox::new(
+                                        &mut self.mfg_on,
+                                        RichText::new("Also unlock RTX 40 DLSS Multi-Frame-Generation (2X–6X)")
+                                            .font(t::plex(12.0))
+                                            .color(t::TEXT_SOFT),
+                                    );
+                                    ui.add_enabled(!self.running, cb).on_hover_text(
+                                        "dashdogy/RTX40MFG-Unlock (MIT): raises the DLSS Frame-Generation multiplier for games that already have it. Adds Ultimate ASI Loader and its ReShade menu. EXPERIMENTAL under Proton — it may fail closed if the Streamline FG wrapper differs; --diagnose reads its log.",
+                                    );
+                                    dim(ui, format!("— loads via {proxy}.dll (added to launch options)"));
+                                }
+                                other => dim(ui, format!("— {}", other.reason())),
                             }
                         }
                     });

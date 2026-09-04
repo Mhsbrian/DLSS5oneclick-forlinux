@@ -469,6 +469,10 @@ pub struct GameStatus {
     pub renodx_mod: Option<String>,
     /// Other RenoDX game mods found in the folder (not ours, not the DLSS 5 add-on).
     pub foreign_renodx: Vec<String>,
+    /// RTX 40 DLSS MFG unlock installed by this tool (its manifest is present).
+    pub mfg: bool,
+    /// Game ships Streamline DLSS Frame Generation (what MFG multiplies).
+    pub has_fg: bool,
     /// Anti-cheat found (files or exe name), whether or not the refusal is overridden.
     pub anticheat: Option<&'static str>,
     pub problems: Vec<String>,
@@ -651,6 +655,8 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         reframework: file_ci(d, REFRAMEWORK_DLL),
         renodx_mod: renodx_mod.clone(),
         foreign_renodx: crate::renodx::foreign_mods(d, renodx_mod.as_deref()),
+        mfg: file_ci(d, crate::mfg::MFG_MANIFEST),
+        has_fg: crate::mfg::has_streamline_fg(d),
         anticheat,
         problems,
     })

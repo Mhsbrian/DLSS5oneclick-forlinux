@@ -8,6 +8,7 @@ mod gui;
 mod installer;
 mod library;
 mod logo;
+mod mfg;
 mod net;
 mod ngx;
 mod platform;
@@ -20,7 +21,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 /// `dlss5oneclick <GAME.exe | game folder | game name | appid> [--remove | --remove-all |
-/// --check | --diagnose | --engine=opti | --renodx | --ignore-anticheat | --mode=feeder|native | --bridge |
+/// --check | --diagnose | --engine=opti | --renodx | --mfg | --ignore-anticheat | --mode=feeder|native | --bridge |
 /// --launch-options | --revert-launch-options] | --list-games | --update` runs headless;
 /// no args opens the GUI.
 fn main() {
@@ -129,6 +130,7 @@ error: {e:#}"
                 installer::Engine::ReShade
             },
             args.iter().any(|a| a == "--renodx"),
+            args.iter().any(|a| a == "--mfg"),
             if args.iter().any(|a| a == "--revert-launch-options") {
                 Some(true)
             } else if args.iter().any(|a| a == "--launch-options") {
@@ -326,6 +328,7 @@ fn cli(
     diagnose_only: bool,
     engine: installer::Engine,
     with_renodx: bool,
+    with_mfg: bool,
     launch_only: Option<bool>,
 ) -> i32 {
     let (exe, candidates) = match game::resolve_target(&target) {
@@ -403,7 +406,7 @@ fn cli(
                 for p in &st.problems {
                     println!("  ! {p}");
                 }
-                let names: Vec<&str> = installer::plan_with(&st, engine, with_renodx)
+                let names: Vec<&str> = installer::plan_with(&st, engine, with_renodx, with_mfg)
                     .iter()
                     .map(|s| s.name)
                     .collect();
@@ -476,6 +479,12 @@ fn cli(
                     Ok(None) => println!("  RenoDX HDR mod: none for this game"),
                     Err(e) => println!("  RenoDX lookup failed: {e:#}"),
                 }
+                match mfg::eligible(&st) {
+                    mfg::Eligibility::Ready(proxy) => println!(
+                        "  RTX 40 DLSS MFG unlock: eligible (loads via {proxy}.dll; --mfg to install; experimental under Proton)"
+                    ),
+                    other => println!("  RTX 40 DLSS MFG unlock: not offered ({})", other.reason()),
+                }
                 0
             }
             Err(e) => {
@@ -527,7 +536,7 @@ fn cli(
             Error => println!("\n      FAILED: {detail}"),
         }
     };
-    match installer::run_all_with(&exe, engine, with_renodx, &progress, &step) {
+    match installer::run_all_with(&exe, engine, with_renodx, with_mfg, &progress, &step) {
         Ok(_) => {
             if engine == installer::Engine::Opti {
                 println!(

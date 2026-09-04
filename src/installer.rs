@@ -497,10 +497,35 @@ fn step_renodx(
     renodx::install(client, &st.exe, &m, progress)
 }
 
+const STEP_MFG: Step = Step {
+    name: "RTX 40 DLSS MFG unlock",
+    run: step_mfg,
+};
+
+/// The optional RTX 40 DLSS Multi-Frame-Generation unlock (dashdogy, MIT). Only
+/// runs when the game is eligible; the plan includes it purely so --check can
+/// show it, so a non-eligible game just reports why and places nothing.
+fn step_mfg(
+    client: &Client,
+    st: &GameStatus,
+    _work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    match crate::mfg::eligible(st) {
+        crate::mfg::Eligibility::Ready(proxy) => {
+            crate::mfg::install(client, &st.exe, proxy, progress)
+        }
+        other => {
+            progress(100, other.reason());
+            Ok(vec![format!("MFG unlock skipped: {}", other.reason())])
+        }
+    }
+}
+
 /// `with_renodx` adds the game's RenoDX HDR mod after the DLSS 5 add-on. On
 /// the OptiScaler engine that needs ReShade too, loaded by OptiScaler as
 /// `ReShade64.dll`. RE Engine games get REFramework first on either engine.
-pub fn plan_with(st: &GameStatus, engine: Engine, with_renodx: bool) -> Vec<Step> {
+pub fn plan_with(st: &GameStatus, engine: Engine, with_renodx: bool, with_mfg: bool) -> Vec<Step> {
     let mut v = if engine == Engine::Opti {
         // Only games with native DLSS: the NR pass reads the inputs the game
         // hands to DLSS. Callers gate on mode; return the plan regardless so
@@ -521,6 +546,9 @@ pub fn plan_with(st: &GameStatus, engine: Engine, with_renodx: bool) -> Vec<Step
     };
     if st.re_engine {
         v.insert(0, STEP_REFRAMEWORK);
+    }
+    if with_mfg {
+        v.push(STEP_MFG);
     }
     v.push(STEP_GPU_PREF);
     v
@@ -1166,6 +1194,7 @@ pub fn run_all_with(
     exe: &Path,
     engine: Engine,
     with_renodx: bool,
+    with_mfg: bool,
     progress: Progress,
     step_cb: &(dyn Fn(usize, usize, &str, StepState, &str) + Sync),
 ) -> Result<Vec<(String, Vec<String>)>> {
@@ -1188,7 +1217,7 @@ pub fn run_all_with(
     let work = tempfile::Builder::new()
         .prefix("dlss5oneclick-")
         .tempdir()?;
-    let steps = plan_with(&st, engine, with_renodx);
+    let steps = plan_with(&st, engine, with_renodx, with_mfg);
     let n = steps.len();
     let mut results = Vec::new();
     for (i, step) in steps.iter().enumerate() {
@@ -1291,6 +1320,7 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
     }
     let mut removed = Vec::new();
     uninstall_opti(d, &mut removed)?;
+    crate::mfg::uninstall(d, &mut removed)?;
     for t in targets {
         if t.is_file() {
             fs::remove_file(&t)?;
@@ -1564,7 +1594,7 @@ mod tests {
         assert!(st.is32());
         assert_eq!(st.mode, game::Mode::Feeder);
         assert!(st.problems.is_empty(), "{:?}", st.problems);
-        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false)
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false, false)
             .iter()
             .map(|s| s.name)
             .collect();
@@ -1610,7 +1640,7 @@ mod tests {
         assert!(st.re_engine && !st.reframework);
         st.mode = game::Mode::Native;
         st.api = game::Api::Dx12;
-        let names: Vec<&str> = plan_with(&st, Engine::ReShade, true)
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, true, false)
             .iter()
             .map(|s| s.name)
             .collect();
@@ -1625,7 +1655,7 @@ mod tests {
                 "GPU preference"
             ]
         );
-        let names: Vec<&str> = plan_with(&st, Engine::Opti, true)
+        let names: Vec<&str> = plan_with(&st, Engine::Opti, true, false)
             .iter()
             .map(|s| s.name)
             .collect();
@@ -1748,7 +1778,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let exe = make_pe(&t.path().join("game.exe"), game::PE_X64);
         let mut st = game::inspect(&exe).unwrap();
-        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false)
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false, false)
             .iter()
             .map(|s| s.name)
             .collect();
@@ -1756,7 +1786,7 @@ mod tests {
         assert_eq!(names[2], "DLSS5-Feeder");
         st.mode = game::Mode::Native;
         st.api = game::Api::Dx12;
-        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false)
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false, false)
             .iter()
             .map(|s| s.name)
             .collect();
@@ -1770,7 +1800,7 @@ mod tests {
             ]
         );
         st.api = game::Api::Dx11;
-        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false)
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false, false)
             .iter()
             .map(|s| s.name)
             .collect();
@@ -1826,7 +1856,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let exe = make_pe(&t.path().join("game.exe"), game::PE_X64);
         let st = game::inspect(&exe).unwrap();
-        let names: Vec<&str> = plan_with(&st, Engine::Opti, false)
+        let names: Vec<&str> = plan_with(&st, Engine::Opti, false, false)
             .iter()
             .map(|s| s.name)
             .collect();
@@ -1840,7 +1870,7 @@ mod tests {
         );
         // Feeder-mode game + Opti engine is refused before any network
         let err =
-            run_all_with(&exe, Engine::Opti, false, &|_, _| {}, &|_, _, _, _, _| {}).unwrap_err();
+            run_all_with(&exe, Engine::Opti, false, false, &|_, _| {}, &|_, _, _, _, _| {}).unwrap_err();
         assert!(err.to_string().contains("own DLSS"));
     }
 
@@ -1870,7 +1900,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let exe = make_pe(&t.path().join("game.exe"), game::PE_X86);
         let err =
-            run_all_with(&exe, Engine::Opti, false, &|_, _| {}, &|_, _, _, _, _| {}).unwrap_err();
+            run_all_with(&exe, Engine::Opti, false, false, &|_, _| {}, &|_, _, _, _, _| {}).unwrap_err();
         assert!(err.to_string().contains("64-bit only"));
     }
 }
