@@ -102,6 +102,29 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
     let d = st.game_dir();
     let mut out = Vec::new();
 
+    // ── which neural model is installed ────────────────────
+    // Two builds of nvngx_dlssnr.dll are in circulation and only the version
+    // resource separates them; every failing RTX 50 report so far carries the
+    // .SF one, so the log has to name it.
+    let consumer = st.consumer_dir();
+    for p in [d.join(game::DLSSNR_DLL), consumer.join(game::DLSSNR_DLL)] {
+        if !p.is_file() {
+            continue;
+        }
+        if let Some(v) = crate::ngx::file_version(&p) {
+            out.push(ok(format!(
+                "DLSS 5 model {}: {v} — {}",
+                if p.parent() == Some(d) {
+                    "beside the exe"
+                } else {
+                    "in host64"
+                },
+                crate::ngx::model_build(&v)
+            )));
+        }
+        break;
+    }
+
     // ── ReShade side ────────────────────────────────────────────────
     let Some(rs) = read(d, "ReShade.log").or_else(|| read(d, "ReShade2.log")) else {
         out.push(bad(
