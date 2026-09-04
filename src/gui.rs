@@ -57,6 +57,13 @@ pub struct App {
     update: UpdateState,
     update_rx: Option<Receiver<UpdateState>>,
     skipped_version: String,
+    /// A card whose install just finished and whose state has to be re-read.
+    pending_refresh: Option<usize>,
+    /// The card being installed from the Games page, so the progress is shown
+    /// where the user started it instead of throwing them onto another page.
+    updating: Option<usize>,
+    /// One refreshed card, after its install finished.
+    meta_one_rx: Option<Receiver<(usize, GameMeta)>>,
     /// The user pressed "Check for updates": the answer is worth showing even
     /// when it is "nothing new", which a background check never says.
     checked_manually: bool,
@@ -171,6 +178,9 @@ impl App {
             search: String::new(),
             store_icons: HashMap::new(),
             kofi_icon: None,
+            updating: None,
+            pending_refresh: None,
+            meta_one_rx: None,
             checked_manually: false,
             last_update_check: std::time::Instant::now(),
             skipped_version: cc
@@ -454,10 +464,11 @@ impl App {
         self.open_game(path);
     }
 
-    /// Right click ▸ Update: set up the game exactly as it is set up now --
-    /// the engine it already carries -- and start immediately.
-    fn update_game(&mut self, path: PathBuf) {
-        self.open_game(path);
+    /// Right click ▸ Update: install with the engine the game already carries,
+    /// without leaving the Games page -- the card itself shows the progress.
+    fn update_game(&mut self, path: PathBuf, index: usize) {
+        self.exe_text = path.to_string_lossy().into_owned();
+        self.refresh();
         if let Some(Ok(st)) = &self.status {
             // Whatever stops the Install button stops this too (anti-cheat, a
             // foreign dxgi.dll): the Setup page is now open and says why.
@@ -472,8 +483,49 @@ impl App {
             // A RenoDX mod that is already installed stays installed: the
             // step is only added when the lookup has found one, and Install
             // refreshes what is there either way.
+            self.updating = Some(index);
             self.start(None);
+        } else {
+            // Could not even inspect it: the Setup page is the only place
+            // that can explain why.
+            self.page = Page::Setup;
         }
+    }
+
+    /// Re-read one game after its install, so the card stops claiming an
+    /// update is available the moment it is not.
+    fn refresh_one(&mut self, index: usize, ctx: &egui::Context) {
+        let Some(g) = self.games.get(index).cloned() else {
+            return;
+        };
+        let (tx, rx) = channel();
+        self.meta_one_rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let latest = net::client()
+                .map(|c| installer::Latest::fetch(&c))
+                .unwrap_or_default();
+            if let Some(m) = game::resolve_target(&g.dir)
+                .and_then(|(exe, _)| game::inspect(&exe))
+                .ok()
+                .map(|st| GameMeta {
+                    api: match st.api {
+                        game::Api::Dx10 => "DirectX 10",
+                        game::Api::Dx11 => "DirectX 11",
+                        game::Api::Dx12 => "DirectX 12",
+                        game::Api::Unknown => "DirectX 12?",
+                    },
+                    has_dlss: st.mode == game::Mode::Native,
+                    addon: st.dlss5_addon || st.opti,
+                    ready: st.complete(),
+                    installed: game::installed_by_tool(st.game_dir()),
+                    stale: installer::stale_components(st.game_dir(), &latest),
+                })
+            {
+                let _ = tx.send((index, m));
+            }
+            ctx.request_repaint();
+        });
     }
 
     fn open_game(&mut self, path: PathBuf) {
@@ -581,6 +633,9 @@ impl App {
         if let Some(r) = finished {
             self.rx = None;
             self.running = false;
+            if let Some(i) = self.updating.take() {
+                self.pending_refresh = Some(i);
+            }
             match r {
                 Ok(msg) => {
                     self.progress = 100;
@@ -988,7 +1043,9 @@ impl App {
                     .min_size(Vec2::new(96.0, 34.0))
                 };
                 if ui
-                    .add_enabled(!self.scanning, btn("Rescan", true))
+                    // Rescanning mid-install would renumber the cards under the
+                    // one being worked on.
+                    .add_enabled(!self.scanning && !self.running, btn("Rescan", true))
                     .clicked()
                 {
                     self.start_scan(ui.ctx());
@@ -1020,7 +1077,7 @@ impl App {
 
         // ── grid, grouped by store ────────────────────────────────
         let needle = self.search.trim().to_ascii_lowercase();
-        let mut clicked: Option<PathBuf> = None;
+        let mut clicked: Option<(PathBuf, usize)> = None;
         let mut forgotten: Option<PathBuf> = None;
         let mut update = false;
         egui::ScrollArea::vertical()
@@ -1128,7 +1185,7 @@ impl App {
                                 // Satisfactory's FactoryGameEGS.exe, the real one is the
                                 // -Shipping.exe under Engine\Binaries\Win64, #29). The
                                 // store's exe is the fallback when nothing is found.
-                                clicked = Some(match game::resolve_target(&g.dir) {
+                                let path = match game::resolve_target(&g.dir) {
                                     Ok(_) => g.dir.clone(),
                                     Err(_) => match &g.exe_hint {
                                         Some(e) if e.is_file() && game::exe_bitness(e).is_ok() => {
@@ -1136,7 +1193,8 @@ impl App {
                                         }
                                         _ => g.dir.clone(),
                                     },
-                                });
+                                };
+                                clicked = Some((path, i));
                             }
                         }
                     }
@@ -1165,9 +1223,9 @@ impl App {
             self.games
                 .retain(|g| !(g.store == Store::Manual && g.dir == p));
         }
-        if let Some(p) = clicked {
+        if let Some((p, index)) = clicked {
             if update {
-                self.update_game(p);
+                self.update_game(p, index);
             } else {
                 self.open_game(p);
             }
@@ -1252,7 +1310,7 @@ impl App {
             p.rect_filled(chip, CornerRadius::same(6), t::ACCENT);
             p.galley(chip.min + pad, galley, t::BG);
             // A game this tool set up whose files upstream has moved past.
-            if !m.stale.is_empty() {
+            if !m.stale.is_empty() && self.updating != Some(i) {
                 let galley = p.layout_no_wrap("UPDATE".to_owned(), font, t::BG);
                 let badge = egui::Rect::from_min_size(
                     egui::pos2(poster.left() + 8.0, poster.top() + 8.0),
@@ -1323,7 +1381,55 @@ impl App {
             resp.clone()
                 .on_hover_text(format!("{}\n{}{stale}", g.title, g.dir.display()));
         }
-        let mut action = if resp.clicked() {
+        // Being installed right now: dim the poster, say so, and show how far
+        // along it is, right where the user asked for it.
+        if self.updating == Some(i) {
+            let p = ui.painter();
+            p.rect_filled(poster, r, Color32::from_black_alpha(190));
+            let pct = self.progress.min(100);
+            let title = p.layout_no_wrap(
+                if self.running {
+                    format!("Updating… {pct}%")
+                } else {
+                    "Finishing…".to_owned()
+                },
+                t::plex_semibold(13.0),
+                t::TEXT,
+            );
+            p.galley(
+                egui::pos2(
+                    poster.center().x - title.size().x / 2.0,
+                    poster.center().y - 22.0,
+                ),
+                title,
+                t::TEXT,
+            );
+            // Which step, so a long download does not look stuck.
+            if !self.progress_msg.is_empty() {
+                let step = p.layout(
+                    self.progress_msg.clone(),
+                    t::plex(10.5),
+                    t::TEXT_SOFT,
+                    poster.width() - 20.0,
+                );
+                p.galley(
+                    egui::pos2(poster.center().x - step.size().x / 2.0, poster.center().y),
+                    step,
+                    t::TEXT_SOFT,
+                );
+            }
+            let track = egui::Rect::from_min_size(
+                egui::pos2(poster.left() + 16.0, poster.bottom() - 26.0),
+                Vec2::new(poster.width() - 32.0, 4.0),
+            );
+            p.rect_filled(track, CornerRadius::same(2), t::BORDER_STRONG);
+            let done = egui::Rect::from_min_size(
+                track.min,
+                Vec2::new(track.width() * pct as f32 / 100.0, track.height()),
+            );
+            p.rect_filled(done, CornerRadius::same(2), t::ACCENT);
+        }
+        let mut action = if resp.clicked() && self.updating != Some(i) {
             CardAction::Open
         } else {
             CardAction::None
@@ -1459,6 +1565,15 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.pump();
         self.pump_renodx();
+        if let Some(i) = self.pending_refresh.take() {
+            self.refresh_one(i, ui.ctx());
+        }
+        if let Some(rx) = &self.meta_one_rx {
+            if let Ok((i, m)) = rx.try_recv() {
+                self.meta.insert(i, m);
+                self.meta_one_rx = None;
+            }
+        }
         self.maybe_recheck_update();
         if self.running || matches!(self.renodx, RenodxLookup::Pending) {
             ui.ctx()
