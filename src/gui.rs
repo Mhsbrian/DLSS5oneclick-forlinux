@@ -324,6 +324,7 @@ impl App {
                     .ok()
                     .map(|st| GameMeta {
                         api: match st.api {
+                            game::Api::Dx10 => "DirectX 10",
                             game::Api::Dx11 => "DirectX 11",
                             game::Api::Dx12 => "DirectX 12",
                             game::Api::Unknown => "DirectX 12?",

@@ -97,6 +97,10 @@ pub enum Mode {
 /// Graphics API the exe imports, from its PE import table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Api {
+    /// Direct3D 10/10.1. The 32-bit Feeder add-on runs these natively from
+    /// 0.13.1-beta.1 (a private D3D11 relay device inside the game process);
+    /// a game imports `d3d10_1.dll` rather than `d3d10.dll` in practice.
+    Dx10,
     Dx11,
     Dx12,
     /// Neither d3d11.dll nor d3d12.dll is a static import (loaded at runtime, or DX9/Vulkan).
@@ -106,6 +110,7 @@ pub enum Api {
 impl Api {
     pub fn label(self) -> &'static str {
         match self {
+            Api::Dx10 => "DX10",
             Api::Dx11 => "DX11",
             Api::Dx12 => "DX12",
             Api::Unknown => "API unknown, assuming DX12",
@@ -184,17 +189,24 @@ pub fn pe_imports(exe: &Path) -> Vec<String> {
     parse().unwrap_or_default()
 }
 
-pub fn detect_api(exe: &Path) -> Api {
-    fn classify(imports: &[String]) -> Api {
-        let has = |n: &str| imports.iter().any(|i| i == n);
-        if has("d3d12.dll") {
-            Api::Dx12
-        } else if has("d3d11.dll") {
-            Api::Dx11
-        } else {
-            Api::Unknown
-        }
+/// Which D3D a static import table implies. `d3d10_1.dll` is what a Direct3D
+/// 10 game actually imports; the upstream installer looked only for
+/// `d3d10.dll` and mistook such games for DirectX 9.
+fn classify_imports(imports: &[String]) -> Api {
+    let has = |n: &str| imports.iter().any(|i| i == n);
+    if has("d3d12.dll") {
+        Api::Dx12
+    } else if has("d3d11.dll") {
+        Api::Dx11
+    } else if has("d3d10_1.dll") || has("d3d10.dll") {
+        Api::Dx10
+    } else {
+        Api::Unknown
     }
+}
+
+pub fn detect_api(exe: &Path) -> Api {
+    use classify_imports as classify;
     let api = classify(&pe_imports(exe));
     let agility_sdk = exe
         .parent()
@@ -239,7 +251,7 @@ pub fn detect_api(exe: &Path) -> Api {
         match classify(&pe_imports(&dll)) {
             Api::Dx12 => return Api::Dx12,
             Api::Dx11 => seen_dx11 = true,
-            Api::Unknown => {}
+            Api::Dx10 | Api::Unknown => {}
         }
     }
     if seen_dx11 {
@@ -532,7 +544,7 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     let is32 = bitness == 32;
     if is32 && api == Api::Dx12 {
         problems.push(
-            "32-bit game on Direct3D 12: DLSS5-Feeder's 32-bit add-on supports Direct3D 11 only."
+            "32-bit game on Direct3D 12: DLSS5-Feeder's 32-bit add-on covers Direct3D 9 (through dgVoodoo2), 10 and 11, but not 12."
                 .into(),
         );
     }
@@ -836,6 +848,29 @@ mod tests {
 
     /// Satisfactory (Epic): the launcher names FactoryGameEGS.exe in the root,
     /// but the real game is the shipping exe under Engine\Binaries\Win64 (#29).
+    /// A Direct3D 10 game imports d3d10_1.dll, and often d3d9.dll too for its
+    /// D3DPERF debug markers - which is how DMC4:SE ends up looking like a
+    /// DirectX 9 game to a naive scan.
+    #[test]
+    fn classify_imports_reads_d3d10() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            classify_imports(&s(&["d3d10_1.dll", "d3d9.dll"])),
+            Api::Dx10
+        );
+        assert_eq!(classify_imports(&s(&["d3d10.dll"])), Api::Dx10);
+        // The newer APIs still win when both are imported.
+        assert_eq!(
+            classify_imports(&s(&["d3d10_1.dll", "d3d11.dll"])),
+            Api::Dx11
+        );
+        assert_eq!(
+            classify_imports(&s(&["d3d10_1.dll", "d3d12.dll"])),
+            Api::Dx12
+        );
+        assert_eq!(classify_imports(&s(&["kernel32.dll"])), Api::Unknown);
+    }
+
     #[test]
     fn find_game_exes_finds_shipping_exe_under_engine_binaries() {
         let t = tempfile::tempdir().unwrap();

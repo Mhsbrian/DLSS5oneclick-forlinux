@@ -835,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "dlss5oneclick"
-version = "0.10.9"
+version = "0.10.10"
 dependencies = [
  "anyhow",
  "eframe",
