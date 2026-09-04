@@ -22,6 +22,8 @@ pub const TEXT_OFF: Color32 = Color32::from_rgb(0x9a, 0xa1, 0xad);
 pub const RING_OFF: Color32 = Color32::from_rgb(0x4a, 0x51, 0x60);
 pub const ACCENT: Color32 = Color32::from_rgb(0xc4, 0xc9, 0xd2);
 pub const DANGER: Color32 = Color32::from_rgb(0xff, 0x6b, 0x6b);
+/// Something works but has fallen behind: an update, not a fault.
+pub const WARN: Color32 = Color32::from_rgb(0xf0, 0xb4, 0x5c);
 
 pub const SORA: &str = "sora";
 pub const PLEX_MEDIUM: &str = "plex-medium";

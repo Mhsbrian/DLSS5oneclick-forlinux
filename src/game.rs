@@ -31,6 +31,9 @@ pub const DLSS_MARKER: &str = "nvngx_dlss.dll.dlss5oneclick";
 /// tool placed, so Install can tell "ours and stale" from "the user's own".
 pub const DLSSNR_MARKER: &str = "nvngx_dlssnr.dll.dlss5oneclick";
 pub const RESHADE_MARKER: &str = "dxgi.dll.dlss5oneclick";
+/// The DLSS5-Feeder release tag this tool placed, so a stale install can be
+/// spotted without downloading the zip to compare sizes.
+pub const FEEDER_MARKER: &str = "dlss5-feed.dlss5oneclick";
 pub const RESHADE_PROXY: &str = "dxgi.dll";
 /// Shader headers the official installer fetches from crosire/reshade-shaders (branch `slim`).
 /// Not inside the setup exe. DLSS5_Feed.fx and every lumenite_*.fx include ReShade.fxh;
@@ -110,9 +113,20 @@ pub fn is_reshade_dll(path: &Path) -> bool {
         return false;
     }
     match fs::read(path) {
-        Ok(bytes) => bytes.windows(7).any(|w| w == b"ReShade"),
+        Ok(bytes) => is_reshade_image(&bytes),
         Err(_) => false,
     }
+}
+
+/// OptiScaler's own `dxgi.dll` carries the string `ReShade` six times, because
+/// it can load ReShade itself — so "contains ReShade" called it ReShade and
+/// refused to update a game that had OptiScaler installed. crosire's name is in
+/// every real ReShade build (36 hits of `ReShade`, 3 of `crosire` in 6.8.0)
+/// and in none of OptiScaler's, so it settles the two apart; a build that
+/// somehow lacks it still counts unless the file says OptiScaler.
+fn is_reshade_image(bytes: &[u8]) -> bool {
+    let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+    has(b"ReShade") && (has(b"crosire") || !has(b"OptiScaler"))
 }
 
 /// Which install path applies to a game.
@@ -128,6 +142,10 @@ pub enum Mode {
 /// Graphics API the exe imports, from its PE import table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Api {
+    /// Direct3D 10/10.1. The 32-bit Feeder add-on runs these natively from
+    /// 0.13.1-beta.1 (a private D3D11 relay device inside the game process);
+    /// a game imports `d3d10_1.dll` rather than `d3d10.dll` in practice.
+    Dx10,
     Dx11,
     Dx12,
     /// Neither d3d11.dll nor d3d12.dll is a static import (loaded at runtime, or DX9/Vulkan).
@@ -137,6 +155,7 @@ pub enum Api {
 impl Api {
     pub fn label(self) -> &'static str {
         match self {
+            Api::Dx10 => "DX10",
             Api::Dx11 => "DX11",
             Api::Dx12 => "DX12",
             Api::Unknown => "API unknown, assuming DX12",
@@ -215,20 +234,26 @@ pub fn pe_imports(exe: &Path) -> Vec<String> {
     parse().unwrap_or_default()
 }
 
-/// What the import table alone proves about the renderer.
-pub fn api_from_imports(imports: &[String]) -> Api {
+/// Which D3D a static import table implies (also used by the exe finder to
+/// prefer a provably-D3D sibling). `d3d10_1.dll` is what a Direct3D 10 game
+/// actually imports; the upstream installer looked only for `d3d10.dll` and
+/// mistook such games for DirectX 9.
+pub fn classify_imports(imports: &[String]) -> Api {
     let has = |n: &str| imports.iter().any(|i| i == n);
     if has("d3d12.dll") {
         Api::Dx12
     } else if has("d3d11.dll") {
         Api::Dx11
+    } else if has("d3d10_1.dll") || has("d3d10.dll") {
+        Api::Dx10
     } else {
         Api::Unknown
     }
 }
 
 pub fn detect_api(exe: &Path) -> Api {
-    let api = api_from_imports(&pe_imports(exe));
+    use classify_imports as classify;
+    let api = classify(&pe_imports(exe));
     let agility_sdk = exe
         .parent()
         .is_some_and(|d| d.join("D3D12").join("D3D12Core.dll").is_file());
@@ -269,10 +294,10 @@ pub fn detect_api(exe: &Path) -> Api {
     dlls.sort_by_key(|(size, _)| std::cmp::Reverse(*size));
     let mut seen_dx11 = false;
     for (_, dll) in dlls.into_iter().take(12) {
-        match api_from_imports(&pe_imports(&dll)) {
+        match classify_imports(&pe_imports(&dll)) {
             Api::Dx12 => return Api::Dx12,
             Api::Dx11 => seen_dx11 = true,
-            Api::Unknown => {}
+            Api::Dx10 | Api::Unknown => {}
         }
     }
     if seen_dx11 {
@@ -574,7 +599,7 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     let is32 = bitness == 32;
     if is32 && api == Api::Dx12 {
         problems.push(
-            "32-bit game on Direct3D 12: DLSS5-Feeder's 32-bit add-on supports Direct3D 11 only."
+            "32-bit game on Direct3D 12: DLSS5-Feeder's 32-bit add-on covers Direct3D 9 (through dgVoodoo2), 10 and 11, but not 12."
                 .into(),
         );
     }
@@ -759,7 +784,7 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
             // carry ReShade and the DX11 bridge. Outranks size, yields to the
             // -Shipping and folder-name signals (Witcher 3's two D3D exes both
             // get it, so their order is unchanged).
-            if contested && matches!(api_from_imports(&pe_imports(&p)), Api::Dx11 | Api::Dx12) {
+            if contested && matches!(classify_imports(&pe_imports(&p)), Api::Dx10 | Api::Dx11 | Api::Dx12) {
                 score += 500_000_000;
             }
             score += size.min(400_000_000);
@@ -772,6 +797,23 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
 
 /// Accepts either a game exe or a game folder; returns the exe to use plus
 /// every candidate found (empty when the input was already an exe).
+/// Did this tool install into this folder? True when any marker or manifest
+/// it writes is present. Used to group those games together (#nn) and to
+/// decide whether a component may be refreshed.
+pub fn installed_by_tool(dir: &Path) -> bool {
+    [
+        OPTI_MANIFEST,
+        RENODX_MANIFEST,
+        REFRAMEWORK_MARKER,
+        DLSS_MARKER,
+        DLSSNR_MARKER,
+        RESHADE_MARKER,
+        FEEDER_MARKER,
+    ]
+    .iter()
+    .any(|m| dir.join(m).is_file())
+}
+
 pub fn resolve_target(input: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
     if input.is_file() {
         return Ok((input.to_path_buf(), Vec::new()));
@@ -975,6 +1017,44 @@ mod tests {
 
     /// Satisfactory (Epic): the launcher names FactoryGameEGS.exe in the root,
     /// but the real game is the shipping exe under Engine\Binaries\Win64 (#29).
+    /// A Direct3D 10 game imports d3d10_1.dll, and often d3d9.dll too for its
+    /// D3DPERF debug markers - which is how DMC4:SE ends up looking like a
+    /// DirectX 9 game to a naive scan.
+    /// OptiScaler's dxgi.dll says "ReShade" because it can load ReShade; only
+    /// a real ReShade build also carries crosire's name (#the update refusal).
+    #[test]
+    fn optiscaler_is_not_mistaken_for_reshade() {
+        assert!(is_reshade_image(
+            b"...crosire's ReShade version '6.8.0.2155'..."
+        ));
+        assert!(!is_reshade_image(
+            b"OptiScaler ... LoadReshade ... ReShade64.dll ..."
+        ));
+        // A ReShade build without the author's name is still ReShade.
+        assert!(is_reshade_image(b"ReShade effect runtime"));
+        assert!(!is_reshade_image(b"some other dxgi wrapper"));
+    }
+
+    #[test]
+    fn classify_imports_reads_d3d10() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            classify_imports(&s(&["d3d10_1.dll", "d3d9.dll"])),
+            Api::Dx10
+        );
+        assert_eq!(classify_imports(&s(&["d3d10.dll"])), Api::Dx10);
+        // The newer APIs still win when both are imported.
+        assert_eq!(
+            classify_imports(&s(&["d3d10_1.dll", "d3d11.dll"])),
+            Api::Dx11
+        );
+        assert_eq!(
+            classify_imports(&s(&["d3d10_1.dll", "d3d12.dll"])),
+            Api::Dx12
+        );
+        assert_eq!(classify_imports(&s(&["kernel32.dll"])), Api::Unknown);
+    }
+
     #[test]
     fn find_game_exes_finds_shipping_exe_under_engine_binaries() {
         let t = tempfile::tempdir().unwrap();

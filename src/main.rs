@@ -3,6 +3,7 @@
 mod diagnose;
 mod game;
 mod gpu;
+mod gpupref;
 mod gui;
 mod installer;
 mod library;
@@ -23,6 +24,7 @@ use std::path::PathBuf;
 /// --launch-options | --revert-launch-options] | --list-games | --update` runs headless;
 /// no args opens the GUI.
 fn main() {
+    install_panic_handler();
     update::cleanup_old();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--fetch") {
@@ -141,23 +143,7 @@ error: {e:#}"
         // The release build has no console: say it in a box and leave a file (#23).
         let msg = format!("{e:#}");
         eprintln!("gui error: {msg}");
-        let log = std::env::var_os("LOCALAPPDATA")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join("dlss5oneclick")
-            .join("gui-error.txt");
-        if let Some(p) = log.parent() {
-            let _ = std::fs::create_dir_all(p);
-        }
-        let _ = std::fs::write(
-            &log,
-            format!(
-                "DLSS5oneclick {}
-{msg}
-",
-                env!("CARGO_PKG_VERSION")
-            ),
-        );
+        let log = write_error_log(&msg);
         report_gui_error(&format!(
             "DLSS5oneclick could not open its window.
 
@@ -440,6 +426,32 @@ fn cli(
                         }
                     );
                 }
+                if gpupref::hybrid() {
+                    // Which GPU Windows starts the process on decides whether NGX
+                    // exists in it at all (#25).
+                    println!(
+                        "  hybrid machine ({}) · Windows GPU preference for {}: {}",
+                        gpupref::real_adapters().join(", "),
+                        exe.file_name().unwrap_or_default().to_string_lossy(),
+                        gpupref::get(&exe).unwrap_or_else(|| "not set".into())
+                    );
+                }
+                if game::installed_by_tool(st.game_dir()) {
+                    // Same comparison the Games page makes, so a stale install
+                    // can be seen without opening the window.
+                    let latest = net::client()
+                        .map(|c| installer::Latest::fetch(&c))
+                        .unwrap_or_default();
+                    match installer::stale_components(st.game_dir(), &latest).as_slice() {
+                        [] => println!("  installed by this tool · everything current"),
+                        stale => {
+                            println!("  installed by this tool · out of date:");
+                            for s in stale {
+                                println!("    {s}");
+                            }
+                        }
+                    }
+                }
                 if let Some(m) = &st.renodx_mod {
                     println!("  RenoDX mod installed: {m}");
                 }
@@ -539,6 +551,63 @@ Done. In game: Home opens ReShade -> Add-ons tab -> DLSS 5 Neural Rendering -> e
     }
 }
 
+/// Where a failure that has no console to print to is recorded (#23, #32).
+fn error_log_path() -> std::path::PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("dlss5oneclick")
+        .join("gui-error.txt")
+}
+
+fn write_error_log(msg: &str) -> std::path::PathBuf {
+    let log = error_log_path();
+    if let Some(p) = log.parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
+    let _ = std::fs::write(
+        &log,
+        format!(
+            "DLSS5oneclick {}
+{msg}
+",
+            env!("CARGO_PKG_VERSION")
+        ),
+    );
+    log
+}
+
+/// A release build has `windows_subsystem = "windows"`, so a panic writes to a
+/// stderr nobody can see and the process simply vanishes -- which is exactly
+/// what two reporters described as "nothing happens" (#23, #32). Record it and
+/// say so in a box instead.
+fn install_panic_handler() {
+    std::panic::set_hook(Box::new(|info| {
+        let where_ = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "unknown location".into());
+        let what = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "panic".into());
+        let msg = format!("panic at {where_}: {what}");
+        eprintln!("{msg}");
+        let log = write_error_log(&msg);
+        report_gui_error(&format!(
+            "DLSS5oneclick stopped unexpectedly.
+
+{msg}
+
+Written to {}
+Attach that file to a GitHub issue.",
+            log.display()
+        ));
+    }));
+}
+
 #[cfg(windows)]
 fn report_gui_error(text: &str) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
@@ -562,5 +631,19 @@ fn attach_parent_console() {
     unsafe {
         use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
         AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The crash log has to name the version, or a report cannot be matched to
+    /// a build (#23, #32).
+    #[test]
+    fn error_log_records_version_and_message() {
+        let p = super::write_error_log("panic at src/gui.rs:12: test");
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(body.starts_with(&format!("DLSS5oneclick {}", env!("CARGO_PKG_VERSION"))));
+        assert!(body.contains("panic at src/gui.rs:12: test"));
+        let _ = std::fs::remove_file(&p);
     }
 }

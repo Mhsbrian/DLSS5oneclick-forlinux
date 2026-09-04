@@ -14,6 +14,7 @@
 //! 6. ReShade.ini + ReShadePreset.ini: DLSS5_MV_PROVIDER=3, Lumenite_Kernel above DLSS5_Feed.
 
 use crate::game::{self, GameStatus};
+use crate::gpupref;
 use crate::net::{self, Progress};
 use crate::renodx;
 use crate::reshade_ini;
@@ -52,16 +53,79 @@ const STEP_OPTI: Step = Step {
 /// Extract the whole OptiScaler_DLSSNR release into the game folder,
 /// writing `OptiScaler.dll` as `dxgi.dll` (the fork's default load name for
 /// DX11/DX12 games) and recording every path in a manifest for uninstall.
+/// The release tag recorded in an OptiScaler manifest, from its `# tag v…`
+/// header. A manifest written before this was recorded has none.
+/// The newest release of every component, fetched once and compared against
+/// what each game has recorded. Empty fields mean "could not check".
+#[derive(Debug, Clone, Default)]
+pub struct Latest {
+    pub reshade: Option<String>,
+    pub feeder: Option<String>,
+    pub opti: Option<String>,
+    pub dlss: Option<String>,
+    pub dlssnr: Option<String>,
+}
+
+impl Latest {
+    pub fn fetch(client: &Client) -> Self {
+        Latest {
+            reshade: resolve_reshade_setup(client).ok().map(|(v, _)| v),
+            feeder: net::latest_tag(client, FEEDER_REPO).ok(),
+            opti: net::latest_tag(client, OPTI_REPO).ok(),
+            dlss: rhi_latest(client, "dlss-").ok().map(|(t, _)| t),
+            dlssnr: rhi_latest(client, "dlssnr-").ok().map(|(t, _)| t),
+        }
+    }
+}
+
+/// Components this tool placed in `dir` whose recorded version is behind
+/// `latest`. A component with no marker was not placed by this tool and is
+/// never reported, so a user's own ReShade never shows up as "out of date".
+pub fn stale_components(dir: &Path, latest: &Latest) -> Vec<String> {
+    let mine = |marker: &str| fs::read_to_string(dir.join(marker)).ok();
+    let mut out = Vec::new();
+    let mut check = |name: &str, have: Option<String>, want: &Option<String>| {
+        if let (Some(h), Some(w)) = (have, want) {
+            if h.trim() != w.trim() {
+                out.push(format!("{name} {} → {w}", h.trim()));
+            }
+        }
+    };
+    check("ReShade", mine(game::RESHADE_MARKER), &latest.reshade);
+    check("DLSS5-Feeder", mine(game::FEEDER_MARKER), &latest.feeder);
+    check("nvngx_dlss.dll", mine(game::DLSS_MARKER), &latest.dlss);
+    check(
+        "nvngx_dlssnr.dll",
+        mine(game::DLSSNR_MARKER),
+        &latest.dlssnr,
+    );
+    if let Ok(m) = fs::read_to_string(dir.join(game::OPTI_MANIFEST)) {
+        match (manifest_tag(&m), &latest.opti) {
+            (Some(have), Some(want)) if have.trim() != want.trim() => {
+                out.push(format!("OptiScaler {} → {want}", have.trim()))
+            }
+            // Installed before the version was recorded (0.11.0), so what is on
+            // disk cannot be compared: an Install settles it either way.
+            (None, Some(want)) => out.push(format!("OptiScaler unknown version → {want}")),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn manifest_tag(manifest: &str) -> Option<String> {
+    manifest
+        .lines()
+        .find_map(|l| l.strip_prefix("# tag "))
+        .map(|t| t.trim().to_owned())
+}
+
 fn step_opti(
     client: &Client,
     st: &GameStatus,
     work: &Path,
     progress: Progress,
 ) -> Result<Vec<String>> {
-    if st.opti {
-        progress(100, "OptiScaler already installed");
-        return Ok(vec![]);
-    }
     let d = st.game_dir();
     if game::is_reshade_dll(&game::join_ci(d, &[game::RESHADE_PROXY])) {
         bail!(
@@ -70,11 +134,38 @@ fn step_opti(
         );
     }
     progress(0, "Looking up latest OptiScaler DLSS-NR release");
+    // An installed OptiScaler used to be left alone forever, so a game set up
+    // in August still ran August's build after every reinstall. The tag is
+    // recorded in the manifest; a copy this tool placed is refreshed when
+    // upstream moves on, and one it did not place is never touched.
+    let latest = net::latest_tag(client, OPTI_REPO).ok();
+    if st.opti {
+        // No manifest at all: somebody else put OptiScaler there. A manifest
+        // without a "# tag" line is ours, from before the tag was recorded --
+        // refresh it, which also writes the tag for next time.
+        let Some(manifest) = fs::read_to_string(d.join(game::OPTI_MANIFEST)).ok() else {
+            return Ok(vec![
+                "OptiScaler present (not placed by this tool, left as is)".to_owned(),
+            ]);
+        };
+        match (manifest_tag(&manifest), &latest) {
+            (Some(a), Some(b)) if &a == b => {
+                return Ok(vec![format!("OptiScaler already current ({a})")]);
+            }
+            (Some(a), Some(b)) => progress(0, &format!("OptiScaler {a} is out, {b} available")),
+            (Some(_), None) => {
+                return Ok(vec![
+                    "OptiScaler present (could not check for a newer one)".to_owned()
+                ]);
+            }
+            (None, _) => progress(0, "OptiScaler version not recorded, refreshing"),
+        }
+    }
     // Stable release only (releases/latest skips pre-releases); the API list
     // and the releases page both put betas first.
-    let asset: String = match net::latest_tag(client, OPTI_REPO) {
-        Ok(tag) => net::github_asset_url_html(client, OPTI_REPO, &tag, r#"[^"]+\.zip"#)?,
-        Err(_) => match net::get_json_github(client, OPTI_RELEASES) {
+    let asset: String = match latest.clone() {
+        Some(tag) => net::github_asset_url_html(client, OPTI_REPO, &tag, r#"[^"]+\.zip"#)?,
+        None => match net::get_json_github(client, OPTI_RELEASES) {
             Ok(releases) => releases
                 .as_array()
                 .and_then(|a| a.iter().find(|r| r["prerelease"] != Value::Bool(true)))
@@ -136,7 +227,14 @@ fn step_opti(
     if !installed.iter().any(|p| p == game::RESHADE_PROXY) {
         bail!("the OptiScaler release had no OptiScaler.dll — layout changed upstream");
     }
-    fs::write(d.join(game::OPTI_MANIFEST), installed.join("\n"))?;
+    let header = latest
+        .as_deref()
+        .map(|t| format!("# tag {t}\n"))
+        .unwrap_or_default();
+    fs::write(
+        d.join(game::OPTI_MANIFEST),
+        format!("{header}{}", installed.join("\n")),
+    )?;
     installed.push(game::OPTI_MANIFEST.into());
     Ok(installed)
 }
@@ -147,7 +245,10 @@ fn uninstall_opti(d: &Path, removed: &mut Vec<String>) -> Result<()> {
     let Ok(list) = fs::read_to_string(&manifest) else {
         return Ok(());
     };
-    for rel in list.lines().filter(|l| !l.trim().is_empty()) {
+    for rel in list
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+    {
         let clean: Vec<&str> = rel
             .split('/')
             .filter(|p| !p.is_empty() && *p != "." && *p != "..")
@@ -268,6 +369,10 @@ fn step_host_reshade(
     Ok(vec![format!("{}/{}", game::HOST_DIR, game::RESHADE_PROXY)])
 }
 
+const STEP_GPU_PREF: Step = Step {
+    name: "GPU preference",
+    run: step_gpu_pref,
+};
 const STEP_RESHADE_VIA_OPTI: Step = Step {
     name: "ReShade loaded by OptiScaler (ReShade64.dll)",
     run: step_reshade_via_opti,
@@ -417,6 +522,7 @@ pub fn plan_with(st: &GameStatus, engine: Engine, with_renodx: bool) -> Vec<Step
     if st.re_engine {
         v.insert(0, STEP_REFRAMEWORK);
     }
+    v.push(STEP_GPU_PREF);
     v
 }
 
@@ -627,6 +733,13 @@ fn step_headers(
 
 // ── step 3: DLSS5-Feeder ───────────────────────────────────────────
 
+/// A release whose tag says beta or rc. Upstream does not flag all of them
+/// as prereleases, so the name is what the install log goes by.
+fn is_prerelease_tag(tag: &str) -> bool {
+    let t = tag.to_ascii_lowercase();
+    t.contains("beta") || t.contains("-rc") || t.contains("alpha")
+}
+
 fn step_feeder(
     client: &Client,
     st: &GameStatus,
@@ -639,15 +752,26 @@ fn step_feeder(
     progress(0, "Looking up latest DLSS5-Feeder");
     // Since 0.11 the project ships one zip per release instead of loose assets;
     // the file name carries the version, so the tag is read first.
-    // Stable release only; the releases page lists betas first.
+    //
+    // Whatever upstream marks as the latest release is what gets installed,
+    // including a tag named "-beta": that project publishes builds it means
+    // people to run with prerelease=false (v0.13.1-beta.1, v0.12.1-beta.2)
+    // while flagging the ones it does not (v0.13.0-beta.1). Those carry
+    // fixes the stable v0.12.0 lacks. The name is reported, so a beta is
+    // never installed silently.
     let tag = match net::latest_tag(client, FEEDER_REPO) {
         Ok(t) => t,
-        Err(_) => net::github_release_tags_html(client, FEEDER_REPO, "v", 2)?
+        Err(_) => net::github_release_tags_html(client, FEEDER_REPO, "v", 1)?
             .into_iter()
-            .find(|t| !t.contains("beta") && !t.contains("rc"))
+            .next()
             .ok_or_else(|| anyhow!("no DLSS5-Feeder release found"))?,
     };
     let tag = &tag;
+    let note = if is_prerelease_tag(tag) {
+        " (beta)"
+    } else {
+        ""
+    };
     let url = net::github_asset_url_html(client, FEEDER_REPO, tag, r#"[^"]+\.zip"#)?;
     let zip_path = work.join("dlss5-feeder.zip");
     net::download(client, &url, &zip_path, "DLSS5-Feeder", progress)?;
@@ -682,15 +806,20 @@ fn step_feeder(
         None => true,
     };
     if st.feeder && host_current && same_size(&mut zip, &addon, &d.join(addon_name)) {
-        return Ok(vec![format!("DLSS5-Feeder already current ({tag})")]);
+        return Ok(vec![format!("DLSS5-Feeder already current ({tag}{note})")]);
     }
     net::extract_member(&mut zip, &addon, &d.join(addon_name))?;
-    let mut out = vec![format!("{addon_name} ({tag})")];
+    fs::write(d.join(game::FEEDER_MARKER), tag.as_bytes())?;
+    let mut out = vec![format!("{addon_name} ({tag}{note})")];
     if let Some(m) = &host_member {
         let host = st.consumer_dir();
         fs::create_dir_all(&host)?;
         net::extract_member(&mut zip, m, &host.join(game::HOST_EXE))?;
-        out.push(format!("{}/{} ({tag})", game::HOST_DIR, game::HOST_EXE));
+        out.push(format!(
+            "{}/{} ({tag}{note})",
+            game::HOST_DIR,
+            game::HOST_EXE
+        ));
     }
     let shaders = game::join_ci(d, &["reshade-shaders", "Shaders"]);
     net::extract_member(&mut zip, &fx, &game::join_ci(&shaders, &[game::FEEDER_FX]))?;
@@ -973,6 +1102,57 @@ fn step_config(_c: &Client, st: &GameStatus, _w: &Path, progress: Progress) -> R
     Ok(vec![game::RESHADE_INI.into(), game::RESHADE_PRESET.into()])
 }
 
+// ── step 7: which GPU Windows starts the process on ────────────
+
+/// On a hybrid machine Windows may start the game (or the 32-bit helper) on the
+/// iGPU, where NGX does not exist and `NVSDK_NGX_D3D12_Init` answers
+/// `0xBAD00001`. That is what a reporter fixed by hand in Settings ▸ System ▸
+/// Display ▸ Graphics (#25); this writes the same preference.
+fn step_gpu_pref(
+    _c: &Client,
+    st: &GameStatus,
+    _w: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    if !gpupref::hybrid() {
+        progress(100, "one GPU vendor on this machine, nothing to set");
+        return Ok(vec![]);
+    }
+    // On Linux there is no per-application GPU registry — the compositor and
+    // PRIME decide which card a process renders on. Writing nothing is the
+    // honest outcome; if DLSS later fails with 0xBAD00001, --diagnose names the
+    // PRIME offload environment variables (the Linux analog of the Windows
+    // high-performance preference). The step stays in the plan on both OSes so
+    // the step list is identical; it just no-ops here.
+    if cfg!(not(windows)) {
+        progress(
+            100,
+            "hybrid GPU: on Linux the compositor/PRIME choose the GPU — nothing to set",
+        );
+        return Ok(vec![]);
+    }
+    let mut targets = vec![st.exe.clone()];
+    if st.is32() {
+        targets.push(st.consumer_dir().join(game::HOST_EXE));
+    }
+    let mut out = Vec::new();
+    for exe in targets.into_iter().filter(|p| p.is_file()) {
+        let name = exe
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match gpupref::set_high_performance(&exe) {
+            Ok(true) => out.push(format!(
+                "{name}: Windows GPU preference set to high performance"
+            )),
+            Ok(false) => out.push(format!("{name}: already set to the high-performance GPU")),
+            Err(e) => out.push(format!("{name}: could not set the GPU preference ({e})")),
+        }
+    }
+    progress(100, "GPU preference checked");
+    Ok(out)
+}
+
 // ── driver ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1042,6 +1222,7 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
     let mut targets: Vec<PathBuf> = vec![
         game::join_ci(d, &[game::DLSS_MARKER]),
         game::join_ci(d, &[game::DLSSNR_MARKER]),
+        game::join_ci(d, &[game::FEEDER_MARKER]),
         game::join_ci(d, &[game::FEEDER_ADDON]),
         game::join_ci(d, &[game::DLSS5_ADDON]),
         game::join_ci(d, &[game::DLSSNR_DLL]),
@@ -1123,6 +1304,19 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
     }
     if include.is_dir() && fs::read_dir(&include)?.next().is_none() {
         fs::remove_dir(&include)?;
+    }
+    // The Windows GPU preference this tool wrote goes too, but only when it is
+    // still exactly what was written (a user's own choice is left alone).
+    for e in [
+        exe.to_path_buf(),
+        d.join(game::HOST_DIR).join(game::HOST_EXE),
+    ] {
+        if gpupref::clear_ours(&e).unwrap_or(false) {
+            removed.push(format!(
+                "Windows GPU preference for {}",
+                e.file_name().unwrap_or_default().to_string_lossy()
+            ));
+        }
     }
     let host = d.join(game::HOST_DIR);
     if host.is_dir() && fs::read_dir(&host)?.next().is_none() {
@@ -1376,8 +1570,8 @@ mod tests {
             .collect();
         assert_eq!(names[0], "ReShade (add-on build)");
         assert_eq!(names[1], "64-bit ReShade for the host64 helper");
-        assert_eq!(names.len(), 7);
-        // Lay the 32-bit result out by hand and check status + removal.
+        assert_eq!(names.len(), 8); // + the GPU-preference step
+                                    // Lay the 32-bit result out by hand and check status + removal.
         let d = t.path();
         let host = d.join(game::HOST_DIR);
         fs::create_dir_all(d.join("reshade-shaders").join("Shaders")).unwrap();
@@ -1427,7 +1621,8 @@ mod tests {
                 "ReShade (add-on build)",
                 "DLSS 5 add-on + models",
                 "RenoDX HDR mod for this game",
-                "ReShade config"
+                "ReShade config",
+                "GPU preference"
             ]
         );
         let names: Vec<&str> = plan_with(&st, Engine::Opti, true)
@@ -1441,7 +1636,8 @@ mod tests {
                 "OptiScaler + DLSS Neural Rendering",
                 "DLSS 5 model (nvngx_dlssnr.dll)",
                 "ReShade loaded by OptiScaler (ReShade64.dll)",
-                "RenoDX HDR mod for this game"
+                "RenoDX HDR mod for this game",
+                "GPU preference"
             ]
         );
     }
@@ -1488,6 +1684,65 @@ mod tests {
         assert!(removed.contains(&game::REFRAMEWORK_DLL.to_string()));
     }
 
+    /// Upstream publishes some "-beta" tags with prerelease=false, so the tag
+    /// name is what decides whether the install log says beta.
+    /// Only a component this tool recorded can be reported as out of date;
+    /// a user's own ReShade has no marker and must stay invisible.
+    #[test]
+    fn stale_components_reports_only_what_we_placed() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let latest = Latest {
+            reshade: Some("6.8.0".into()),
+            feeder: Some("v0.13.1-beta.1".into()),
+            opti: Some("v0.2.0-dlssnr".into()),
+            dlss: Some("dlss-310.9.0".into()),
+            dlssnr: Some("dlssnr-310.8.SF-v2".into()),
+        };
+        assert!(stale_components(d, &latest).is_empty());
+
+        fs::write(d.join(game::FEEDER_MARKER), "v0.12.0").unwrap();
+        fs::write(d.join(game::DLSS_MARKER), "dlss-310.9.0").unwrap();
+        fs::write(
+            d.join(game::OPTI_MANIFEST),
+            "# tag v0.1.2-dlssnr\ndxgi.dll\n",
+        )
+        .unwrap();
+        let stale = stale_components(d, &latest);
+        assert_eq!(
+            stale,
+            vec![
+                "DLSS5-Feeder v0.12.0 → v0.13.1-beta.1".to_string(),
+                "OptiScaler v0.1.2-dlssnr → v0.2.0-dlssnr".to_string(),
+            ]
+        );
+
+        // A manifest from before the tag was recorded cannot be compared, and
+        // saying nothing would leave a stale install looking current.
+        fs::write(d.join(game::OPTI_MANIFEST), "dxgi.dll\nOptiScaler.ini\n").unwrap();
+        assert!(stale_components(d, &latest)
+            .iter()
+            .any(|s| s == "OptiScaler unknown version → v0.2.0-dlssnr"));
+    }
+
+    /// The manifest carries the tag on a comment line, and older manifests
+    /// (written before that) must read as "unknown" rather than as a path.
+    #[test]
+    fn manifest_tag_is_read_from_the_header() {
+        let m = "# tag v0.2.0-dlssnr\nOptiScaler.dll\ndxgi.dll\n";
+        assert_eq!(manifest_tag(m).as_deref(), Some("v0.2.0-dlssnr"));
+        assert_eq!(manifest_tag("OptiScaler.dll\ndxgi.dll\n"), None);
+    }
+
+    #[test]
+    fn prerelease_tags_are_named_by_their_tag() {
+        assert!(is_prerelease_tag("v0.13.1-beta.1"));
+        assert!(is_prerelease_tag("v0.12.1-beta.2"));
+        assert!(is_prerelease_tag("v1.0.0-rc.1"));
+        assert!(!is_prerelease_tag("v0.12.0"));
+        assert!(!is_prerelease_tag("v1.4.8"));
+    }
+
     #[test]
     fn plan_follows_mode_and_api() {
         let t = tempfile::tempdir().unwrap();
@@ -1497,7 +1752,7 @@ mod tests {
             .iter()
             .map(|s| s.name)
             .collect();
-        assert_eq!(names.len(), 6);
+        assert_eq!(names.len(), 7); // + the GPU-preference step
         assert_eq!(names[2], "DLSS5-Feeder");
         st.mode = game::Mode::Native;
         st.api = game::Api::Dx12;
@@ -1510,7 +1765,8 @@ mod tests {
             [
                 "ReShade (add-on build)",
                 "DLSS 5 add-on + models",
-                "ReShade config"
+                "ReShade config",
+                "GPU preference"
             ]
         );
         st.api = game::Api::Dx11;
@@ -1578,7 +1834,8 @@ mod tests {
             names,
             [
                 "OptiScaler + DLSS Neural Rendering",
-                "DLSS 5 model (nvngx_dlssnr.dll)"
+                "DLSS 5 model (nvngx_dlssnr.dll)",
+                "GPU preference"
             ]
         );
         // Feeder-mode game + Opti engine is refused before any network

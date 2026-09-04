@@ -130,8 +130,87 @@ fn describe_core() -> String {
     }
 }
 
+// ── which neural model is installed ────────────────────────────────
+
+/// The DLSS 5 model's own version string, e.g. `310.8.0.0` for NVIDIA's build
+/// and `310.8.SF.0` for ShortFuse's repack. Read from the file's version
+/// resource, which is the only field that separates them: both carry the same
+/// `OriginalFilename` (`CL 38718415`), `ProductName` and `CompanyName`, and
+/// differ by 10 KB in size. Verified against both builds from rhi-repo.
+#[cfg(windows)]
+pub fn file_version(path: &std::path::Path) -> Option<String> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
+    };
+    let w: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    use std::os::windows::ffi::OsStrExt;
+    let size = unsafe { GetFileVersionInfoSizeW(w.as_ptr(), std::ptr::null_mut()) };
+    if size == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; size as usize];
+    if unsafe { GetFileVersionInfoW(w.as_ptr(), 0, size, buf.as_mut_ptr() as *mut _) } == 0 {
+        return None;
+    }
+    // The language-neutral block first, then the two codepages NVIDIA ships.
+    for sub in [
+        r"\StringFileInfo\040904B0\FileVersion",
+        r"\StringFileInfo\000004B0\FileVersion",
+        r"\StringFileInfo\040904E4\FileVersion",
+    ] {
+        let q: Vec<u16> = sub.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut p: *mut core::ffi::c_void = std::ptr::null_mut();
+        let mut len: u32 = 0;
+        if unsafe { VerQueryValueW(buf.as_ptr() as *const _, q.as_ptr(), &mut p, &mut len) } != 0
+            && len > 0
+        {
+            let s = unsafe { std::slice::from_raw_parts(p as *const u16, len as usize) };
+            let v = String::from_utf16_lossy(s)
+                .trim_end_matches('\0')
+                .trim()
+                .to_owned();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+pub fn file_version(_path: &std::path::Path) -> Option<String> {
+    None
+}
+
+/// How that version string reads to a user: ShortFuse's multi-generation build
+/// or NVIDIA's original.
+pub fn model_build(version: &str) -> &'static str {
+    if version.to_ascii_uppercase().contains(".SF") {
+        "ShortFuse .SF build (adds Ada/Turing paths)"
+    } else {
+        "NVIDIA original build"
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// The two builds of the model differ only here: NVIDIA's reads
+    /// `310,8,0,0`, ShortFuse's `310.8.SF.0`. Every other version field is
+    /// identical, including `OriginalFilename` (`CL 38718415`).
+    #[test]
+    fn model_build_names_the_sf_repack() {
+        assert_eq!(
+            super::model_build("310.8.SF.0"),
+            "ShortFuse .SF build (adds Ada/Turing paths)"
+        );
+        assert_eq!(super::model_build("310,8,0,0"), "NVIDIA original build");
+        assert_eq!(super::model_build("310.8.0.0"), "NVIDIA original build");
+    }
+
     #[test]
     fn version_key_orders_driver_numbers() {
         assert!(super::version_key("616.56").unwrap() >= (616, 56));

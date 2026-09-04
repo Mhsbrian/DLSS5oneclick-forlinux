@@ -129,11 +129,15 @@ impl Tier {
     }
 }
 
-pub fn classify(name: &str) -> Tier {
+/// An adapter that is not a graphics card: a hypervisor's, a remote session's,
+/// or one of the software "monitors" that VR runtimes and virtual-display
+/// drivers register (Meta Virtual Monitor, an IDDCX device, a capture-card
+/// display). Windows lists these next to the real GPU, and counting them as a
+/// second vendor made the tool tell a single-GPU owner his game was starting
+/// on an integrated one (#30).
+pub fn is_virtual_adapter(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    // Virtual / remote adapters say nothing about the real GPU (Hyper-V GPU-P,
-    // RDP sessions, VMs, safe mode). Never refuse on those.
-    for v in [
+    [
         "hyper-v",
         "remote display",
         "basic display",
@@ -145,10 +149,30 @@ pub fn classify(name: &str) -> Tier {
         "qxl",
         "citrix",
         "rdp",
-    ] {
-        if n.contains(v) {
-            return Tier::Unknown;
-        }
+        // Virtual monitors: Meta Quest link, IDD/IDDCX drivers of every
+        // brand, Parsec, Sunshine, Amyuni and the rest.
+        "virtual monitor",
+        "virtual display",
+        "iddcx",
+        "idd device",
+        "mridd",
+        "luminoncore",
+        "parsec",
+        "sunshine",
+        "amyuni",
+        "usb display",
+        "displaylink",
+    ]
+    .iter()
+    .any(|v| n.contains(v))
+}
+
+pub fn classify(name: &str) -> Tier {
+    let n = name.to_ascii_lowercase();
+    // Virtual / remote adapters say nothing about the real GPU (Hyper-V GPU-P,
+    // RDP sessions, VMs, safe mode, virtual monitors). Never refuse on those.
+    if is_virtual_adapter(&n) {
+        return Tier::Unknown;
     }
     if !(n.contains("nvidia") || n.contains("geforce") || n.contains("rtx") || n.contains("quadro"))
     {

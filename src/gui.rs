@@ -62,6 +62,20 @@ pub struct App {
     /// The running worker is an install (not a removal): apply options after.
     finishing_install: bool,
     skipped_version: String,
+    /// A card whose install just finished and whose state has to be re-read.
+    pending_refresh: Option<usize>,
+    /// The card being installed from the Games page, so the progress is shown
+    /// where the user started it instead of throwing them onto another page.
+    updating: Option<usize>,
+    /// One refreshed card, after its install finished.
+    meta_one_rx: Option<Receiver<(usize, GameMeta)>>,
+    /// The user pressed "Check for updates": the answer is worth showing even
+    /// when it is "nothing new", which a background check never says.
+    checked_manually: bool,
+    /// When the last update check ran. The check used to happen once, at
+    /// startup, so a release published while the window was open was never
+    /// noticed -- the tool sat there saying it was current for days.
+    last_update_check: std::time::Instant,
     /// "Also install the RenoDX HDR mod" checkbox.
     renodx_on: bool,
     renodx: RenodxLookup,
@@ -94,6 +108,20 @@ enum Page {
     About,
 }
 
+/// What a poster card asked for this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum CardAction {
+    #[default]
+    None,
+    /// Left click: open the game on the Setup page.
+    Open,
+    /// Right click ▸ Update: install straight away, with the engine the game
+    /// already has, and show the Setup page so the progress is visible.
+    Update,
+    /// Right click ▸ Forget: drop a hand-added game from the list.
+    Forget,
+}
+
 /// What the tool knows about an installed game without touching it.
 #[derive(Debug, Clone)]
 struct GameMeta {
@@ -101,6 +129,11 @@ struct GameMeta {
     has_dlss: bool,
     addon: bool,
     ready: bool,
+    /// This tool installed into that folder: the game is listed in its own
+    /// section at the top rather than under its store.
+    installed: bool,
+    /// Components this tool placed that upstream has since moved past.
+    stale: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +185,11 @@ impl App {
             search: String::new(),
             store_icons: HashMap::new(),
             kofi_icon: None,
+            updating: None,
+            pending_refresh: None,
+            meta_one_rx: None,
+            checked_manually: false,
+            last_update_check: std::time::Instant::now(),
             skipped_version: cc
                 .storage
                 .and_then(|s| s.get_string("skip_version"))
@@ -327,12 +365,18 @@ impl App {
         let ctx2 = ctx.clone();
         let g2 = games.clone();
         thread::spawn(move || {
+            // One lookup for the whole scan; every game is then compared
+            // against it by reading the markers this tool wrote.
+            let latest = net::client()
+                .map(|c| installer::Latest::fetch(&c))
+                .unwrap_or_default();
             for (i, g) in g2.iter().enumerate() {
                 let meta = game::resolve_target(&g.dir)
                     .and_then(|(exe, _)| game::inspect(&exe))
                     .ok()
                     .map(|st| GameMeta {
                         api: match st.api {
+                            game::Api::Dx10 => "DirectX 10",
                             game::Api::Dx11 => "DirectX 11",
                             game::Api::Dx12 => "DirectX 12",
                             game::Api::Unknown => "DirectX 12?",
@@ -340,6 +384,8 @@ impl App {
                         has_dlss: st.mode == game::Mode::Native,
                         addon: st.dlss5_addon || st.opti,
                         ready: st.complete(),
+                        installed: game::installed_by_tool(st.game_dir()),
+                        stale: installer::stale_components(st.game_dir(), &latest),
                     });
                 if let Some(m) = meta {
                     let _ = mtx.send((i, m));
@@ -427,13 +473,92 @@ impl App {
         self.open_game(path);
     }
 
+    /// Right click ▸ Update: install with the engine the game already carries,
+    /// without leaving the Games page -- the card itself shows the progress.
+    fn update_game(&mut self, path: PathBuf, index: usize) {
+        self.exe_text = path.to_string_lossy().into_owned();
+        self.refresh();
+        if let Some(Ok(st)) = &self.status {
+            // Whatever stops the Install button stops this too (anti-cheat, a
+            // foreign dxgi.dll): the Setup page is now open and says why.
+            if !st.problems.is_empty() {
+                return;
+            }
+            self.engine = if st.opti {
+                Engine::Opti
+            } else {
+                Engine::ReShade
+            };
+            // A RenoDX mod that is already installed stays installed: the
+            // step is only added when the lookup has found one, and Install
+            // refreshes what is there either way.
+            self.updating = Some(index);
+            self.start(None);
+        } else {
+            // Could not even inspect it: the Setup page is the only place
+            // that can explain why.
+            self.page = Page::Setup;
+        }
+    }
+
+    /// Re-read one game after its install, so the card stops claiming an
+    /// update is available the moment it is not.
+    fn refresh_one(&mut self, index: usize, ctx: &egui::Context) {
+        let Some(g) = self.games.get(index).cloned() else {
+            return;
+        };
+        let (tx, rx) = channel();
+        self.meta_one_rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let latest = net::client()
+                .map(|c| installer::Latest::fetch(&c))
+                .unwrap_or_default();
+            if let Some(m) = game::resolve_target(&g.dir)
+                .and_then(|(exe, _)| game::inspect(&exe))
+                .ok()
+                .map(|st| GameMeta {
+                    api: match st.api {
+                        game::Api::Dx10 => "DirectX 10",
+                        game::Api::Dx11 => "DirectX 11",
+                        game::Api::Dx12 => "DirectX 12",
+                        game::Api::Unknown => "DirectX 12?",
+                    },
+                    has_dlss: st.mode == game::Mode::Native,
+                    addon: st.dlss5_addon || st.opti,
+                    ready: st.complete(),
+                    installed: game::installed_by_tool(st.game_dir()),
+                    stale: installer::stale_components(st.game_dir(), &latest),
+                })
+            {
+                let _ = tx.send((index, m));
+            }
+            ctx.request_repaint();
+        });
+    }
+
     fn open_game(&mut self, path: PathBuf) {
         self.exe_text = path.to_string_lossy().into_owned();
         self.refresh();
         self.page = Page::Setup;
     }
 
+    /// Re-check at most this often while the window is open.
+    const UPDATE_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+    /// Called every frame: cheap, and only starts a request when the interval
+    /// has passed and nothing else is in flight.
+    fn maybe_recheck_update(&mut self) {
+        if self.update_rx.is_some() || !matches!(self.update, UpdateState::Idle) {
+            return;
+        }
+        if self.last_update_check.elapsed() >= Self::UPDATE_CHECK_EVERY {
+            self.start_update_check();
+        }
+    }
+
     fn start_update_check(&mut self) {
+        self.last_update_check = std::time::Instant::now();
         let (tx, rx) = channel::<UpdateState>();
         self.update_rx = Some(rx);
         thread::spawn(move || {
@@ -654,6 +779,9 @@ impl App {
         if let Some(r) = finished {
             self.rx = None;
             self.running = false;
+            if let Some(i) = self.updating.take() {
+                self.pending_refresh = Some(i);
+            }
             match r {
                 Ok(msg) => {
                     self.progress = 100;
@@ -1074,7 +1202,9 @@ impl App {
                     .min_size(Vec2::new(96.0, 34.0))
                 };
                 if ui
-                    .add_enabled(!self.scanning, btn("Rescan", true))
+                    // Rescanning mid-install would renumber the cards under the
+                    // one being worked on.
+                    .add_enabled(!self.scanning && !self.running, btn("Rescan", true))
                     .clicked()
                 {
                     self.start_scan(ui.ctx());
@@ -1106,8 +1236,9 @@ impl App {
 
         // ── grid, grouped by store ────────────────────────────────
         let needle = self.search.trim().to_ascii_lowercase();
-        let mut clicked: Option<PathBuf> = None;
+        let mut clicked: Option<(PathBuf, usize)> = None;
         let mut forgotten: Option<PathBuf> = None;
+        let mut update = false;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -1119,20 +1250,30 @@ impl App {
                 let card_w =
                     ((avail - CARD_GAP * (cols as f32 - 1.0)) / cols as f32).clamp(CARD_W, 190.0);
                 let poster_h = (card_w * 1.5).round();
-                for store in [
-                    Store::Manual,
-                    Store::Steam,
-                    Store::Epic,
-                    Store::Gog,
-                    Store::Xbox,
-                    Store::Lutris,
-                ] {
+                // None = "Installed by this tool", always first: the whole
+                // point is to see at a glance what has been modified and
+                // what has fallen behind.
+                let sections: [Option<Store>; 7] = [
+                    None,
+                    Some(Store::Manual),
+                    Some(Store::Steam),
+                    Some(Store::Epic),
+                    Some(Store::Gog),
+                    Some(Store::Xbox),
+                    Some(Store::Lutris),
+                ];
+                for section in sections {
                     let idx: Vec<usize> = self
                         .games
                         .iter()
                         .enumerate()
-                        .filter(|(_, g)| {
-                            g.store == store
+                        .filter(|(i, g)| {
+                            let ours = self.meta.get(i).is_some_and(|m| m.installed);
+                            let in_section = match section {
+                                None => ours,
+                                Some(st) => g.store == st && !ours,
+                            };
+                            in_section
                                 && (needle.is_empty()
                                     || g.title.to_ascii_lowercase().contains(&needle))
                         })
@@ -1145,13 +1286,20 @@ impl App {
                         .iter()
                         .filter(|i| self.meta.get(i).is_some_and(|m| m.ready))
                         .count();
+                    let stale = idx
+                        .iter()
+                        .filter(|i| self.meta.get(i).is_some_and(|m| !m.stale.is_empty()))
+                        .count();
                     ui.horizontal(|ui| {
                         ui.set_max_width(avail);
                         ui.spacing_mut().item_spacing.x = 8.0;
                         ui.label(
-                            RichText::new(store.label())
-                                .font(t::plex_semibold(13.0))
-                                .color(t::TEXT),
+                            RichText::new(match section {
+                                None => "Installed by this tool",
+                                Some(st) => st.label(),
+                            })
+                            .font(t::plex_semibold(13.0))
+                            .color(t::TEXT),
                         );
                         ui.label(
                             RichText::new(idx.len().to_string())
@@ -1159,7 +1307,13 @@ impl App {
                                 .color(t::TEXT_DIM),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ready > 0 {
+                            if stale > 0 {
+                                ui.label(
+                                    RichText::new(format!("{stale} need updating"))
+                                        .font(t::plex(11.5))
+                                        .color(t::WARN),
+                                );
+                            } else if ready > 0 {
                                 ui.label(
                                     RichText::new(format!("{ready} ready for DLSS 5"))
                                         .font(t::plex(11.5))
@@ -1179,18 +1333,19 @@ impl App {
                                 egui::pos2(x, row_rect.top()),
                                 Vec2::new(card_w, poster_h + CAPTION_H),
                             );
-                            let (hit, forget) = self.game_card(ui, rect, i);
-                            if forget {
+                            let action = self.game_card(ui, rect, i);
+                            if action == CardAction::Forget {
                                 forgotten = Some(self.games[i].dir.clone());
                             }
-                            if hit {
+                            if matches!(action, CardAction::Open | CardAction::Update) {
+                                update = action == CardAction::Update;
                                 let g = &self.games[i];
                                 // The folder, so the exe finder ranks every candidate:
                                 // a store's launch exe can be a bootstrapper (Epic names
                                 // Satisfactory's FactoryGameEGS.exe, the real one is the
                                 // -Shipping.exe under Engine\Binaries\Win64, #29). The
                                 // store's exe is the fallback when nothing is found.
-                                clicked = Some(match game::resolve_target(&g.dir) {
+                                let path = match game::resolve_target(&g.dir) {
                                     Ok(_) => g.dir.clone(),
                                     Err(_) => match &g.exe_hint {
                                         Some(e) if e.is_file() && game::exe_bitness(e).is_ok() => {
@@ -1198,7 +1353,8 @@ impl App {
                                         }
                                         _ => g.dir.clone(),
                                     },
-                                });
+                                };
+                                clicked = Some((path, i));
                             }
                         }
                     }
@@ -1227,13 +1383,17 @@ impl App {
             self.games
                 .retain(|g| !(g.store == Store::Manual && g.dir == p));
         }
-        if let Some(p) = clicked {
-            self.open_game(p);
+        if let Some((p, index)) = clicked {
+            if update {
+                self.update_game(p, index);
+            } else {
+                self.open_game(p);
+            }
         }
     }
 
-    /// One poster card. Returns (clicked, forget requested).
-    fn game_card(&self, ui: &mut egui::Ui, rect: egui::Rect, i: usize) -> (bool, bool) {
+    /// One poster card, and what it was asked to do.
+    fn game_card(&self, ui: &mut egui::Ui, rect: egui::Rect, i: usize) -> CardAction {
         let g = &self.games[i];
         let resp = ui.interact(rect, ui.id().with(("card", i)), egui::Sense::click());
         let hovered = resp.hovered();
@@ -1309,6 +1469,16 @@ impl App {
             );
             p.rect_filled(chip, CornerRadius::same(6), t::ACCENT);
             p.galley(chip.min + pad, galley, t::BG);
+            // A game this tool set up whose files upstream has moved past.
+            if !m.stale.is_empty() && self.updating != Some(i) {
+                let galley = p.layout_no_wrap("UPDATE".to_owned(), font, t::BG);
+                let badge = egui::Rect::from_min_size(
+                    egui::pos2(poster.left() + 8.0, poster.top() + 8.0),
+                    galley.size() + pad * 2.0,
+                );
+                p.rect_filled(badge, CornerRadius::same(6), t::WARN);
+                p.galley(badge.min + pad, galley, t::BG);
+            }
             // Status line over the bottom of the poster.
             let band = egui::Rect::from_min_max(
                 egui::pos2(poster.left(), poster.bottom() - 26.0),
@@ -1362,19 +1532,89 @@ impl App {
             StrokeKind::Inside,
         );
         if hovered {
+            let stale = self
+                .meta
+                .get(&i)
+                .filter(|m| !m.stale.is_empty())
+                .map(|m| format!("\n\nOut of date:\n  {}", m.stale.join("\n  ")))
+                .unwrap_or_default();
             resp.clone()
-                .on_hover_text(format!("{}\n{}", g.title, g.dir.display()));
+                .on_hover_text(format!("{}\n{}{stale}", g.title, g.dir.display()));
         }
-        let mut forget = false;
-        if g.store == Store::Manual {
+        // Being installed right now: dim the poster, say so, and show how far
+        // along it is, right where the user asked for it.
+        if self.updating == Some(i) {
+            let p = ui.painter();
+            p.rect_filled(poster, r, Color32::from_black_alpha(190));
+            let pct = self.progress.min(100);
+            let title = p.layout_no_wrap(
+                if self.running {
+                    format!("Updating… {pct}%")
+                } else {
+                    "Finishing…".to_owned()
+                },
+                t::plex_semibold(13.0),
+                t::TEXT,
+            );
+            p.galley(
+                egui::pos2(
+                    poster.center().x - title.size().x / 2.0,
+                    poster.center().y - 22.0,
+                ),
+                title,
+                t::TEXT,
+            );
+            // Which step, so a long download does not look stuck.
+            if !self.progress_msg.is_empty() {
+                let step = p.layout(
+                    self.progress_msg.clone(),
+                    t::plex(10.5),
+                    t::TEXT_SOFT,
+                    poster.width() - 20.0,
+                );
+                p.galley(
+                    egui::pos2(poster.center().x - step.size().x / 2.0, poster.center().y),
+                    step,
+                    t::TEXT_SOFT,
+                );
+            }
+            let track = egui::Rect::from_min_size(
+                egui::pos2(poster.left() + 16.0, poster.bottom() - 26.0),
+                Vec2::new(poster.width() - 32.0, 4.0),
+            );
+            p.rect_filled(track, CornerRadius::same(2), t::BORDER_STRONG);
+            let done = egui::Rect::from_min_size(
+                track.min,
+                Vec2::new(track.width() * pct as f32 / 100.0, track.height()),
+            );
+            p.rect_filled(done, CornerRadius::same(2), t::ACCENT);
+        }
+        let mut action = if resp.clicked() && self.updating != Some(i) {
+            CardAction::Open
+        } else {
+            CardAction::None
+        };
+        let installed = self.meta.get(&i).is_some_and(|m| m.installed);
+        let stale = self.meta.get(&i).is_some_and(|m| !m.stale.is_empty());
+        if installed || g.store == Store::Manual {
             resp.context_menu(|ui| {
-                if ui.button("Forget this game").clicked() {
-                    forget = true;
+                if installed {
+                    let label = if stale { "Update" } else { "Re-install" };
+                    if ui
+                        .add_enabled(!self.running, egui::Button::new(label))
+                        .clicked()
+                    {
+                        action = CardAction::Update;
+                        ui.close();
+                    }
+                }
+                if g.store == Store::Manual && ui.button("Forget this game").clicked() {
+                    action = CardAction::Forget;
                     ui.close();
                 }
             });
         }
-        (resp.clicked(), forget)
+        action
     }
 }
 
@@ -1485,6 +1725,16 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.pump();
         self.pump_renodx();
+        if let Some(i) = self.pending_refresh.take() {
+            self.refresh_one(i, ui.ctx());
+        }
+        if let Some(rx) = &self.meta_one_rx {
+            if let Ok((i, m)) = rx.try_recv() {
+                self.meta.insert(i, m);
+                self.meta_one_rx = None;
+            }
+        }
+        self.maybe_recheck_update();
         if self.running || matches!(self.renodx, RenodxLookup::Pending) {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
@@ -1803,6 +2053,39 @@ impl eframe::App for App {
                     }
                     Page::About => {
                         about_page(ui);
+                        ui.add_space(10.0);
+                        let busy = self.update_rx.is_some()
+                            || !matches!(self.update, UpdateState::Idle);
+                        let btn = egui::Button::new(
+                            RichText::new("Check for updates")
+                                .font(t::plex_medium(12.5))
+                                .color(t::TEXT),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::new(1.0, t::BORDER_STRONG))
+                        .corner_radius(CornerRadius::same(8))
+                        .min_size(Vec2::new(150.0, 34.0));
+                        if ui.add_enabled(!busy, btn).clicked() {
+                            // An explicit check also clears a skipped version:
+                            // asking is asking.
+                            self.skipped_version.clear();
+                            self.checked_manually = true;
+                            self.start_update_check();
+                        }
+                        if self.checked_manually
+                            && matches!(self.update, UpdateState::Idle)
+                            && self.update_rx.is_none()
+                        {
+                            ui.label(
+                                RichText::new(concat!(
+                                    "You are on the newest release (v",
+                                    env!("CARGO_PKG_VERSION"),
+                                    ")."
+                                ))
+                                .font(t::plex(12.0))
+                                .color(t::TEXT_MUTED),
+                            );
+                        }
                         return;
                     }
                     Page::Setup => {}

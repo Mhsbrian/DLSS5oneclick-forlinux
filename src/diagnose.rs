@@ -23,13 +23,47 @@ pub struct Finding {
 
 /// `NVSDK_NGX_*_Init -> 0xBAD00001` in a log: NGX itself refused. Add what the
 /// system says about NGX Core, which is the usual cause on capable hardware.
-fn ngx_init_failure(log: &str, out: &mut Vec<Finding>) {
+/// `exe` is the game (and, for a 32-bit game, its helper) whose Windows GPU
+/// preference is worth naming: on a hybrid machine a process started on the
+/// iGPU gets exactly this error, because NGX does not exist there (#25).
+fn ngx_init_failure_for(log: &str, exe: Option<&std::path::Path>, out: &mut Vec<Finding>) {
     let Some(line) = log
         .lines()
         .find(|l| l.contains("NVSDK_NGX") && l.contains("Init") && l.contains("0xBAD00001"))
     else {
         return;
     };
+    if crate::gpupref::hybrid() {
+        let names = crate::gpupref::real_adapters();
+        #[cfg(target_os = "linux")]
+        {
+            let _ = exe;
+            out.push(bad(format!(
+                "More than one GPU is present ({}). If the game (under Proton) started on the \
+                 integrated GPU, NGX does not exist there and every Init answers 0xBAD00001. \
+                 Force the NVIDIA card by adding these to the game's launch options: \
+                 __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia \
+                 (with DXVK, also DRI_PRIME=1). On a desktop where NVIDIA already drives the \
+                 display this is not the cause.",
+                names.join(", ")
+            )));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let set = exe.is_some_and(|e| {
+                crate::gpupref::get(e).is_some_and(|v| crate::gpupref::is_high_performance(&v))
+            });
+            out.push(bad(format!(
+                "More than one GPU vendor on this machine ({}), and Windows decides which one              a process starts on. Started on the integrated GPU, NGX does not exist and              every Init answers 0xBAD00001 — this is the most likely cause here{}.              Settings ▸ System ▸ Display ▸ Graphics ▸ Add a desktop app ▸ pick the game's exe              (and, for a 32-bit game, host64\\dlss5-feed-host64.exe) ▸ Options ▸ High performance.              Install sets that for you from this version on.",
+                names.join(", "),
+                if set {
+                    ", though the preference is already set to high performance for that exe"
+                } else {
+                    ""
+                }
+            )));
+        }
+    }
     let system = crate::ngx::describe();
     // Reported on three machines (RTX 4070, 5080, 5090) with NGX Core present and
     // driver 616.56, always on the Feeder's own in-process D3D12 device. The same
@@ -79,10 +113,48 @@ fn read(dir: &Path, name: &str) -> Option<String> {
     fs::read_to_string(dir.join(name)).ok()
 }
 
+/// The exe ReShade actually loaded into, from its first line:
+/// `... loaded from '...dxgi.dll' into 'C:\\...bg3_dx11.exe' (0x...)`.
+fn reshade_host_exe(log: &str) -> Option<String> {
+    let line = log
+        .lines()
+        .find(|l| l.contains("loaded from") && l.contains(" into "))?;
+    let path = line.split(" into ").nth(1)?.split('\'').nth(1)?;
+    // The log always holds a Windows path (`C:\...\bg3_dx11.exe`), so split on
+    // both separators — `Path::file_name` treats `\` as an ordinary character
+    // when this tool runs on Linux and would return the whole path.
+    path.rsplit(['/', '\\'])
+        .find(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
 /// Findings for a game folder, in reading order.
 pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
     let d = st.game_dir();
     let mut out = Vec::new();
+
+    // ── which neural model is installed ────────────────────
+    // Two builds of nvngx_dlssnr.dll are in circulation and only the version
+    // resource separates them; every failing RTX 50 report so far carries the
+    // .SF one, so the log has to name it.
+    let consumer = st.consumer_dir();
+    for p in [d.join(game::DLSSNR_DLL), consumer.join(game::DLSSNR_DLL)] {
+        if !p.is_file() {
+            continue;
+        }
+        if let Some(v) = crate::ngx::file_version(&p) {
+            out.push(ok(format!(
+                "DLSS 5 model {}: {v} — {}",
+                if p.parent() == Some(d) {
+                    "beside the exe"
+                } else {
+                    "in host64"
+                },
+                crate::ngx::model_build(&v)
+            )));
+        }
+        break;
+    }
 
     // ── ReShade side ────────────────────────────────────────────────
     let Some(rs) = read(d, "ReShade.log").or_else(|| read(d, "ReShade2.log")) else {
@@ -141,11 +213,41 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
              in the add-on panel.",
         ));
     } else if st.mode == game::Mode::Native {
-        out.push(bad(
-            "No NGX call was intercepted: this game's own DLSS never ran. Turn DLSS on in the \
-             game's graphics settings (the add-on hooks the game's DLSS calls; without them it has \
-             nothing to work with).",
-        ));
+        // The add-on hooks NVSDK_NGX_D3D12_*. A game whose DLSS runs on D3D11
+        // calls the D3D11 entry points, which it never sees, so "no create"
+        // is expected until the bridge is installed (#33, BG3 DX11).
+        if st.api == game::Api::Dx11 && !st.bridge {
+            out.push(bad(
+                "No NGX call was intercepted, and this is a Direct3D 11 game with its own \
+                 DLSS: the add-on hooks the D3D12 NGX entry points, but the game calls the \
+                 D3D11 ones, so it can never see them. The DX11 bridge covers exactly this \
+                 and is not installed here — run Install on this exe.",
+            ));
+        } else {
+            out.push(bad(
+                "No NGX call was intercepted: this game's own DLSS never ran. Turn DLSS on \
+                 in the game's graphics settings (the add-on hooks the game's DLSS calls; \
+                 without them it has nothing to work with).",
+            ));
+        }
+    }
+
+    // A game with more than one executable (a Vulkan build and a DX11 build,
+    // a launcher and the game) can be installed for one and played through
+    // another: ReShade loads, everything looks right, nothing is hooked (#33).
+    if let Some(loaded) = reshade_host_exe(&rs) {
+        let ours = st
+            .exe
+            .file_name()
+            .map(|n| n.to_string_lossy().to_ascii_lowercase());
+        if ours.is_some_and(|o| o != loaded.to_ascii_lowercase()) {
+            out.push(warn(format!(
+                "ReShade loaded into {loaded}, but this install was set up for {}. Those are \
+                 different executables, and the install is tuned to the one you picked (the \
+                 DX11 bridge in particular). Point the tool at {loaded} and run Install again.",
+                st.exe.file_name().unwrap_or_default().to_string_lossy()
+            )));
+        }
     }
 
     // ── DX11 bridge (native DLSS on D3D11) ──────────────────────────
@@ -222,7 +324,7 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
                  \"LUMENITE: Kernel 2.0\" ABOVE \"DLSS5_Feed\", then reload effects.",
             ));
         }
-        ngx_init_failure(&fd, &mut out);
+        ngx_init_failure_for(&fd, Some(&st.exe), &mut out);
         // 32-bit games: the work happens in host64\, and its own log names the reason.
         if let Some(hl) = read(&d.join(game::HOST_DIR), "dlss5-feed-host.log") {
             if hl.contains("feature ready") {
@@ -230,7 +332,7 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
                     "The host64 helper built its DLSS feature (feature ready … DLAA).",
                 ));
             }
-            ngx_init_failure(&hl, &mut out);
+            ngx_init_failure_for(&hl, Some(&st.consumer_dir().join(game::HOST_EXE)), &mut out);
         } else if st.is32() {
             out.push(warn(
                 "No host64\\dlss5-feed-host.log yet: the 64-bit helper has not started. It is \
@@ -419,16 +521,16 @@ pub fn host_findings(st: &GameStatus, ctx: &HostContext) -> Vec<Finding> {
             "NVIDIA kernel module not loaded (no /sys/module/nvidia/version).",
         )),
     }
-    if st.mode == game::Mode::Native && st.api == game::Api::Dx11 {
-        if st.bridge {
-            out.push(ok(
-                "DX11 bridge installed (this game's own DLSS is D3D11; the bridge mirrors it                  onto a private D3D12 device — vkd3d-proton under Proton, supported by bridge                  1.4.6+; Install refreshes the bridge when a newer build is published).",
-            ));
-        } else {
-            out.push(bad(
-                "This game's own DLSS runs on D3D11, so the dlss5-bridge is required and it is                  not installed — run Install to add it.",
-            ));
-        }
+    // Only the positive confirmation lives here; the "missing bridge" case is
+    // owned by diagnose() proper (it explains, in the NGX-interception
+    // narrative, why the D3D11 game's calls are never seen), so this does not
+    // double-report it.
+    if st.mode == game::Mode::Native && st.api == game::Api::Dx11 && st.bridge {
+        out.push(ok(
+            "DX11 bridge installed (this game's own DLSS is D3D11; the bridge mirrors it onto a \
+             private D3D12 device — vkd3d-proton under Proton, supported by bridge 1.4.6+; \
+             Install refreshes the bridge when a newer build is published).",
+        ));
     }
     if ctx.d3dcompiler_missing_feeder && st.mode == game::Mode::Feeder {
         out.push(warn(
@@ -443,6 +545,19 @@ pub fn host_findings(st: &GameStatus, ctx: &HostContext) -> Vec<Finding> {
 
 #[cfg(test)]
 mod tests {
+    /// Baldur's Gate 3 ships bg3.exe (Vulkan) and bg3_dx11.exe; installing for
+    /// one and playing the other leaves everything looking right and nothing
+    /// hooked (#33). The exe name is in ReShade's first line.
+    #[test]
+    fn reshade_host_exe_reads_the_first_line() {
+        let log = "01:30:11:810 [17792] | INFO  | Initializing crosire's ReShade version '6.8.0.2155' (64-bit) loaded from 'C:\\\\Program Files (x86)\\\\Steam\\\\steamapps\\\\common\\\\Baldurs Gate 3\\\\bin\\\\dxgi.dll' into 'C:\\\\Program Files (x86)\\\\Steam\\\\steamapps\\\\common\\\\Baldurs Gate 3\\\\bin\\\\bg3_dx11.exe' (0x64317982) ...";
+        assert_eq!(
+            super::reshade_host_exe(log).as_deref(),
+            Some("bg3_dx11.exe")
+        );
+        assert!(super::reshade_host_exe("nothing useful here").is_none());
+    }
+
     use super::*;
     use crate::game::testutil::*;
 
@@ -578,8 +693,10 @@ mod tests {
         assert!(bad.text.contains("vkd3d-proton"));
     }
 
+    /// The missing-bridge case is owned by diagnose() (needs a ReShade.log to
+    /// establish "no NGX call"); host_findings only confirms an installed one.
     #[test]
-    fn host_findings_flag_missing_bridge_on_native_dx11() {
+    fn native_dx11_missing_bridge_is_caught_by_diagnose() {
         std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
         let t = tempfile::tempdir().unwrap();
         let exe = game::testutil::make_pe_with_imports(
@@ -588,17 +705,26 @@ mod tests {
             2_000_000,
         );
         fs::write(t.path().join(game::DLSS_DLL), b"x").unwrap(); // native mode
+        // ReShade loaded and the add-on registered, but nothing was hooked.
+        fs::write(
+            t.path().join("ReShade.log"),
+            "Initializing crosire's ReShade version '6.8.0'\nRegistered add-on \"DLSS 5 Neural Rendering\"\n",
+        )
+        .unwrap();
         let st = game::inspect(&exe).unwrap();
         assert_eq!(st.api, game::Api::Dx11);
         assert_eq!(st.mode, game::Mode::Native);
-        let f = host_findings(&st, &host_ctx());
-        assert!(f
+        // diagnose() (no bridge) names the bridge; host_findings does not repeat it.
+        let d = diagnose(&st);
+        assert!(d
             .iter()
-            .any(|x| x.level == Level::Bad && x.text.contains("dlss5-bridge is required")));
+            .any(|x| x.level == Level::Bad && x.text.contains("DX11 bridge covers")));
+        let h = host_findings(&st, &host_ctx());
+        assert!(!h.iter().any(|x| x.text.contains("bridge")));
+        // With the bridge present, host_findings confirms it and diagnose stops warning.
         fs::write(t.path().join(game::BRIDGE_ADDON), b"x").unwrap();
         let st = game::inspect(&exe).unwrap();
-        let f = host_findings(&st, &host_ctx());
-        assert!(f
+        assert!(host_findings(&st, &host_ctx())
             .iter()
             .any(|x| x.level == Level::Ok && x.text.contains("DX11 bridge installed")));
     }
