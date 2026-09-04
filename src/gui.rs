@@ -89,6 +89,20 @@ enum Page {
     About,
 }
 
+/// What a poster card asked for this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum CardAction {
+    #[default]
+    None,
+    /// Left click: open the game on the Setup page.
+    Open,
+    /// Right click ▸ Update: install straight away, with the engine the game
+    /// already has, and show the Setup page so the progress is visible.
+    Update,
+    /// Right click ▸ Forget: drop a hand-added game from the list.
+    Forget,
+}
+
 /// What the tool knows about an installed game without touching it.
 #[derive(Debug, Clone)]
 struct GameMeta {
@@ -429,6 +443,28 @@ impl App {
             self.start_game_details(ctx);
         }
         self.open_game(path);
+    }
+
+    /// Right click ▸ Update: set up the game exactly as it is set up now --
+    /// the engine it already carries -- and start immediately.
+    fn update_game(&mut self, path: PathBuf) {
+        self.open_game(path);
+        if let Some(Ok(st)) = &self.status {
+            // Whatever stops the Install button stops this too (anti-cheat, a
+            // foreign dxgi.dll): the Setup page is now open and says why.
+            if !st.problems.is_empty() {
+                return;
+            }
+            self.engine = if st.opti {
+                Engine::Opti
+            } else {
+                Engine::ReShade
+            };
+            // A RenoDX mod that is already installed stays installed: the
+            // step is only added when the lookup has found one, and Install
+            // refreshes what is there either way.
+            self.start(None);
+        }
     }
 
     fn open_game(&mut self, path: PathBuf) {
@@ -962,6 +998,7 @@ impl App {
         let needle = self.search.trim().to_ascii_lowercase();
         let mut clicked: Option<PathBuf> = None;
         let mut forgotten: Option<PathBuf> = None;
+        let mut update = false;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -1055,11 +1092,12 @@ impl App {
                                 egui::pos2(x, row_rect.top()),
                                 Vec2::new(card_w, poster_h + CAPTION_H),
                             );
-                            let (hit, forget) = self.game_card(ui, rect, i);
-                            if forget {
+                            let action = self.game_card(ui, rect, i);
+                            if action == CardAction::Forget {
                                 forgotten = Some(self.games[i].dir.clone());
                             }
-                            if hit {
+                            if matches!(action, CardAction::Open | CardAction::Update) {
+                                update = action == CardAction::Update;
                                 let g = &self.games[i];
                                 // The folder, so the exe finder ranks every candidate:
                                 // a store's launch exe can be a bootstrapper (Epic names
@@ -1104,12 +1142,16 @@ impl App {
                 .retain(|g| !(g.store == Store::Manual && g.dir == p));
         }
         if let Some(p) = clicked {
-            self.open_game(p);
+            if update {
+                self.update_game(p);
+            } else {
+                self.open_game(p);
+            }
         }
     }
 
-    /// One poster card. Returns (clicked, forget requested).
-    fn game_card(&self, ui: &mut egui::Ui, rect: egui::Rect, i: usize) -> (bool, bool) {
+    /// One poster card, and what it was asked to do.
+    fn game_card(&self, ui: &mut egui::Ui, rect: egui::Rect, i: usize) -> CardAction {
         let g = &self.games[i];
         let resp = ui.interact(rect, ui.id().with(("card", i)), egui::Sense::click());
         let hovered = resp.hovered();
@@ -1257,16 +1299,32 @@ impl App {
             resp.clone()
                 .on_hover_text(format!("{}\n{}{stale}", g.title, g.dir.display()));
         }
-        let mut forget = false;
-        if g.store == Store::Manual {
+        let mut action = if resp.clicked() {
+            CardAction::Open
+        } else {
+            CardAction::None
+        };
+        let installed = self.meta.get(&i).is_some_and(|m| m.installed);
+        let stale = self.meta.get(&i).is_some_and(|m| !m.stale.is_empty());
+        if installed || g.store == Store::Manual {
             resp.context_menu(|ui| {
-                if ui.button("Forget this game").clicked() {
-                    forget = true;
+                if installed {
+                    let label = if stale { "Update" } else { "Re-install" };
+                    if ui
+                        .add_enabled(!self.running, egui::Button::new(label))
+                        .clicked()
+                    {
+                        action = CardAction::Update;
+                        ui.close();
+                    }
+                }
+                if g.store == Store::Manual && ui.button("Forget this game").clicked() {
+                    action = CardAction::Forget;
                     ui.close();
                 }
             });
         }
-        (resp.clicked(), forget)
+        action
     }
 }
 
