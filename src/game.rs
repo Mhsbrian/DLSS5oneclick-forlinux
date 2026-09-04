@@ -82,9 +82,20 @@ pub fn is_reshade_dll(path: &Path) -> bool {
         return false;
     }
     match fs::read(path) {
-        Ok(bytes) => bytes.windows(7).any(|w| w == b"ReShade"),
+        Ok(bytes) => is_reshade_image(&bytes),
         Err(_) => false,
     }
+}
+
+/// OptiScaler's own `dxgi.dll` carries the string `ReShade` six times, because
+/// it can load ReShade itself — so "contains ReShade" called it ReShade and
+/// refused to update a game that had OptiScaler installed. crosire's name is in
+/// every real ReShade build (36 hits of `ReShade`, 3 of `crosire` in 6.8.0)
+/// and in none of OptiScaler's, so it settles the two apart; a build that
+/// somehow lacks it still counts unless the file says OptiScaler.
+fn is_reshade_image(bytes: &[u8]) -> bool {
+    let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+    has(b"ReShade") && (has(b"crosire") || !has(b"OptiScaler"))
 }
 
 /// Which install path applies to a game.
@@ -871,6 +882,21 @@ mod tests {
     /// A Direct3D 10 game imports d3d10_1.dll, and often d3d9.dll too for its
     /// D3DPERF debug markers - which is how DMC4:SE ends up looking like a
     /// DirectX 9 game to a naive scan.
+    /// OptiScaler's dxgi.dll says "ReShade" because it can load ReShade; only
+    /// a real ReShade build also carries crosire's name (#the update refusal).
+    #[test]
+    fn optiscaler_is_not_mistaken_for_reshade() {
+        assert!(is_reshade_image(
+            b"...crosire's ReShade version '6.8.0.2155'..."
+        ));
+        assert!(!is_reshade_image(
+            b"OptiScaler ... LoadReshade ... ReShade64.dll ..."
+        ));
+        // A ReShade build without the author's name is still ReShade.
+        assert!(is_reshade_image(b"ReShade effect runtime"));
+        assert!(!is_reshade_image(b"some other dxgi wrapper"));
+    }
+
     #[test]
     fn classify_imports_reads_d3d10() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
