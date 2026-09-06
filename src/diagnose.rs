@@ -541,6 +541,11 @@ pub struct HostContext {
     /// when it wrote one (proof its ASI + core loaded under Proton); `None`
     /// means installed but no log found yet.
     pub mfg_log_tail: Option<String>,
+    /// The game's newest Proton-prefix crash report has a callstack dominated by
+    /// the DLSS 5 neural-rendering runtime (`nvngx_dlssnr`) reached through the
+    /// add-on — the signed NR runtime faulting under Proton. Carries the crash's
+    /// error line. `None` = no such crash found.
+    pub nr_runtime_crash: Option<String>,
 }
 
 /// Findings about the host setup (launch options, driver, Proton) — pure and
@@ -646,6 +651,22 @@ pub fn host_findings(st: &GameStatus, ctx: &HostContext) -> Vec<Finding> {
              WINEDLLOVERRIDES.",
         ));
     }
+    // The signed NR runtime crashing under Proton is invisible in ReShade.log
+    // (it takes the process down mid-frame); the evidence is the game's own UE
+    // crash report in the prefix. When its callstack is nvngx_dlssnr reached
+    // through the add-on, the neural pass itself faulted — on every title seen
+    // so far as the game brings up DLSS Frame Generation, which the add-on
+    // intercepts. DLAA/native NR runs fine right up to that point.
+    if let Some(err) = &ctx.nr_runtime_crash {
+        out.push(bad(format!(
+            "The DLSS 5 neural-rendering runtime crashed under Proton: the game's crash report \
+             faults inside nvngx_dlssnr, reached through the add-on ({err}). Neural rendering on \
+             the native/DLAA path runs until the game creates a DLSS Frame Generation feature, \
+             which is where it goes down. Turn Frame Generation OFF in the game (keep DLSS on \
+             DLAA) — that is the stable configuration — or Remove neural rendering for this \
+             title. This is the signed runtime under Proton, not the tool's setup.",
+        )));
+    }
     if ctx.mfg_installed {
         match &ctx.mfg_log_tail {
             Some(tail) => out.push(ok(format!(
@@ -707,7 +728,27 @@ mod tests {
             steam_running: false,
             mfg_installed: false,
             mfg_log_tail: None,
+            nr_runtime_crash: None,
         }
+    }
+
+    #[test]
+    fn host_findings_reports_nr_runtime_crash_and_points_at_frame_generation() {
+        let (_t, exe) = setup(true);
+        let st = game::inspect(&exe).unwrap();
+        let mut ctx = host_ctx();
+        ctx.nr_runtime_crash =
+            Some("Unhandled Exception: EXCEPTION_ACCESS_VIOLATION reading address 0x18".into());
+        let f = host_findings(&st, &ctx);
+        let bad = f
+            .iter()
+            .find(|x| x.level == Level::Bad && x.text.contains("neural-rendering runtime crashed"))
+            .expect("crash finding present");
+        assert!(bad.text.contains("Frame Generation") && bad.text.contains("DLAA"));
+        // Silent when there is no such crash.
+        assert!(!host_findings(&st, &host_ctx())
+            .iter()
+            .any(|x| x.text.contains("neural-rendering runtime crashed")));
     }
 
     #[test]

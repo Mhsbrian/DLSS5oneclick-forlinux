@@ -425,6 +425,11 @@ pub fn host_context(st: &crate::game::GameStatus) -> crate::diagnose::HostContex
                 if st.mfg {
                     ctx.mfg_log_tail = newest_mfg_log_tail(&cd);
                 }
+                // Only relevant while the NR add-on is installed: a crash left
+                // over from a previous engine is not this install's story.
+                if st.dlss5_addon {
+                    ctx.nr_runtime_crash = newest_nr_runtime_crash(&cd);
+                }
             }
         }
     }
@@ -459,6 +464,60 @@ fn newest_mfg_log_tail(compatdata: &Path) -> Option<String> {
         .map(str::trim)
         .find(|l| !l.is_empty())
         .map(str::to_owned)
+}
+
+/// The error line of the game's newest Unreal crash report, when that crash's
+/// callstack is dominated by the DLSS 5 neural-rendering runtime reached
+/// through the add-on — i.e. the signed NR runtime faulted under Proton, which
+/// never reaches ReShade.log. The report is `CrashContext.runtime-xml` under
+/// `Saved/Crashes/UECC-*/`, whose `<PCallStack>` names the faulting modules.
+#[cfg(target_os = "linux")]
+fn newest_nr_runtime_crash(compatdata: &Path) -> Option<String> {
+    let crashes = compatdata
+        .join("pfx/drive_c/users/steamuser/AppData/Local")
+        .read_dir()
+        .ok()?
+        // AppData/Local/<Game>/Saved/Crashes — the game folder name is unknown,
+        // so scan each app's Saved/Crashes for UE crash directories.
+        .flatten()
+        .map(|e| e.path().join("Saved/Crashes"))
+        .filter(|p| p.is_dir())
+        .flat_map(|p| p.read_dir().into_iter().flatten().flatten())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("UECC-"))
+        });
+    let mut reports: Vec<std::path::PathBuf> = crashes
+        .map(|d| d.join("CrashContext.runtime-xml"))
+        .filter(|p| p.is_file())
+        .collect();
+    reports.sort_by_key(|p| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH)
+    });
+    let newest = reports.last()?;
+    let xml = std::fs::read_to_string(newest).ok()?;
+    // The neural pass is the culprit only when the signed NR runtime is on the
+    // callstack together with the add-on that drives it — not any UE crash.
+    let call = xml
+        .split_once("<PCallStack>")
+        .map(|(_, rest)| rest.split_once("</PCallStack>").map_or(rest, |(c, _)| c))
+        .unwrap_or("");
+    if !(call.contains("nvngx_dlssnr") && call.contains("renodx-dlss5")) {
+        return None;
+    }
+    // Report the human-readable error line (the exception + address).
+    let msg = xml
+        .split_once("<ErrorMessage>")
+        .and_then(|(_, rest)| rest.split_once("</ErrorMessage>"))
+        .map(|(m, _)| m.trim().to_owned())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| "access violation".into());
+    Some(msg)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -498,5 +557,53 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let adv = ensure_d3dcompiler(t.path(), crate::installer::Engine::ReShade, &|_| {});
         assert!(matches!(adv, D3dcompilerAdvice::NotApplicable));
+    }
+
+    fn write_crash(compatdata: &Path, game: &str, id: &str, pcallstack: &str, err: &str) {
+        let dir = compatdata
+            .join("pfx/drive_c/users/steamuser/AppData/Local")
+            .join(game)
+            .join("Saved/Crashes")
+            .join(format!("UECC-Windows-{id}_0000"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("CrashContext.runtime-xml"),
+            format!(
+                "<FGenericCrashContext>\
+                 <RuntimeProperties><ErrorMessage>{err}</ErrorMessage></RuntimeProperties>\
+                 <PCallStack>{pcallstack}</PCallStack></FGenericCrashContext>"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn nr_runtime_crash_recognised_only_when_the_addon_and_runtime_are_on_the_stack() {
+        let t = tempfile::tempdir().unwrap();
+        let cd = t.path();
+
+        // A crash whose callstack is the NR runtime reached through the add-on.
+        write_crash(
+            cd,
+            "Bodycam",
+            "AAAA",
+            "dxgi + 1\nnvngx_dlssnr + 25b3\nrenodx-dlss5 + a673\n_nvngx + 6022a\n",
+            "Unhandled Exception: EXCEPTION_ACCESS_VIOLATION reading address 0x18",
+        );
+        let got = newest_nr_runtime_crash(cd).expect("NR crash recognised");
+        assert!(got.contains("ACCESS_VIOLATION"));
+
+        // A newer, unrelated engine crash (no NR runtime on the stack) is not
+        // attributed to neural rendering — the newest report is inspected, and
+        // it must actually name both modules.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        write_crash(
+            cd,
+            "Bodycam",
+            "BBBB",
+            "Bodycam-Win64-Shipping + 1\nUnrealEditor-Engine + 2\nntdll + 3\n",
+            "Unhandled Exception: EXCEPTION_ACCESS_VIOLATION",
+        );
+        assert!(newest_nr_runtime_crash(cd).is_none());
     }
 }
