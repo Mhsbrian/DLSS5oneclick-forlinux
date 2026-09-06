@@ -653,18 +653,21 @@ pub fn host_findings(st: &GameStatus, ctx: &HostContext) -> Vec<Finding> {
     }
     // The signed NR runtime crashing under Proton is invisible in ReShade.log
     // (it takes the process down mid-frame); the evidence is the game's own UE
-    // crash report in the prefix. When its callstack is nvngx_dlssnr reached
-    // through the add-on, the neural pass itself faulted — on every title seen
-    // so far as the game brings up DLSS Frame Generation, which the add-on
-    // intercepts. DLAA/native NR runs fine right up to that point.
+    // crash report in the prefix. The callstack is nvngx_dlssnr calling into
+    // nvapi64 — Proton's dxvk-nvapi, a reimplementation — and the closed runtime
+    // dereferencing what comes back as null (reading 0x18). It can fault within
+    // seconds of neural rendering starting, with or without Frame Generation;
+    // DLAA/native NR runs cleanly right up to the fault.
     if let Some(err) = &ctx.nr_runtime_crash {
         out.push(bad(format!(
             "The DLSS 5 neural-rendering runtime crashed under Proton: the game's crash report \
-             faults inside nvngx_dlssnr, reached through the add-on ({err}). Neural rendering on \
-             the native/DLAA path runs until the game creates a DLSS Frame Generation feature, \
-             which is where it goes down. Turn Frame Generation OFF in the game (keep DLSS on \
-             DLAA) — that is the stable configuration — or Remove neural rendering for this \
-             title. This is the signed runtime under Proton, not the tool's setup.",
+             faults inside nvngx_dlssnr via nvapi64 ({err}), reached through the add-on. The \
+             signed runtime and Proton's nvapi (dxvk-nvapi) do not fully agree here, and it can \
+             go down within seconds of neural rendering starting — with or without DLSS Frame \
+             Generation. Worth trying, cheapest first: turn Frame Generation off and keep DLSS \
+             on DLAA; update Proton (a newer dxvk-nvapi may not hit it); or switch to the \
+             OptiScaler engine (--engine=opti). If it keeps crashing, Remove neural rendering \
+             for this title — it is the signed runtime under Proton, not the tool's setup.",
         )));
     }
     if ctx.mfg_installed {
