@@ -14,6 +14,7 @@ mod ngx;
 mod platform;
 mod renodx;
 mod reshade_ini;
+mod text;
 mod theme;
 mod update;
 
@@ -24,6 +25,20 @@ use std::path::PathBuf;
 /// --check | --diagnose | --engine=opti | --renodx | --mfg | --ignore-anticheat | --mode=feeder|native | --bridge |
 /// --launch-options | --revert-launch-options] | --list-games | --update` runs headless;
 /// no args opens the GUI.
+/// Read by the NVIDIA and AMD drivers from this exe's export table to choose
+/// the discrete GPU for the whole process. Exported by the linker flags in
+/// build.rs; the values themselves are what the drivers read (#32). Windows-only:
+/// on Linux the discrete-GPU choice is a Proton/driver matter, not an exe export.
+#[cfg(windows)]
+#[no_mangle]
+#[used]
+pub static NvOptimusEnablement: u32 = 1;
+
+#[cfg(windows)]
+#[no_mangle]
+#[used]
+pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
+
 fn main() {
     install_panic_handler();
     update::cleanup_old();
@@ -377,7 +392,7 @@ fn cli(
                         diagnose::Level::Warn => "warn",
                         diagnose::Level::Bad => "FAIL",
                     };
-                    println!("[{tag}] {}", f.text);
+                    println!("[{tag}] {}", text::tidy(&f.text));
                 }
                 if findings.iter().any(|f| f.level == diagnose::Level::Bad) {
                     1
@@ -404,7 +419,7 @@ fn cli(
                     st.complete()
                 );
                 for p in &st.problems {
-                    println!("  ! {p}");
+                    println!("  ! {}", text::tidy(p));
                 }
                 let names: Vec<&str> = installer::plan_with(&st, engine, with_renodx, with_mfg)
                     .iter()
@@ -416,7 +431,11 @@ fn cli(
                     && !st.needs_bridge()
                 {
                     println!(
-                        "  ! renderer not provable from the exe: if this game actually renders                          D3D11, re-run with --bridge to include the DX11 bridge"
+                        "  ! {}",
+                        text::tidy(
+                            "renderer not provable from the exe: if this game actually renders \
+                             D3D11, re-run with --bridge to include the DX11 bridge"
+                        )
                     );
                 }
                 if st.re_engine {

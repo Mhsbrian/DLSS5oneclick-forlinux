@@ -221,11 +221,48 @@ fn step_opti(
             parts.join("/")
         };
         let dest = d.join(out_rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        // A refresh must not overwrite the settings file. It carries the user's
+        // choices -- upscaler, frame generation, LoadReshade -- and replacing it
+        // silently turns them all back to auto, which is how a working RenoDX
+        // install stopped loading ReShade after a routine update.
+        if fname.eq_ignore_ascii_case(OPTI_INI) && dest.is_file() {
+            installed.push(out_rel);
+            continue;
+        }
         net::extract_member(&mut zip, &member, &dest)?;
         installed.push(out_rel);
     }
     if !installed.iter().any(|p| p == game::RESHADE_PROXY) {
         bail!("the OptiScaler release had no OptiScaler.dll — layout changed upstream");
+    }
+    // OptiScaler ships DLSS Neural Rendering off, and its overlay toggle lives
+    // only in memory unless the user finds the Save button -- so the whole
+    // point of this install had to be switched back on at every launch.
+    let ini = d.join(OPTI_INI);
+    if let Ok(text) = fs::read_to_string(&ini) {
+        let mut cur = text;
+        if let Some(patched) = set_dlss_nr_enabled(&cur) {
+            cur = patched;
+        }
+        // RE Engine trips its own scheduler assertion unless the compute root
+        // signature is put back, and fights REFramework over WndProc unless
+        // input is polled. The graphics-side restores must stay off there: they
+        // hand dangling descriptors to the NVIDIA driver when the swapchain is
+        // recreated after the intro, which is a crash in nvwgf2umx.dll
+        // (#44, Dragon's Dogma 2).
+        if st.re_engine {
+            for (key, value) in [
+                ("ManualInputPolling", "true"),
+                ("RestoreComputeSignature", "true"),
+                ("RestoreGraphicSignature", "false"),
+                ("ExtendedStateRestore", "false"),
+            ] {
+                if let Some(patched) = set_ini_key(&cur, "Hotfix", key, value) {
+                    cur = patched;
+                }
+            }
+        }
+        fs::write(&ini, cur)?;
     }
     let header = latest
         .as_deref()
@@ -449,6 +486,47 @@ pub fn set_load_reshade(ini: &str) -> Option<String> {
             out.push('\n');
         }
         out.push_str("\n[Plugins]\nLoadReshade=true\n");
+        changed = true;
+    }
+    changed.then_some(out)
+}
+
+/// `[DlssNr] Enabled=true` in OptiScaler.ini; `None` when it already says so.
+/// Section-scoped: `Enabled` appears under half a dozen headings in that file.
+pub fn set_dlss_nr_enabled(ini: &str) -> Option<String> {
+    set_ini_key(ini, "DlssNr", "Enabled", "true")
+}
+
+/// Set `key=value` inside `[section]`, appending the section or the key when
+/// missing; `None` when it already reads that way. Section-scoped because
+/// OptiScaler.ini repeats names like `Enabled` under many headings.
+pub fn set_ini_key(ini: &str, section: &str, key: &str, value: &str) -> Option<String> {
+    let header = format!("[{section}]");
+    let mut out = String::with_capacity(ini.len() + 32);
+    let mut in_section = false;
+    let mut seen = false;
+    let mut changed = false;
+    for line in ini.split_inclusive('\n') {
+        let raw = line.trim_end_matches(['\r', '\n']);
+        let t = raw.trim();
+        if t.starts_with('[') {
+            in_section = t.eq_ignore_ascii_case(&header);
+        } else if in_section && t.split('=').next().unwrap_or("").trim() == key {
+            seen = true;
+            if t.split('=').nth(1).map(str::trim) != Some(value) {
+                out.push_str(&format!("{key}={value}"));
+                out.push_str(&line[raw.len()..]);
+                changed = true;
+                continue;
+            }
+        }
+        out.push_str(line);
+    }
+    if !seen {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&format!("\n{header}\n{key}={value}\n"));
         changed = true;
     }
     changed.then_some(out)
@@ -1202,6 +1280,11 @@ pub fn run_all_with(
     if !st.problems.is_empty() {
         bail!("{}", st.problems.join("\n"));
     }
+    if engine == Engine::ReShade {
+        if let Some(p) = st.reshade_engine_problem() {
+            bail!("{p}");
+        }
+    }
     if engine == Engine::Opti && st.is32() {
         bail!("The OptiScaler engine is 64-bit only; a 32-bit game takes the Feeder path.");
     }
@@ -1669,6 +1752,67 @@ mod tests {
                 "RenoDX HDR mod for this game",
                 "GPU preference"
             ]
+        );
+    }
+
+    #[test]
+    fn set_ini_key_is_section_scoped_and_appends() {
+        // The RE Engine hotfixes go under [Hotfix]; the same key names exist
+        // elsewhere in OptiScaler.ini, so only that section may move (#44).
+        let ini = "[Menu]
+ManualInputPolling=auto
+
+[Hotfix]
+ManualInputPolling=auto
+ExtendedStateRestore=true
+";
+        let out = set_ini_key(ini, "Hotfix", "ManualInputPolling", "true").unwrap();
+        assert_eq!(
+            out,
+            "[Menu]
+ManualInputPolling=auto
+
+[Hotfix]
+ManualInputPolling=true
+ExtendedStateRestore=true
+"
+        );
+        // A value that already reads that way is left alone.
+        assert!(set_ini_key(&out, "Hotfix", "ManualInputPolling", "true").is_none());
+        // Turning one back off is the same operation.
+        let off = set_ini_key(&out, "Hotfix", "ExtendedStateRestore", "false").unwrap();
+        assert!(off.contains("ExtendedStateRestore=false"));
+        // Missing section is appended rather than dropped.
+        let added = set_ini_key(
+            "[Menu]
+X=1
+",
+            "Hotfix",
+            "RestoreComputeSignature",
+            "true",
+        )
+        .unwrap();
+        assert!(added.ends_with(
+            "
+[Hotfix]
+RestoreComputeSignature=true
+"
+        ));
+    }
+
+    #[test]
+    fn dlss_nr_enabled_is_section_scoped() {
+        // "Enabled" also lives under other headings; only DlssNr's may move.
+        let ini = "[OptiFG]\nEnabled=auto\n\n[DlssNr]\n; comment\nEnabled=auto\n";
+        assert_eq!(
+            set_dlss_nr_enabled(ini).unwrap(),
+            "[OptiFG]\nEnabled=auto\n\n[DlssNr]\n; comment\nEnabled=true\n"
+        );
+        assert!(set_dlss_nr_enabled("[DlssNr]\nEnabled=true\n").is_none());
+        // No section at all: append one.
+        assert_eq!(
+            set_dlss_nr_enabled("[OptiFG]\nEnabled=auto\n").unwrap(),
+            "[OptiFG]\nEnabled=auto\n\n[DlssNr]\nEnabled=true\n"
         );
     }
 

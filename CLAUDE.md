@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Fork context
 
-This repo (`Mhsbrian/DLSS5oneclick-forlinux`) is the **Linux port** of `faisalkindi/DLSS5oneclick` (add it as git remote `upstream`; currently merged through upstream 0.10.2), a Rust tool that automates installing the leaked DLSS 5 neural-rendering build into DX11/DX12 games. The port targets Steam/Proton gaming distros: launcher game discovery (Steam/Heroic/Lutris), automatic Steam launch-option handling, Linux GPU/driver detection, Linux self-update, and binary+AppImage releases from this fork. The crate still compiles on Windows — all Linux integration is `cfg(target_os = "linux")`-gated at the data-source edges, with parsers/mergers platform-neutral — so upstream changes merge cleanly. Windows binaries are not released from this fork (Windows users use upstream).
+This repo (`Mhsbrian/DLSS5oneclick-forlinux`) is the **Linux port** of `faisalkindi/DLSS5oneclick` (add it as git remote `upstream`; currently merged through upstream 0.11.15), a Rust tool that automates installing the leaked DLSS 5 neural-rendering build into DX11/DX12 games. The port targets Steam/Proton gaming distros: launcher game discovery (Steam/Heroic/Lutris), automatic Steam launch-option handling, Linux GPU/driver detection, Linux self-update, and binary+AppImage releases from this fork. The crate still compiles on Windows — all Linux integration is `cfg(target_os = "linux")`-gated at the data-source edges, with parsers/mergers platform-neutral — so upstream changes merge cleanly. Windows binaries are not released from this fork (Windows users use upstream).
 
 ## Commands
 
@@ -52,7 +52,8 @@ Upstream modules worth knowing (kept intact for mergeability, given Linux data s
 
 Supporting modules:
 
-- `net.rs` — blocking reqwest. GitHub is queried via the API when `GITHUB_TOKEN` is set, otherwise by scraping the public release HTML pages (avoids the 60/hr unauthenticated API cap). Downloads retry on connection-level failures.
+- `net.rs` — blocking reqwest. GitHub is queried via the API when `GITHUB_TOKEN` is set, otherwise by scraping the public release HTML pages (avoids the 60/hr unauthenticated API cap). Downloads retry on connection-level failures, and a versioned release asset (anything but `/latest/download/`, whose bytes can move) is cached by FNV-hashed URL and reused — on Linux under `~/.cache/dlss5oneclick/downloads` (XDG, like the poster cache), capped at 2 GB oldest-out, so the 165 MB model is fetched once across every game.
+- `text.rs` — `tidy()` collapses the whitespace runs that `cargo fmt` bakes into source-wrapped user-facing strings; every message on its way to a user (CLI `--check` problems, diagnose findings, GUI log) passes through it, text on its way to a log file does not.
 - `reshade_ini.rs` — minimal INI parser/writer that preserves existing user keys and understands ReShade's `,,` comma escape. Ordering matters: `Lumenite_Kernel` must sit above `DLSS5_Feed` in the preset's technique list.
 - `update.rs` — self-update without the API: `releases/latest` answers with a 302 whose Location header carries the tag. Swaps the running binary, keeping `<name>.old` until next start (details in the Linux-layer paragraph above).
 - `diagnose.rs` — reads `ReShade.log` / `dlss5-feed.log` next to the game exe and emits leveled `Finding`s explaining why neural rendering is or isn't running.

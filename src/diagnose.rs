@@ -133,6 +133,22 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
     let d = st.game_dir();
     let mut out = Vec::new();
 
+    // ── a game-shipped HLSL compiler shadowing the system one ──────
+    // The add-on compiles its NR pass at cs_5_1. A d3dcompiler_47.dll that
+    // ships with the game is loaded in preference to System32's, and an old
+    // one does not know that target: "error X3506: unrecognized compiler
+    // target" and no neural rendering, with everything else looking correct.
+    let compiler = d.join("d3dcompiler_47.dll");
+    if compiler.is_file() {
+        let ver = crate::ngx::file_version(&compiler).unwrap_or_else(|| "unknown".into());
+        out.push(warn(format!(
+            "The game ships its own d3dcompiler_47.dll ({ver}), which Windows loads instead of \
+             System32's. If it predates shader model 5.1 the DLSS 5 pass cannot compile \
+             (error X3506). Rename it to d3dcompiler_47.dll.bak and start the game again; \
+             almost every game runs fine on the system copy."
+        )));
+    }
+
     // ── which neural model is installed ────────────────────
     // Two builds of nvngx_dlssnr.dll are in circulation and only the version
     // resource separates them; every failing RTX 50 report so far carries the
@@ -232,6 +248,19 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
         }
     }
 
+    // The compile failure itself, which is unambiguous when it appears.
+    if let Some(line) = rs
+        .lines()
+        .find(|l| l.contains("X3506") || l.contains("unrecognized compiler target"))
+    {
+        out.push(bad(format!(
+            "{} — the HLSL compiler in this process is too old for the DLSS 5 pass. That is \
+             a d3dcompiler_47.dll shipped with the game, loaded in preference to System32's. \
+             Rename it (d3dcompiler_47.dll.bak) and start the game again.",
+            line.trim()
+        )));
+    }
+
     // A game with more than one executable (a Vulkan build and a DX11 build,
     // a launcher and the game) can be installed for one and played through
     // another: ReShade loads, everything looks right, nothing is hooked (#33).
@@ -268,14 +297,34 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
             .lines()
             .find(|l| l.contains("D3D12CreateDevice failed 0x887E0003"))
         {
+            // Where the redist actually is decides what the user can do. Unreal
+            // puts it in a D3D12 subfolder; a Unity player declares the exe's own
+            // folder, so renaming a "D3D12 folder" that was never there changes
+            // nothing and reads as a dead end (dlss5-bridge#24).
+            let where_ = match game::has_agility_redist(d) {
+                Some(p) => {
+                    let ver = crate::ngx::file_version(&p).unwrap_or_else(|| "unknown".into());
+                    format!(
+                        "The copy in force here is {} ({ver}). Rename it and start the game \
+                         again: it falls back to the Windows runtime, which every device in \
+                         the process can match. If the game will not start without it, verify \
+                         the game files instead -- a D3D12Core.dll replaced or truncated by \
+                         another tool gives exactly this error.",
+                        p.display()
+                    )
+                }
+                None => "No D3D12Core.dll is next to the exe or in a D3D12 folder here, so the \
+                         declaration points somewhere else or the file is missing outright. \
+                         Verify the game files."
+                    .into(),
+            };
             out.push(bad(format!(
-                "{} — 0x887E0003 is D3D12_ERROR_INVALID_REDIST: this game ships a DirectX 12 \
-                 Agility SDK (a D3D12\\D3D12Core.dll beside the exe) and every D3D12 device in \
-                 the process must match it, which the bridge's private device cannot. Not \
-                 something this tool sets. Worth trying: rename the game's D3D12 folder so it \
-                 falls back to the Windows runtime, and report the log to \
-                 github.com/NIGos/dlss5-bridge.",
-                line.trim()
+                "{} — 0x887E0003 is D3D12_ERROR_INVALID_REDIST: the executable declares its own \
+                 DirectX 12 Agility SDK (D3D12SDKVersion/D3D12SDKPath exports), and until that \
+                 declaration is satisfied no D3D12 device can be created in this process at \
+                 all -- not the bridge's, not the game's. Not something this tool sets. {}",
+                line.trim(),
+                where_
             )));
         } else if bl.contains("session failed") {
             out.push(bad(

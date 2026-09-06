@@ -148,6 +148,10 @@ pub enum Api {
     Dx10,
     Dx11,
     Dx12,
+    /// Imports `vulkan-1.dll` and no Direct3D. ReShade reaches a Vulkan game
+    /// through a registered Vulkan layer, not through a `dxgi.dll` beside the
+    /// exe, so this install has nothing to load (#6, Detroit: Become Human).
+    Vulkan,
     /// Neither d3d11.dll nor d3d12.dll is a static import (loaded at runtime, or DX9/Vulkan).
     Unknown,
 }
@@ -158,6 +162,7 @@ impl Api {
             Api::Dx10 => "DX10",
             Api::Dx11 => "DX11",
             Api::Dx12 => "DX12",
+            Api::Vulkan => "Vulkan",
             Api::Unknown => "API unknown, assuming DX12",
         }
     }
@@ -246,9 +251,25 @@ pub fn classify_imports(imports: &[String]) -> Api {
         Api::Dx11
     } else if has("d3d10_1.dll") || has("d3d10.dll") {
         Api::Dx10
+    } else if has("vulkan-1.dll") {
+        Api::Vulkan
     } else {
         Api::Unknown
     }
+}
+
+/// True when the game carries its own DirectX 12 Agility SDK runtime.
+/// Unreal puts it in a `D3D12` subfolder; Unity players declare the exe's own
+/// folder, so the file sits directly beside the exe. Both count, and the
+/// second layout is the one that produced a 0x887E0003 nobody could find
+/// (dlss5-bridge#24).
+pub fn has_agility_redist(dir: &Path) -> Option<PathBuf> {
+    [
+        dir.join("D3D12").join("D3D12Core.dll"),
+        dir.join("D3D12Core.dll"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())
 }
 
 pub fn detect_api(exe: &Path) -> Api {
@@ -256,7 +277,7 @@ pub fn detect_api(exe: &Path) -> Api {
     let api = classify(&pe_imports(exe));
     let agility_sdk = exe
         .parent()
-        .is_some_and(|d| d.join("D3D12").join("D3D12Core.dll").is_file());
+        .is_some_and(|d| has_agility_redist(d).is_some());
     if api == Api::Dx12 || (api == Api::Dx11 && agility_sdk) {
         // The DirectX 12 Agility SDK redist ships only with D3D12 renderers;
         // RE Engine exes import d3d11.dll statically and create D3D12 at runtime.
@@ -297,7 +318,7 @@ pub fn detect_api(exe: &Path) -> Api {
         match classify_imports(&pe_imports(&dll)) {
             Api::Dx12 => return Api::Dx12,
             Api::Dx11 => seen_dx11 = true,
-            Api::Dx10 | Api::Unknown => {}
+            Api::Dx10 | Api::Vulkan | Api::Unknown => {}
         }
     }
     if seen_dx11 {
@@ -526,6 +547,22 @@ impl GameStatus {
     pub fn game_dir(&self) -> &Path {
         self.exe.parent().expect("exe has a parent")
     }
+    /// Why the ReShade engine cannot reach this game, when that is the case.
+    /// A Vulkan game has no `dxgi.dll` to hook, so ReShade must be installed as
+    /// a Vulkan layer by its own setup -- but OptiScaler reaches Vulkan games
+    /// perfectly well, so this refuses one engine, not the game (#46,
+    /// Indiana Jones and the Great Circle, which worked until 0.11.8).
+    pub fn reshade_engine_problem(&self) -> Option<String> {
+        (self.api == Api::Vulkan).then(|| {
+            "This is a Vulkan game, so the ReShade engine cannot reach it: ReShade hooks \
+             Vulkan through a registered layer, not through the dxgi.dll installed beside \
+             the exe, and nothing here would ever load. Use the OptiScaler engine, which \
+             does cover Vulkan. To use ReShade anyway, run its own setup, point it at this \
+             exe and choose Vulkan, then follow DLSS5-Feeder's Vulkan instructions."
+                .to_owned()
+        })
+    }
+
     pub fn is32(&self) -> bool {
         self.bitness == 32
     }
@@ -596,8 +633,10 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     // dgVoodoo2, which is exactly how a D3D9 game reaches D3D11 and then the
     // Feeder (verified working on Dead or Alive 5 Last Round, #17).
     if file_ci(d, "d3d9.dll") && !file_ci(d, RESHADE_PROXY) && !is_dgvoodoo(d) {
-        problems
-            .push("A d3d9.dll proxy is present; DirectX 9 games are not supported here.".into());
+        problems.push(
+            "A d3d9.dll proxy is present that is not dgVoodoo2. DirectX 9 itself is not a dead              end -- DLSS 5 needs a D3D11/12 device, and dgVoodoo2 provides one, which is how a              D3D9 game can work here (#17, #37) -- but this tool cannot install behind another              wrapper. Replace it with dgVoodoo 2.87.3 (MS\\x86\\D3D9.dll plus dgVoodoo.conf,              OutputAPI = bestavailable) and run Install again."
+                .into(),
+        );
     }
     let api = detect_api(exe);
     let is32 = bitness == 32;
@@ -711,8 +750,7 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
         }
     };
     push_dir(dir);
-    // One and two levels down (bin/x64, bin/x64_dx12, Game/Binaries/Win64 ...), skipping
-    // engine/content trees that never hold the launch exe.
+    // Subfolders that never hold a launch exe, skipped at every level.
     let skip = |p: &Path| {
         let n = p
             .file_name()
@@ -732,28 +770,26 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
                 | "redistributables"
         ) || n.ends_with("_data")
     };
-    if let Ok(rd1) = fs::read_dir(dir) {
-        for d1 in rd1
+    // Down to four levels, which is where games actually put the launch exe:
+    // bin/x64, Game/Binaries/Win64, and ph_ft/work/bin/x64 (Dying Light: The
+    // Beast, #43). Engine and content trees are skipped at every level.
+    fn walk(d: &Path, depth: u8, skip: &dyn Fn(&Path) -> bool, out: &mut dyn FnMut(&Path)) {
+        if depth == 0 {
+            return;
+        }
+        let Ok(rd) = fs::read_dir(d) else {
+            return;
+        };
+        for sub in rd
             .flatten()
             .map(|e| e.path())
             .filter(|p| p.is_dir() && !skip(p))
         {
-            push_dir(&d1);
-            if let Ok(rd2) = fs::read_dir(&d1) {
-                for d2 in rd2
-                    .flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.is_dir() && !skip(p))
-                {
-                    push_dir(&d2);
-                    let win64 = d2.join("Win64");
-                    if win64.is_dir() {
-                        push_dir(&win64);
-                    }
-                }
-            }
+            out(&sub);
+            walk(&sub, depth - 1, skip, out);
         }
     }
+    walk(dir, 4, &skip, &mut push_dir);
     // The Engine tree is skipped above because it is full of helper exes, but
     // Satisfactory keeps its shipping exe in exactly one place inside it (#29).
     let eng = join_ci(dir, &["Engine", "Binaries", "Win64"]);
@@ -917,6 +953,27 @@ pub mod testutil {
 
 #[cfg(test)]
 mod tests {
+
+    /// Unreal keeps its Agility runtime in a D3D12 subfolder, Unity players put
+    /// it directly beside the exe. Missing the second layout is what made a
+    /// 0x887E0003 look unexplainable (dlss5-bridge#24).
+    #[test]
+    fn agility_redist_found_in_both_layouts() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        assert!(has_agility_redist(d).is_none());
+
+        fs::write(d.join("D3D12Core.dll"), b"x").unwrap();
+        assert_eq!(has_agility_redist(d), Some(d.join("D3D12Core.dll")));
+
+        fs::create_dir(d.join("D3D12")).unwrap();
+        fs::write(d.join("D3D12").join("D3D12Core.dll"), b"x").unwrap();
+        // The subfolder wins when a game somehow carries both.
+        assert_eq!(
+            has_agility_redist(d),
+            Some(d.join("D3D12").join("D3D12Core.dll"))
+        );
+    }
     use super::testutil::*;
     use super::*;
 
@@ -1041,6 +1098,24 @@ mod tests {
         assert!(!is_reshade_image(b"some other dxgi wrapper"));
     }
 
+    /// A Vulkan-only game imports vulkan-1.dll and no Direct3D; the dxgi.dll
+    /// proxy can never load in one, so it has to be named rather than
+    /// reported as "API unknown, assuming DX12" (#6).
+    #[test]
+    fn classify_imports_reads_vulkan() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(classify_imports(&s(&["vulkan-1.dll"])), Api::Vulkan);
+        // A game offering both still takes the Direct3D path.
+        assert_eq!(
+            classify_imports(&s(&["vulkan-1.dll", "d3d12.dll"])),
+            Api::Dx12
+        );
+        assert_eq!(
+            classify_imports(&s(&["vulkan-1.dll", "d3d11.dll"])),
+            Api::Dx11
+        );
+    }
+
     #[test]
     fn classify_imports_reads_d3d10() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
@@ -1134,6 +1209,30 @@ mod tests {
         assert!(!found
             .iter()
             .any(|p| p.to_string_lossy().contains("Redistributables")));
+    }
+
+    #[test]
+    fn find_game_exes_finds_exe_four_levels_down() {
+        // Dying Light: The Beast keeps its exe at ph_ft\work\bin\x64 (#43);
+        // two levels of search reported "no 64-bit game executable found".
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("Dying Light The Beast");
+        let deep = d.join("ph_ft").join("work").join("bin").join("x64");
+        fs::create_dir_all(&deep).unwrap();
+        let exe = deep.join("DyingLightGame_TheBeast_x64_rwdi.exe");
+        make_pe(&exe, PE_X64);
+        assert_eq!(find_game_exes(&d), vec![exe]);
+
+        // Five levels down is still out of reach, and content trees stay skipped.
+        let t2 = tempfile::tempdir().unwrap();
+        let d2 = t2.path().join("Game");
+        let too_deep = d2.join("a").join("b").join("c").join("d").join("e");
+        fs::create_dir_all(&too_deep).unwrap();
+        make_pe(&too_deep.join("Game.exe"), PE_X64);
+        let content = d2.join("Content").join("bin");
+        fs::create_dir_all(&content).unwrap();
+        make_pe(&content.join("Game.exe"), PE_X64);
+        assert!(find_game_exes(&d2).is_empty());
     }
 
     #[test]

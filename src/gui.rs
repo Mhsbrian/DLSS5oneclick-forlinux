@@ -9,6 +9,7 @@ use crate::logo;
 use crate::net;
 use crate::platform;
 use crate::renodx;
+use crate::text;
 use crate::theme::{self as t};
 use crate::update;
 use eframe::egui::{
@@ -382,6 +383,7 @@ impl App {
                     .ok()
                     .map(|st| GameMeta {
                         api: match st.api {
+                            game::Api::Vulkan => "Vulkan",
                             game::Api::Dx10 => "DirectX 10",
                             game::Api::Dx11 => "DirectX 11",
                             game::Api::Dx12 => "DirectX 12",
@@ -525,6 +527,7 @@ impl App {
                 .ok()
                 .map(|st| GameMeta {
                     api: match st.api {
+                        game::Api::Vulkan => "Vulkan",
                         game::Api::Dx10 => "DirectX 10",
                         game::Api::Dx11 => "DirectX 11",
                         game::Api::Dx12 => "DirectX 12",
@@ -608,9 +611,13 @@ impl App {
             Ok(findings) => {
                 for f in findings {
                     let line = match f.level {
-                        diagnose::Level::Ok => LogLine::Ok(format!("ok: {}", f.text)),
-                        diagnose::Level::Warn => LogLine::Plain(format!("warn: {}", f.text)),
-                        diagnose::Level::Bad => LogLine::Fail(format!("FAIL: {}", f.text)),
+                        diagnose::Level::Ok => LogLine::Ok(format!("ok: {}", text::tidy(&f.text))),
+                        diagnose::Level::Warn => {
+                            LogLine::Plain(format!("warn: {}", text::tidy(&f.text)))
+                        }
+                        diagnose::Level::Bad => {
+                            LogLine::Fail(format!("FAIL: {}", text::tidy(&f.text)))
+                        }
                     };
                     self.log.push(line);
                 }
@@ -1756,12 +1763,21 @@ impl eframe::App for App {
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
 
-        let (ok_status, problems, complete) = match &self.status {
+        let (ok_status, mut problems, complete) = match &self.status {
             Some(Ok(s)) => (Some(s.clone()), s.problems.clone(), s.complete()),
             Some(Err(e)) => (None, vec![e.clone()], false),
             None => (None, vec![], false),
         };
 
+        // A Vulkan game blocks the ReShade engine only; OptiScaler reaches it (#46).
+        if self.engine == Engine::ReShade {
+            if let Some(p) = ok_status
+                .as_ref()
+                .and_then(game::GameStatus::reshade_engine_problem)
+            {
+                problems.push(p);
+            }
+        }
         self.pump_library(ui.ctx());
         if self.scanning || self.poster_rx.is_some() {
             ui.ctx()
@@ -2221,7 +2237,11 @@ impl eframe::App for App {
                     });
                 }
                 for p in &problems {
-                    ui.label(RichText::new(p).font(t::plex(12.0)).color(t::DANGER));
+                    ui.label(
+                        RichText::new(text::tidy(p))
+                            .font(t::plex(12.0))
+                            .color(t::DANGER),
+                    );
                 }
                 if let Some(ac) = ok_status.as_ref().and_then(|s| s.anticheat) {
                     let mut on = game::ignore_anticheat();
