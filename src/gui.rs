@@ -43,6 +43,25 @@ enum LogLine {
     Plain(String),
 }
 
+/// One log line for the outcome of the add-on's Proton d3dcompiler step, or
+/// `None` when there was nothing to do.
+#[cfg(target_os = "linux")]
+fn d3dcompiler_log_line(adv: &platform::D3dcompilerAdvice) -> Option<LogLine> {
+    use platform::D3dcompilerAdvice as A;
+    Some(match adv {
+        A::NotApplicable | A::AlreadyPresent => return None,
+        A::Installed { via } => LogLine::Ok(format!(
+            "ok: installed d3dcompiler_47 into the Proton prefix via {via} — the neural pass can compile now"
+        )),
+        A::Failed { cmd, why } => LogLine::Fail(format!(
+            "d3dcompiler_47 not installed ({why}); neural rendering will not compile under Proton until you run: {cmd}"
+        )),
+        A::Manual { cmd } => LogLine::Plain(format!(
+            "The add-on needs Microsoft's d3dcompiler_47 under Proton (Wine's builtin cannot compile its pass). Install it once: {cmd}"
+        )),
+    })
+}
+
 pub struct App {
     exe_text: String,
     status: Option<Result<GameStatus, String>>,
@@ -318,7 +337,7 @@ impl App {
             } else {
                 let p_tx = tx.clone();
                 let s_tx = tx.clone();
-                installer::run_all_with(
+                match installer::run_all_with(
                     &exe,
                     engine,
                     with_renodx,
@@ -334,15 +353,31 @@ impl App {
                         };
                         let _ = s_tx.send(Msg::Log(line));
                     },
-                )
-                .map(|_| {
-                    if engine == Engine::Opti {
-                        "Done. In game: Insert opens the OptiScaler overlay → enable Neural Rendering.".to_owned()
-                    } else {
-                        "Done. In game: Home opens ReShade → Add-ons tab → DLSS 5 Neural Rendering → enable. (Home tab saying \"no effect files\" is normal on games with their own DLSS.)".to_owned()
+                ) {
+                    Ok(_) => {
+                        // Linux: the add-on compiles its NR pass through
+                        // d3dcompiler_47, and Proton's builtin one cannot. Put
+                        // Microsoft's real DLL in the prefix. Runs on this
+                        // worker thread so the minute-long install never freezes
+                        // the UI; progress and outcome go to the log.
+                        #[cfg(target_os = "linux")]
+                        if let Some(d) = exe.parent() {
+                            let d_tx = tx.clone();
+                            let adv = platform::ensure_d3dcompiler(d, engine, &|m| {
+                                let _ = d_tx.send(Msg::Log(LogLine::Step(m.to_owned())));
+                            });
+                            if let Some(line) = d3dcompiler_log_line(&adv) {
+                                let _ = d_tx.send(Msg::Log(line));
+                            }
+                        }
+                        Ok(if engine == Engine::Opti {
+                            "Done. In game: Insert opens the OptiScaler overlay → enable Neural Rendering.".to_owned()
+                        } else {
+                            "Done. In game: Home opens ReShade → Add-ons tab → DLSS 5 Neural Rendering → enable. (Home tab saying \"no effect files\" is normal on games with their own DLSS.)".to_owned()
+                        })
                     }
-                })
-                .map_err(|e| format!("{e:#}"))
+                    Err(e) => Err(format!("{e:#}")),
+                }
             };
             let _ = tx.send(Msg::Finished(out));
         });

@@ -271,6 +271,24 @@ fn resolve_game_arg(arg: &str) -> Result<PathBuf, String> {
     }
 }
 
+/// Report what happened about the add-on's Proton d3dcompiler dependency.
+#[cfg(target_os = "linux")]
+fn print_d3dcompiler_advice(advice: &platform::D3dcompilerAdvice) {
+    use platform::D3dcompilerAdvice as A;
+    match advice {
+        A::NotApplicable | A::AlreadyPresent => {}
+        A::Installed { via } => println!(
+            "Installed Microsoft's d3dcompiler_47 into the Proton prefix via {via} — the neural pass can compile now."
+        ),
+        A::Failed { cmd, why } => println!(
+            "Could not install d3dcompiler_47 automatically ({why}). Neural rendering will not compile under Proton until it is present — run it yourself:\n  {cmd}"
+        ),
+        A::Manual { cmd } => println!(
+            "The DLSS 5 add-on needs Microsoft's d3dcompiler_47 to compile its pass under Proton (Wine's builtin cannot). Install it once for this game:\n  {cmd}"
+        ),
+    }
+}
+
 /// Render a `LaunchAdvice` for the terminal; nonzero when the user still has
 /// to act by hand.
 #[cfg(target_os = "linux")]
@@ -569,6 +587,9 @@ Done. In game: Home opens ReShade -> Add-ons tab -> DLSS 5 Neural Rendering -> e
             #[cfg(target_os = "linux")]
             if let Some(d) = exe.parent() {
                 print_advice(&platform::ensure_launch_options(d, engine, false));
+                print_d3dcompiler_advice(&platform::ensure_d3dcompiler(d, engine, &|m| {
+                    println!("  {m}…");
+                }));
             }
             0
         }

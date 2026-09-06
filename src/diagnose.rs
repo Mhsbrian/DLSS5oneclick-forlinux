@@ -216,7 +216,38 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
             "The log's last F6 state may be OFF — press F6 in game and watch the add-on's panel.",
         ));
     }
-    if rs.contains("inline feature 18 evaluation succeeded") {
+    // A failed evaluate takes priority over an earlier success: a title that
+    // rejects the upscaling evaluate but not the native one logs both, and the
+    // rejection is the one the player is looking at (a black frame).
+    if let Some(line) = rs.lines().find(|l| l.contains("feature 18 evaluate failed")) {
+        // The NR model was created and evaluated, but the runtime rejected the
+        // call. 0xbad00005 is NVSDK_NGX_Result_FAIL_InvalidParameter, and it
+        // shows up on the *upscaling* path under Proton -- vkd3d-proton's D3D12
+        // does not satisfy the signed NR runtime the way the native driver does
+        // -- while native-resolution (DLAA) frames evaluate fine. The rejected
+        // frame comes out black, so DLSS upscaling flickers black on this title.
+        let proton = line.contains("0xbad00005") || line.contains("0xBAD00005");
+        let dlaa_works = rs.contains("inline feature 18 evaluation succeeded");
+        out.push(bad(format!(
+            "{} — neural rendering compiled and ran, but the DLSS 5 runtime rejected the \
+             evaluate.{}{} This is the signed NR runtime under Proton, not the tool's setup.",
+            line.trim(),
+            if proton {
+                " 0xbad00005 is InvalidParameter, and it appears on the upscaling path under \
+                 Proton (vkd3d-proton), leaving that frame black — the flicker you see."
+            } else {
+                ""
+            },
+            if dlaa_works {
+                " Native-resolution frames did evaluate here, so set the game's DLSS to DLAA \
+                 (no upscaling) for working neural rendering, or press F6 to turn it off and \
+                 keep the game's own DLSS."
+            } else {
+                " Set the game's DLSS to DLAA (native resolution, no upscaling), or press F6 to \
+                 turn neural rendering off and keep the game's own DLSS."
+            }
+        )));
+    } else if rs.contains("inline feature 18 evaluation succeeded") {
         out.push(ok(
             "Neural rendering ran: the add-on evaluated the DLSS 5 model on real frames. If the \
              picture still looks unchanged, raise NR Intensity / Local Structure in its panel — \
@@ -257,6 +288,26 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
             "{} — the HLSL compiler in this process is too old for the DLSS 5 pass. That is \
              a d3dcompiler_47.dll shipped with the game, loaded in preference to System32's. \
              Rename it (d3dcompiler_47.dll.bak) and start the game again.",
+            line.trim()
+        )));
+    }
+    // The same failure under Proton wears a different face: the add-on compiles
+    // its NR "proxy encode" pass at runtime through d3dcompiler_47, and Wine's
+    // builtin one (backed by vkd3d-shader's still-incomplete HLSL compiler) does
+    // not implement every intrinsic — "isnan" among them — so the compile aborts
+    // with E5005 and neural rendering never binds, though every other step reads
+    // fine. Microsoft's real d3dcompiler_47 knows the intrinsic; put it in the
+    // game's Proton prefix. (This tool installs it at setup from this version on.)
+    else if let Some(line) = rs
+        .lines()
+        .find(|l| l.contains("proxy encode compilation failed") || l.contains("is not defined"))
+    {
+        out.push(bad(format!(
+            "{} — the add-on's neural-rendering shader could not be compiled by the HLSL \
+             compiler in this process. Under Proton that is Wine's builtin d3dcompiler_47, \
+             which does not implement every intrinsic the pass uses. Install Microsoft's real \
+             one into this game's prefix -- `protontricks <appid> d3dcompiler_47` (or run \
+             Install again, which now does this for you) -- and start the game again.",
             line.trim()
         )));
     }
@@ -799,6 +850,40 @@ mod tests {
         assert!(host_findings(&st, &host_ctx())
             .iter()
             .any(|x| x.level == Level::Ok && x.text.contains("DX11 bridge installed")));
+    }
+
+    /// A title that rejects the upscaling NR evaluate but not the native one
+    /// logs both a success and a failure; the failure (the black frame the
+    /// player sees) must win, and name the DLAA workaround.
+    #[test]
+    fn nr_evaluate_failure_beats_earlier_success_and_names_dlaa() {
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+        let t = tempfile::tempdir().unwrap();
+        let exe = game::testutil::make_pe_with_imports(
+            &t.path().join("game.exe"),
+            &["d3d12.dll"],
+            2_000_000,
+        );
+        fs::write(t.path().join(game::DLSS_DLL), b"x").unwrap(); // native mode
+        fs::write(
+            t.path().join("ReShade.log"),
+            "Initializing crosire's ReShade version '6.8.0'\n\
+             Registered add-on \"DLSS 5 Neural Rendering\"\n\
+             DLSS5 Generic: inline feature 18 evaluation succeeded\n\
+             DLSS5 Generic: feature 18 evaluate failed with 0xbad00005; NR upscaling is blocked\n",
+        )
+        .unwrap();
+        let st = game::inspect(&exe).unwrap();
+        let d = diagnose(&st);
+        // The failure is reported, at Bad, with the 0xbad00005/Proton reason and DLAA advice.
+        let f = d
+            .iter()
+            .find(|x| x.text.contains("evaluate failed"))
+            .expect("failure finding present");
+        assert_eq!(f.level, Level::Bad);
+        assert!(f.text.contains("InvalidParameter") && f.text.contains("DLAA"));
+        // The optimistic "Neural rendering ran" line must not also appear.
+        assert!(!d.iter().any(|x| x.text.contains("Neural rendering ran")));
     }
 
     #[test]

@@ -171,6 +171,176 @@ pub fn ensure_launch_options(
     }
 }
 
+/// What happened (or must happen) about the Microsoft `d3dcompiler_47.dll` the
+/// RenoDX DLSS 5 add-on needs under Proton. The add-on compiles its neural
+/// pass at runtime through `d3dcompiler_47`; Wine's builtin one is backed by
+/// vkd3d-shader's still-incomplete HLSL compiler and does not implement every
+/// intrinsic it uses (`isnan`), so the shader fails to compile and neural
+/// rendering never binds. Microsoft's real DLL knows the intrinsic.
+#[derive(Debug, Clone)]
+pub enum D3dcompilerAdvice {
+    /// Not a Steam/Proton game, or the add-on is not installed: nothing to do.
+    NotApplicable,
+    /// A real (Microsoft) `d3dcompiler_47.dll` is already in the prefix.
+    AlreadyPresent,
+    /// It was just installed into the prefix (by `protontricks`/`winetricks`).
+    Installed { via: String },
+    /// The installer ran but failed; show the reason and the manual command.
+    Failed { cmd: String, why: String },
+    /// No `protontricks`/`winetricks` on `PATH`: show the exact command to run.
+    Manual { cmd: String },
+}
+
+/// Microsoft's redistributable `d3dcompiler_47.dll` is ~4–5 MB; Wine's builtin
+/// is ~0.4 MB. Anything under this (or absent) is the builtin, which is the one
+/// that cannot compile the add-on's pass.
+#[cfg(target_os = "linux")]
+const D3DCOMPILER_REAL_MIN: u64 = 1_000_000;
+
+/// Ensure the game's Proton prefix has Microsoft's `d3dcompiler_47.dll` so the
+/// DLSS 5 add-on's neural pass can compile. Runs `protontricks`/`winetricks`
+/// when one is on `PATH`; otherwise returns the exact command for the user.
+/// Only acts for the ReShade engine (the one that installs the add-on) on a
+/// Steam game under Proton. `progress` is called for the slow install.
+#[cfg(target_os = "linux")]
+pub fn ensure_d3dcompiler(
+    game_dir: &Path,
+    engine: crate::installer::Engine,
+    progress: &dyn Fn(&str),
+) -> D3dcompilerAdvice {
+    use D3dcompilerAdvice as A;
+    // Only the ReShade engine installs the add-on that compiles a runtime pass;
+    // OptiScaler carries its own upscaler and needs no d3dcompiler.
+    if engine != crate::installer::Engine::ReShade
+        || !game_dir.join(crate::game::DLSS5_ADDON).is_file()
+    {
+        return A::NotApplicable;
+    }
+    let Some(entry) = entry_for_path(game_dir) else {
+        return A::NotApplicable;
+    };
+    if entry.launcher != Launcher::Steam {
+        return A::NotApplicable;
+    }
+    // A game not mapped to Proton needs no Wine d3dcompiler at all.
+    if steam::proton_for(&entry.root, &entry.id).is_none() {
+        return A::NotApplicable;
+    }
+    let g = steam::SteamGame {
+        appid: entry.id.clone(),
+        name: entry.name.clone(),
+        dir: entry.dir.clone(),
+        library: entry
+            .dir
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .unwrap_or(&entry.root)
+            .to_path_buf(),
+        root: entry.root.clone(),
+    };
+    let Some(cd) = steam::compatdata(&g) else {
+        return A::NotApplicable;
+    };
+    let sys32 = cd.join("pfx/drive_c/windows/system32/d3dcompiler_47.dll");
+    let real = std::fs::metadata(&sys32)
+        .map(|m| m.len() >= D3DCOMPILER_REAL_MIN)
+        .unwrap_or(false);
+    if real {
+        return A::AlreadyPresent;
+    }
+    let cmd = format!("protontricks {} d3dcompiler_47", entry.id);
+    // protontricks knows the Steam layout and points Wine at the right prefix.
+    if which("protontricks") {
+        progress("Installing d3dcompiler_47 into the Proton prefix (this can take a minute)");
+        match run_winetricks_d3dcompiler(WinetricksKind::Protontricks(&entry.id)) {
+            Ok(()) if std::fs::metadata(&sys32).map(|m| m.len() >= D3DCOMPILER_REAL_MIN).unwrap_or(false) => {
+                A::Installed { via: "protontricks".into() }
+            }
+            Ok(()) => A::Failed {
+                cmd,
+                why: "protontricks finished but the prefix still holds the builtin DLL".into(),
+            },
+            Err(e) => A::Failed { cmd, why: e },
+        }
+    } else if which("winetricks") {
+        progress("Installing d3dcompiler_47 into the Proton prefix (this can take a minute)");
+        let pfx = cd.join("pfx");
+        match run_winetricks_d3dcompiler(WinetricksKind::Winetricks(&pfx)) {
+            Ok(()) if std::fs::metadata(&sys32).map(|m| m.len() >= D3DCOMPILER_REAL_MIN).unwrap_or(false) => {
+                A::Installed { via: "winetricks".into() }
+            }
+            Ok(()) => A::Failed {
+                cmd,
+                why: "winetricks finished but the prefix still holds the builtin DLL".into(),
+            },
+            Err(e) => A::Failed { cmd, why: e },
+        }
+    } else {
+        A::Manual { cmd }
+    }
+}
+
+#[cfg(target_os = "linux")]
+enum WinetricksKind<'a> {
+    Protontricks(&'a str),
+    Winetricks(&'a Path),
+}
+
+/// Run the d3dcompiler_47 verb unattended and return a short error on failure.
+#[cfg(target_os = "linux")]
+fn run_winetricks_d3dcompiler(kind: WinetricksKind) -> Result<(), String> {
+    use std::process::Command;
+    let mut cmd = match kind {
+        WinetricksKind::Protontricks(appid) => {
+            let mut c = Command::new("protontricks");
+            c.arg(appid).arg("-q").arg("d3dcompiler_47");
+            c
+        }
+        WinetricksKind::Winetricks(pfx) => {
+            let mut c = Command::new("winetricks");
+            c.env("WINEPREFIX", pfx).arg("-q").arg("d3dcompiler_47");
+            c
+        }
+    };
+    // Non-interactive: never let the tool block on a prompt.
+    cmd.env("WINETRICKS_GUI", "none");
+    cmd.stdin(std::process::Stdio::null());
+    let out = cmd
+        .output()
+        .map_err(|e| format!("could not run: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let tail = String::from_utf8_lossy(&out.stderr);
+    let tail = tail
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("no output");
+    Err(format!(
+        "exit {}: {tail}",
+        out.status.code().unwrap_or(-1)
+    ))
+}
+
+/// Is a program on `PATH`?
+#[cfg(target_os = "linux")]
+fn which(bin: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|p| p.join(bin).is_file())
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn ensure_d3dcompiler(
+    _game_dir: &Path,
+    _engine: crate::installer::Engine,
+    _progress: &dyn Fn(&str),
+) -> D3dcompilerAdvice {
+    D3dcompilerAdvice::NotApplicable
+}
+
 /// Candidate locations for the NVIDIA driver's Wine NGX DLLs across distros.
 #[cfg(target_os = "linux")]
 const NVNGX_WINE_DIRS: [&str; 4] = [
@@ -308,4 +478,25 @@ pub fn entry_for_path(p: &Path) -> Option<GameEntry> {
         })
         // The deepest matching dir wins (nested library layouts).
         .max_by_key(|e| e.dir.components().count())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn which_finds_real_binaries_and_rejects_fake_ones() {
+        // `sh` is on PATH on every Linux box the tool runs on; a random name is not.
+        assert!(which("sh"));
+        assert!(!which("dlss5oneclick-no-such-binary-42"));
+    }
+
+    #[test]
+    fn ensure_d3dcompiler_is_noop_off_steam() {
+        // A folder that belongs to no launcher (a bare tempdir) with no add-on:
+        // nothing to provision, and nothing is run.
+        let t = tempfile::tempdir().unwrap();
+        let adv = ensure_d3dcompiler(t.path(), crate::installer::Engine::ReShade, &|_| {});
+        assert!(matches!(adv, D3dcompilerAdvice::NotApplicable));
+    }
 }
