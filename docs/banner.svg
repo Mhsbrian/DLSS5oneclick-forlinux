@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 340" width="1280" height="340" role="img" aria-label="DLSS5oneclick for Linux">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d0f13"/>
+      <stop offset="0.55" stop-color="#12151b"/>
+      <stop offset="1" stop-color="#171b22"/>
+    </linearGradient>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#eef0f3"/>
+      <stop offset="1" stop-color="#c2c7d0"/>
+    </linearGradient>
+    <linearGradient id="accentline" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#c4c9d2" stop-opacity="0"/>
+      <stop offset="0.5" stop-color="#c4c9d2" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#c4c9d2" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <style>
+    text { font-family: 'DejaVu Sans','Segoe UI',system-ui,-apple-system,'Helvetica Neue',Arial,sans-serif; }
+    .title  { font-weight: 800; letter-spacing: -0.5px; }
+    .sub    { font-weight: 600; }
+    .tag    { font-weight: 400; }
+    .chip   { font-weight: 600; letter-spacing: 0.3px; }
+  </style>
+
+  <!-- panel -->
+  <rect x="4" y="4" width="1272" height="332" rx="22" fill="url(#bg)" stroke="#262a33" stroke-width="1.5"/>
+  <rect x="4.75" y="4.75" width="1270.5" height="330.5" rx="21.5" fill="none" stroke="#000000" stroke-opacity="0.35" stroke-width="0.5"/>
+  <rect x="40" y="250" width="1200" height="1.5" fill="url(#accentline)"/>
+
+  <!-- mark: rounded tile with a stroke-built 5 ending in a forward chevron -->
+  <g transform="translate(72,86)">
+    <rect x="6" y="6" width="132" height="132" rx="34" fill="url(#tile)"/>
+    <rect x="6" y="6" width="132" height="132" rx="34" fill="none" stroke="#ffffff" stroke-opacity="0.5" stroke-width="1"/>
+    <g fill="none" stroke="#12151a" stroke-width="14.4" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M 96,39 L 48,39 L 48,69 L 79.2,69 A 21 21 0 0 1 79.2,111 L 51,111"/>
+    </g>
+    <path d="M 90,27 L 105,39 L 90,51" fill="none" stroke="#12151a" stroke-width="10.8" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="105" cy="39" r="5.4" fill="#12151a"/>
+  </g>
+
+  <!-- wordmark -->
+  <text x="252" y="150" class="title" font-size="66" fill="#e8e9ec">DLSS<tspan fill="#c4c9d2">5</tspan>oneclick</text>
+  <text x="256" y="196" class="sub" font-size="30" fill="#7d8592">for <tspan fill="#c4c9d2">Linux</tspan> · Steam / Proton</text>
+
+  <!-- tagline -->
+  <text x="254" y="238" class="tag" font-size="21" fill="#9aa1ad">One click — the leaked DLSS 5 neural rendering, into games that never shipped it.</text>
+
+  <!-- chips -->
+  <g class="chip" font-size="15">
+    <g transform="translate(254,270)">
+      <rect x="0" y="0" width="132" height="34" rx="8" fill="#1a1e25" stroke="#2a2f39"/>
+      <text x="66" y="22" text-anchor="middle" fill="#c9cdd4">NVIDIA RTX only</text>
+    </g>
+    <g transform="translate(398,270)">
+      <rect x="0" y="0" width="300" height="34" rx="8" fill="#1a1e25" stroke="#2a2f39"/>
+      <text x="150" y="22" text-anchor="middle" fill="#c9cdd4">OptiScaler · Feeder · Bridge · RTX Remix</text>
+    </g>
+    <g transform="translate(710,270)">
+      <rect x="0" y="0" width="196" height="34" rx="8" fill="#1a1e25" stroke="#2a2f39"/>
+      <text x="98" y="22" text-anchor="middle" fill="#c9cdd4">Launch options set for you</text>
+    </g>
+    <g transform="translate(918,270)">
+      <rect x="0" y="0" width="150" height="34" rx="8" fill="#241d12" stroke="#5a4a22"/>
+      <text x="75" y="22" text-anchor="middle" fill="#f0b45c">experimental</text>
+    </g>
+  </g>
+</svg>

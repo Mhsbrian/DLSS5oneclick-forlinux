@@ -1,4 +1,17 @@
-# DLSS5oneclick for Linux
+<p align="center">
+  <img src="docs/banner.svg" alt="DLSS5oneclick for Linux — one click, the leaked DLSS 5 neural rendering into your Steam/Proton games" width="840">
+</p>
+
+<p align="center">
+  <a href="https://github.com/Mhsbrian/DLSS5oneclick-forlinux/actions"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/Mhsbrian/DLSS5oneclick-forlinux/ci.yml?branch=main&style=flat-square&label=CI&labelColor=15181e&color=8fe39a"></a>
+  <a href="https://github.com/Mhsbrian/DLSS5oneclick-forlinux/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/Mhsbrian/DLSS5oneclick-forlinux?style=flat-square&label=release&labelColor=15181e&color=c4c9d2"></a>
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Linux%20x86__64-15181e?style=flat-square">
+  <img alt="GPU" src="https://img.shields.io/badge/GPU-NVIDIA%20RTX-76b900?style=flat-square&labelColor=15181e">
+  <img alt="Steam / Proton" src="https://img.shields.io/badge/Steam-Proton-1b2838?style=flat-square&labelColor=15181e">
+  <img alt="Built with Rust" src="https://img.shields.io/badge/Rust-2021-c4c9d2?style=flat-square&labelColor=15181e">
+  <img alt="License MIT" src="https://img.shields.io/badge/license-MIT-c4c9d2?style=flat-square&labelColor=15181e">
+  <img alt="DLSS 5: experimental" src="https://img.shields.io/badge/DLSS%205-experimental-f0b45c?style=flat-square&labelColor=15181e">
+</p>
 
 One button that sets up the **leaked DLSS 5 neural-rendering build** in DirectX 11/12 games running under **Steam/Proton** (Heroic and Lutris games work too). This is the Linux port of [faisalkindi/DLSS5oneclick](https://github.com/faisalkindi/DLSS5oneclick) — same installer, plus everything a Linux gaming box actually needs: your Steam library listed in the app, the Proton launch options set for you, Linux GPU/driver checks, and native Linux builds.
 
@@ -14,6 +27,10 @@ chmod +x dlss5oneclick-linux-x86_64
 Works on any x86_64 gaming distro with glibc ≥ 2.35 (Arch/CachyOS/EndeavourOS, Bazzite, Nobara, Fedora, Ubuntu/Mint/Pop!_OS, openSUSE, SteamOS desktop mode). Wayland and X11 both fine; the file picker uses the XDG portal.
 
 > **⚠️ This is a leaked, unofficial feature, and it is genuinely unstable under Proton.** The installer is solid and well-tested; what it installs is a signed neural runtime that can crash the GPU inside Proton's translation layers — most often a few seconds into loading, worst at 4K and with DLSS Frame Generation on. Some game + Proton combinations work beautifully, others fault every launch. **Read [Will it actually work?](#will-it-actually-work-stability-under-proton) before you start**, treat it as an experiment, and lean on `--diagnose`.
+
+<p align="center">
+  <img src="docs/routes.svg" alt="One tool, every route into DLSS 5: OptiScaler, ReShade add-on, DX11 bridge, Feeder DLAA, RTX Remix, Neural Upstream" width="900">
+</p>
 
 ## What the Linux version adds
 
