@@ -23,7 +23,8 @@ use std::io::Write;
 use std::path::PathBuf;
 
 /// `dlss5oneclick <GAME.exe | game folder | game name | appid> [--remove | --remove-all |
-/// --check | --diagnose | --engine=opti | --renodx | --mfg | --upstream | --fg | --imports |
+/// --check | --diagnose | --engine=opti | --renodx | --mfg | --upstream | --fg |
+/// --model-res=25..100 | --imports |
 /// --ignore-anticheat | --mode=feeder|native | --bridge |
 /// --launch-options | --revert-launch-options] | --list-games | --update` runs headless;
 /// no args opens the GUI.
@@ -177,6 +178,10 @@ error: {e:#}"
                 with_mfg: args.iter().any(|a| a == "--mfg"),
                 upstream: args.iter().any(|a| a == "--upstream"),
                 with_fg: args.iter().any(|a| a == "--fg"),
+                model_scale: args
+                    .iter()
+                    .find_map(|a| a.strip_prefix("--model-res="))
+                    .and_then(parse_model_res),
             },
             if args.iter().any(|a| a == "--revert-launch-options") {
                 Some(true)
@@ -391,6 +396,14 @@ struct Choice {
     with_mfg: bool,
     upstream: bool,
     with_fg: bool,
+    model_scale: Option<f32>,
+}
+
+/// `--model-res=N` (N a percent, 25–100) → the `WorkingScale` fraction the
+/// OptiScaler neural model runs at. Out-of-range or unparseable is ignored.
+fn parse_model_res(s: &str) -> Option<f32> {
+    let pct: u32 = s.parse().ok()?;
+    (25..=100).contains(&pct).then(|| pct as f32 / 100.0)
 }
 
 fn cli(
@@ -408,12 +421,14 @@ fn cli(
         with_mfg,
         upstream,
         with_fg,
+        model_scale,
     } = choice;
     let extras = installer::Extras {
         with_renodx,
         with_mfg,
         upstream,
         with_fg,
+        model_scale,
     };
     let (exe, candidates) = match game::resolve_target(&target) {
         Ok(v) => v,
@@ -737,6 +752,16 @@ fn attach_parent_console() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parse_model_res_clamps_to_a_sane_percent() {
+        assert_eq!(super::parse_model_res("75"), Some(0.75));
+        assert_eq!(super::parse_model_res("100"), Some(1.0));
+        assert_eq!(super::parse_model_res("50"), Some(0.5));
+        assert_eq!(super::parse_model_res("10"), None); // too low
+        assert_eq!(super::parse_model_res("150"), None); // too high
+        assert_eq!(super::parse_model_res("x"), None); // not a number
+    }
+
     /// The crash log has to name the version, or a report cannot be matched to
     /// a build (#23, #32).
     #[test]

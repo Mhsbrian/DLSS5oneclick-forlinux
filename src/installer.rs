@@ -560,6 +560,13 @@ fn step_opti_fg(
     )])
 }
 
+/// Set `[DlssNr] WorkingScale` — the fraction of native the neural model runs
+/// at — in an OptiScaler.ini. Two decimals, section-scoped. `None` when it
+/// already reads that way.
+fn scale_ini(ini: &str, scale: f32) -> Option<String> {
+    set_ini_key(ini, "DlssNr", "WorkingScale", &format!("{scale:.2}"))
+}
+
 /// Apply the FSR 3.1 frame-generation keys to an OptiScaler.ini, section-scoped
 /// so no unrelated `Enabled` moves. Returns the patched text and which keys
 /// changed (empty when it already reads that way — the step is then a no-op).
@@ -699,6 +706,10 @@ pub struct Extras {
     pub upstream: bool,
     /// OptiScaler engine: turn on FSR 3.1 frame generation (any RTX card, D3D12).
     pub with_fg: bool,
+    /// OptiScaler engine: the fraction of native the neural model runs at
+    /// (`[DlssNr] WorkingScale`; cost falls with its square). `None` leaves the
+    /// OptiScaler default (1.0, full).
+    pub model_scale: Option<f32>,
 }
 
 pub fn plan_with(st: &GameStatus, engine: Engine, x: Extras) -> Vec<Step> {
@@ -1646,6 +1657,26 @@ pub fn run_all_with(
         }
         st = game::inspect(exe)?;
     }
+    // The model-resolution dial is a value, not a plan step: set it in the ini
+    // OptiScaler wrote, after the steps that create it. Below 1.0 it lowers the
+    // neural pass's frame cost (0.75 ≈ half, 0.5 ≈ a quarter).
+    if engine == Engine::Opti {
+        if let Some(scale) = x.model_scale {
+            let ini = st.game_dir().join(OPTI_INI);
+            if let Ok(text) = fs::read_to_string(&ini) {
+                if let Some(patched) = scale_ini(&text, scale) {
+                    fs::write(&ini, patched)?;
+                    results.push((
+                        "OptiScaler model resolution".to_owned(),
+                        vec![format!(
+                            "model runs at {:.0}% of native ([DlssNr] WorkingScale={scale:.2})",
+                            scale * 100.0
+                        )],
+                    ));
+                }
+            }
+        }
+    }
     Ok(results)
 }
 
@@ -1883,6 +1914,19 @@ mod tests {
         // Running it again changes nothing.
         let (_, again) = fg_ini(&out);
         assert!(again.is_empty());
+    }
+
+    #[test]
+    fn scale_ini_sets_workingscale_section_scoped() {
+        let ini = "[FrameGen]\nWorkingScale=99\n\n[DlssNr]\nEnabled=true\nWorkingScale=auto\n";
+        let out = scale_ini(ini, 0.75).unwrap();
+        // Only DlssNr's WorkingScale moves, not FrameGen's identically-named key.
+        assert!(out.contains("[DlssNr]\nEnabled=true\nWorkingScale=0.75"));
+        assert!(out.contains("[FrameGen]\nWorkingScale=99"));
+        // Idempotent.
+        assert!(scale_ini(&out, 0.75).is_none());
+        // Half formats cleanly.
+        assert!(scale_ini(ini, 0.5).unwrap().contains("WorkingScale=0.50"));
     }
 
     #[test]

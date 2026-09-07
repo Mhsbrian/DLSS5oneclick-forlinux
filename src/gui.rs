@@ -135,6 +135,8 @@ pub struct App {
     upstream_on: bool,
     /// OptiScaler engine: turn on FSR 3.1 frame generation (any RTX card).
     fg_on: bool,
+    /// OptiScaler engine: model resolution as a percent of native (100 = off).
+    opti_scale_pct: u32,
     renodx: RenodxLookup,
     renodx_rx: Option<Receiver<RenodxLookup>>,
     /// Exe the current lookup belongs to, so a refresh does not re-fetch.
@@ -232,6 +234,7 @@ impl App {
             mfg_on: false,
             upstream_on: false,
             fg_on: false,
+            opti_scale_pct: 100,
             renodx: RenodxLookup::Idle,
             renodx_rx: None,
             renodx_for: None,
@@ -308,6 +311,7 @@ impl App {
             self.renodx_on = false;
             self.mfg_on = false;
             self.fg_on = false;
+            self.opti_scale_pct = 100;
             self.start_renodx_lookup();
         }
     }
@@ -348,6 +352,8 @@ impl App {
             with_mfg: self.mfg_on,
             upstream: self.upstream_on,
             with_fg: self.fg_on,
+            model_scale: (self.opti_scale_pct < 100)
+                .then(|| self.opti_scale_pct as f32 / 100.0),
         };
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
         self.rx = Some(rx);
@@ -2677,6 +2683,32 @@ impl eframe::App for App {
                             }
                         });
                     }
+                }
+
+                // ── OptiScaler model resolution (cost dial) ──────────
+                if ok_status.is_some() && self.engine == Engine::Opti {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(
+                            RichText::new("MODEL RESOLUTION")
+                                .font(t::plex_semibold(11.0))
+                                .color(t::TEXT_MUTED),
+                        );
+                        ui.add_enabled(
+                            !self.running,
+                            egui::Slider::new(&mut self.opti_scale_pct, 50..=100).suffix("%"),
+                        )
+                        .on_hover_text(
+                            "How much of the frame the neural model works at ([DlssNr] WorkingScale). The frame keeps full detail; only the model's own work is done small. Cost falls with the square — 75% is about half the cost of 100%, 50% a quarter. 100% leaves it at full.",
+                        );
+                        let note = match self.opti_scale_pct {
+                            100 => "— full (Quality)".to_string(),
+                            75 => "— Balanced (~half the cost)".to_string(),
+                            50 => "— Performance (~a quarter)".to_string(),
+                            p => format!("— ~{:.0}% of full cost", (p as f32 / 100.0).powi(2) * 100.0),
+                        };
+                        ui.label(RichText::new(note).font(t::plex(11.0)).color(t::TEXT_DIM));
+                    });
                 }
 
                 // ── actions ───────────────────────────────────────
