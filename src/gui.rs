@@ -103,6 +103,8 @@ pub struct App {
     /// ReShade engine: run the experimental neural-upstream consumer instead of
     /// the stable RenoDX DLSS 5 add-on.
     upstream_on: bool,
+    /// OptiScaler engine: turn on FSR 3.1 frame generation (any RTX card).
+    fg_on: bool,
     renodx: RenodxLookup,
     renodx_rx: Option<Receiver<RenodxLookup>>,
     /// Exe the current lookup belongs to, so a refresh does not re-fetch.
@@ -198,6 +200,7 @@ impl App {
             renodx_on: false,
             mfg_on: false,
             upstream_on: false,
+            fg_on: false,
             renodx: RenodxLookup::Idle,
             renodx_rx: None,
             renodx_for: None,
@@ -273,6 +276,7 @@ impl App {
             self.renodx_for = self.resolved_exe.clone();
             self.renodx_on = false;
             self.mfg_on = false;
+            self.fg_on = false;
             self.start_renodx_lookup();
         }
     }
@@ -308,9 +312,12 @@ impl App {
         self.finishing_install = remove.is_none();
         self.launch_panel = None;
         let engine = self.engine;
-        let with_renodx = self.renodx_on;
-        let with_mfg = self.mfg_on;
-        let upstream = self.upstream_on;
+        let extras = installer::Extras {
+            with_renodx: self.renodx_on,
+            with_mfg: self.mfg_on,
+            upstream: self.upstream_on,
+            with_fg: self.fg_on,
+        };
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
         self.rx = Some(rx);
         self.running = true;
@@ -345,9 +352,7 @@ impl App {
                 match installer::run_all_with(
                     &exe,
                     engine,
-                    with_renodx,
-                    with_mfg,
-                    upstream,
+                    extras,
                     &move |pct, msg| {
                         let _ = p_tx.send(Msg::Progress(pct, msg.to_owned()));
                     },
@@ -2579,6 +2584,36 @@ impl eframe::App for App {
                             }
                         }
                     });
+                }
+
+                // ── OptiScaler frame generation (FSR 3.1, any card) ──
+                if let Some(s) = &ok_status {
+                    if self.engine == Engine::Opti {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            ui.label(
+                                RichText::new("FRAME GENERATION")
+                                    .font(t::plex_semibold(11.0))
+                                    .color(t::TEXT_MUTED),
+                            );
+                            let dim = |ui: &mut egui::Ui, text: String| {
+                                ui.label(RichText::new(text).font(t::plex(11.0)).color(t::TEXT_DIM));
+                            };
+                            if s.api == game::Api::Dx12 || s.api == game::Api::Unknown {
+                                let cb = egui::Checkbox::new(
+                                    &mut self.fg_on,
+                                    RichText::new("Also turn on FSR 3.1 frame generation (2×, any RTX card)")
+                                        .font(t::plex(12.0))
+                                        .color(t::TEXT_SOFT),
+                                );
+                                ui.add_enabled(!self.running, cb).on_hover_text(
+                                    "OptiScaler ships AMD's FSR 3.1 frame-generation libraries; this turns them on with the upscaler it already runs as the input. One generated frame per rendered one, D3D12 only. Turn the game's own frame generation off. EXPERIMENTAL under Proton. Separate from the RTX 40 MFG unlock above.",
+                                );
+                            } else {
+                                dim(ui, "— needs a Direct3D 12 game".into());
+                            }
+                        });
+                    }
                 }
 
                 // ── actions ───────────────────────────────────────

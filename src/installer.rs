@@ -50,6 +50,10 @@ const STEP_OPTI: Step = Step {
     name: "OptiScaler + DLSS Neural Rendering",
     run: step_opti,
 };
+const STEP_OPTI_FG: Step = Step {
+    name: "OptiScaler frame generation (FSR 3.1)",
+    run: step_opti_fg,
+};
 
 /// Extract the whole OptiScaler_DLSSNR release into the game folder,
 /// writing `OptiScaler.dll` as `dxgi.dll` (the fork's default load name for
@@ -507,6 +511,75 @@ pub fn set_dlss_nr_enabled(ini: &str) -> Option<String> {
     set_ini_key(ini, "DlssNr", "Enabled", "true")
 }
 
+/// The two FSR 3.1 frame-generation libraries OptiScaler bundles. `FGOutput=fsrfg`
+/// needs both beside the DLL (under `OptiScaler/`); a trimmed build without them
+/// cannot frame-generate, so the toggle is a no-op there rather than a wrong ini.
+const FG_LIBS: [&str; 2] = [
+    "amd_fidelityfx_loader_dx12.dll",
+    "amd_fidelityfx_framegeneration_dx12.dll",
+];
+
+/// Turn on OptiScaler's FSR 3.1 frame generation, driven by the upscaler it
+/// already runs — 2× on any RTX card, D3D12 only. Separate from the RTX 40 MFG
+/// unlock (which multiplies a DLSS Frame Generation the game already has). The
+/// keys and values are verified against a real OptiScaler.ini: `[FrameGen]`
+/// Enabled/FGInput=upscaler/FGOutput=fsrfg, and `[OptiFG] HUDFix=true` (the
+/// upscaler input needs Hudfix or the UI ghosts). Experimental under Proton.
+fn step_opti_fg(
+    _client: &Client,
+    st: &GameStatus,
+    _work: &Path,
+    _progress: Progress,
+) -> Result<Vec<String>> {
+    let d = st.game_dir();
+    let ini = d.join(OPTI_INI);
+    let Ok(text) = fs::read_to_string(&ini) else {
+        return Ok(vec![
+            "frame generation skipped (OptiScaler.ini not found)".to_owned(),
+        ]);
+    };
+    let opti_sub = game::join_ci(d, &["OptiScaler"]);
+    let libs_present = FG_LIBS
+        .iter()
+        .all(|l| game::join_ci(&opti_sub, &[l]).is_file());
+    if !libs_present {
+        return Ok(vec![
+            "frame generation not available in this OptiScaler build (FSR 3.1 libraries absent)"
+                .to_owned(),
+        ]);
+    }
+    let (cur, set) = fg_ini(&text);
+    if set.is_empty() {
+        return Ok(vec!["frame generation already on".to_owned()]);
+    }
+    fs::write(&ini, cur)?;
+    Ok(vec![format!(
+        "frame generation on ({}) — turn the game's own frame generation off; \
+         experimental under Proton",
+        set.join(", ")
+    )])
+}
+
+/// Apply the FSR 3.1 frame-generation keys to an OptiScaler.ini, section-scoped
+/// so no unrelated `Enabled` moves. Returns the patched text and which keys
+/// changed (empty when it already reads that way — the step is then a no-op).
+fn fg_ini(ini: &str) -> (String, Vec<String>) {
+    let mut cur = ini.to_string();
+    let mut set = Vec::new();
+    for (section, key, value) in [
+        ("FrameGen", "Enabled", "true"),
+        ("FrameGen", "FGInput", "upscaler"),
+        ("FrameGen", "FGOutput", "fsrfg"),
+        ("OptiFG", "HUDFix", "true"),
+    ] {
+        if let Some(patched) = set_ini_key(&cur, section, key, value) {
+            cur = patched;
+            set.push(format!("[{section}] {key}={value}"));
+        }
+    }
+    (cur, set)
+}
+
 /// Set `key=value` inside `[section]`, appending the section or the key when
 /// missing; `None` when it already reads that way. Section-scoped because
 /// OptiScaler.ini repeats names like `Enabled` under many headings.
@@ -613,26 +686,39 @@ fn step_mfg(
 /// `with_renodx` adds the game's RenoDX HDR mod after the DLSS 5 add-on. On
 /// the OptiScaler engine that needs ReShade too, loaded by OptiScaler as
 /// `ReShade64.dll`. RE Engine games get REFramework first on either engine.
-pub fn plan_with(
-    st: &GameStatus,
-    engine: Engine,
-    with_renodx: bool,
-    with_mfg: bool,
-    upstream: bool,
-) -> Vec<Step> {
+/// The optional extras a caller turns on for an install. Bundled into one value
+/// so the two entry points do not grow a positional bool per feature — a shape
+/// that has already been mismerged once (each `false` looked like every other).
+#[derive(Clone, Copy, Default)]
+pub struct Extras {
+    /// Also install the game's RenoDX HDR mod after the DLSS 5 add-on.
+    pub with_renodx: bool,
+    /// RTX 40 DLSS Multi-Frame-Generation unlock (ReShade routes).
+    pub with_mfg: bool,
+    /// ReShade engine: run the experimental Neural Upstream consumer.
+    pub upstream: bool,
+    /// OptiScaler engine: turn on FSR 3.1 frame generation (any RTX card, D3D12).
+    pub with_fg: bool,
+}
+
+pub fn plan_with(st: &GameStatus, engine: Engine, x: Extras) -> Vec<Step> {
     let mut v = if engine == Engine::Opti {
         // Only games with native DLSS: the NR pass reads the inputs the game
         // hands to DLSS. Callers gate on mode; return the plan regardless so
         // --check can show it.
-        let mut v = vec![STEP_OPTI, STEP_DLSSNR_ONLY];
-        if with_renodx {
+        let mut v = vec![STEP_OPTI];
+        if x.with_fg {
+            v.push(STEP_OPTI_FG); // edits the ini step_opti just wrote
+        }
+        v.push(STEP_DLSSNR_ONLY);
+        if x.with_renodx {
             v.push(STEP_RESHADE_VIA_OPTI);
             v.push(STEP_RENODX);
         }
         v
     } else {
-        let mut v = plan_reshade(st, upstream);
-        if with_renodx {
+        let mut v = plan_reshade(st, x.upstream);
+        if x.with_renodx {
             let at = v.len() - 1; // before ReShade config
             v.insert(at, STEP_RENODX);
         }
@@ -641,7 +727,7 @@ pub fn plan_with(
     if st.re_engine {
         v.insert(0, STEP_REFRAMEWORK);
     }
-    if with_mfg {
+    if x.with_mfg {
         v.push(STEP_MFG);
     }
     v.push(STEP_GPU_PREF);
@@ -1504,9 +1590,7 @@ pub enum StepState {
 pub fn run_all_with(
     exe: &Path,
     engine: Engine,
-    with_renodx: bool,
-    with_mfg: bool,
-    upstream: bool,
+    x: Extras,
     progress: Progress,
     step_cb: &(dyn Fn(usize, usize, &str, StepState, &str) + Sync),
 ) -> Result<Vec<(String, Vec<String>)>> {
@@ -1519,7 +1603,7 @@ pub fn run_all_with(
             bail!("{p}");
         }
     }
-    if upstream && (engine != Engine::ReShade || st.mode != game::Mode::Native) {
+    if x.upstream && (engine != Engine::ReShade || st.mode != game::Mode::Native) {
         bail!(
             "Neural Upstream runs the network on the colour buffer the game hands its own DLSS, so it needs a game with DLSS of its own on the ReShade engine. This game has none - use the stable ReShade add-on."
         );
@@ -1539,7 +1623,7 @@ pub fn run_all_with(
     let work = tempfile::Builder::new()
         .prefix("dlss5oneclick-")
         .tempdir()?;
-    let steps = plan_with(&st, engine, with_renodx, with_mfg, upstream);
+    let steps = plan_with(&st, engine, x);
     let n = steps.len();
     let mut results = Vec::new();
     for (i, step) in steps.iter().enumerate() {
@@ -1784,6 +1868,54 @@ mod tests {
     }
 
     #[test]
+    fn fg_ini_sets_the_framegen_keys_and_is_idempotent() {
+        // A real OptiScaler.ini has these sections with auto values; only the
+        // FrameGen/OptiFG ones must move, never another section's Enabled.
+        let ini = "[FrameGen]\nEnabled=auto\nFGInput=auto\nFGOutput=auto\n\n\
+                   [OptiFG]\nHUDFix=auto\n\n[DlssNr]\nEnabled=true\n";
+        let (out, set) = fg_ini(ini);
+        assert!(out.contains("[FrameGen]"));
+        assert!(out.contains("Enabled=true\nFGInput=upscaler\nFGOutput=fsrfg"));
+        assert!(out.contains("[OptiFG]\nHUDFix=true"));
+        // DlssNr's own Enabled=true is untouched (section-scoped).
+        assert!(out.contains("[DlssNr]\nEnabled=true"));
+        assert_eq!(set.len(), 4);
+        // Running it again changes nothing.
+        let (_, again) = fg_ini(&out);
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn opti_plan_adds_frame_generation_after_optiscaler() {
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe(&t.path().join("game.exe"), game::PE_X64);
+        let mut st = game::inspect(&exe).unwrap();
+        st.mode = game::Mode::Native;
+        st.api = game::Api::Dx12;
+        let names: Vec<&str> = plan_with(
+            &st,
+            Engine::Opti,
+            Extras {
+                with_fg: true,
+                ..Default::default()
+            },
+        )
+        .iter()
+        .map(|s| s.name)
+        .collect();
+        let opti = names.iter().position(|n| *n == STEP_OPTI.name).unwrap();
+        let fg = names.iter().position(|n| *n == STEP_OPTI_FG.name).unwrap();
+        assert!(fg == opti + 1, "FG must run right after OptiScaler: {names:?}");
+        // Off by default.
+        let off: Vec<&str> = plan_with(&st, Engine::Opti, Extras::default())
+            .iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(!off.contains(&STEP_OPTI_FG.name));
+    }
+
+    #[test]
     fn feeder_key_orders_betas_below_the_release() {
         assert!(feeder_key("v0.7.0") < feeder_key("v0.8.0-beta.3"));
         assert!(feeder_key("v0.8.0-beta.3") < feeder_key("v0.8.0"));
@@ -1962,7 +2094,7 @@ mod tests {
         assert!(st.is32());
         assert_eq!(st.mode, game::Mode::Feeder);
         assert!(st.problems.is_empty(), "{:?}", st.problems);
-        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false, false, false)
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, Extras::default())
             .iter()
             .map(|s| s.name)
             .collect();
@@ -2008,7 +2140,7 @@ mod tests {
         assert!(st.re_engine && !st.reframework);
         st.mode = game::Mode::Native;
         st.api = game::Api::Dx12;
-        let names: Vec<&str> = plan_with(&st, Engine::ReShade, true, false, false)
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, Extras { with_renodx: true, ..Default::default() })
             .iter()
             .map(|s| s.name)
             .collect();
@@ -2023,7 +2155,7 @@ mod tests {
                 "GPU preference"
             ]
         );
-        let names: Vec<&str> = plan_with(&st, Engine::Opti, true, false, false)
+        let names: Vec<&str> = plan_with(&st, Engine::Opti, Extras { with_renodx: true, ..Default::default() })
             .iter()
             .map(|s| s.name)
             .collect();
@@ -2207,7 +2339,7 @@ RestoreComputeSignature=true
         let t = tempfile::tempdir().unwrap();
         let exe = make_pe(&t.path().join("game.exe"), game::PE_X64);
         let mut st = game::inspect(&exe).unwrap();
-        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false, false, false)
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, Extras::default())
             .iter()
             .map(|s| s.name)
             .collect();
@@ -2215,7 +2347,7 @@ RestoreComputeSignature=true
         assert_eq!(names[2], "DLSS5-Feeder");
         st.mode = game::Mode::Native;
         st.api = game::Api::Dx12;
-        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false, false, false)
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, Extras::default())
             .iter()
             .map(|s| s.name)
             .collect();
@@ -2229,7 +2361,7 @@ RestoreComputeSignature=true
             ]
         );
         st.api = game::Api::Dx11;
-        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false, false, false)
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, Extras::default())
             .iter()
             .map(|s| s.name)
             .collect();
@@ -2289,11 +2421,11 @@ RestoreComputeSignature=true
         let exe = make_pe(&t.path().join("game.exe"), game::PE_X64);
         let mut st = game::inspect(&exe).unwrap();
         st.mode = game::Mode::Native;
-        let stable: Vec<&str> = plan_with(&st, Engine::ReShade, false, false, false)
+        let stable: Vec<&str> = plan_with(&st, Engine::ReShade, Extras::default())
             .iter()
             .map(|s| s.name)
             .collect();
-        let upstream: Vec<&str> = plan_with(&st, Engine::ReShade, false, false, true)
+        let upstream: Vec<&str> = plan_with(&st, Engine::ReShade, Extras { upstream: true, ..Default::default() })
             .iter()
             .map(|s| s.name)
             .collect();
@@ -2314,9 +2446,10 @@ RestoreComputeSignature=true
         let e = run_all_with(
             &exe,
             Engine::ReShade,
-            false,
-            false,
-            true,
+            Extras {
+                upstream: true,
+                ..Default::default()
+            },
             &|_, _| {},
             &|_, _, _, _, _| {},
         )
@@ -2333,7 +2466,7 @@ RestoreComputeSignature=true
         let t = tempfile::tempdir().unwrap();
         let exe = make_pe(&t.path().join("game.exe"), game::PE_X64);
         let st = game::inspect(&exe).unwrap();
-        let names: Vec<&str> = plan_with(&st, Engine::Opti, false, false, false)
+        let names: Vec<&str> = plan_with(&st, Engine::Opti, Extras::default())
             .iter()
             .map(|s| s.name)
             .collect();
@@ -2349,9 +2482,7 @@ RestoreComputeSignature=true
         let err = run_all_with(
             &exe,
             Engine::Opti,
-            false,
-            false,
-            false,
+            Extras::default(),
             &|_, _| {},
             &|_, _, _, _, _| {},
         )
@@ -2387,9 +2518,7 @@ RestoreComputeSignature=true
         let err = run_all_with(
             &exe,
             Engine::Opti,
-            false,
-            false,
-            false,
+            Extras::default(),
             &|_, _| {},
             &|_, _, _, _, _| {},
         )

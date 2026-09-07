@@ -22,7 +22,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 /// `dlss5oneclick <GAME.exe | game folder | game name | appid> [--remove | --remove-all |
-/// --check | --diagnose | --engine=opti | --renodx | --mfg | --upstream | --imports |
+/// --check | --diagnose | --engine=opti | --renodx | --mfg | --upstream | --fg | --imports |
 /// --ignore-anticheat | --mode=feeder|native | --bridge |
 /// --launch-options | --revert-launch-options] | --list-games | --update` runs headless;
 /// no args opens the GUI.
@@ -175,6 +175,7 @@ error: {e:#}"
                 with_renodx: args.iter().any(|a| a == "--renodx"),
                 with_mfg: args.iter().any(|a| a == "--mfg"),
                 upstream: args.iter().any(|a| a == "--upstream"),
+                with_fg: args.iter().any(|a| a == "--fg"),
             },
             if args.iter().any(|a| a == "--revert-launch-options") {
                 Some(true)
@@ -388,6 +389,7 @@ struct Choice {
     with_renodx: bool,
     with_mfg: bool,
     upstream: bool,
+    with_fg: bool,
 }
 
 fn cli(
@@ -404,7 +406,14 @@ fn cli(
         with_renodx,
         with_mfg,
         upstream,
+        with_fg,
     } = choice;
+    let extras = installer::Extras {
+        with_renodx,
+        with_mfg,
+        upstream,
+        with_fg,
+    };
     let (exe, candidates) = match game::resolve_target(&target) {
         Ok(v) => v,
         Err(e) => {
@@ -481,7 +490,7 @@ fn cli(
                     println!("  ! {}", text::tidy(p));
                 }
                 let names: Vec<&str> =
-                    installer::plan_with(&st, engine, with_renodx, with_mfg, upstream)
+                    installer::plan_with(&st, engine, extras)
                     .iter()
                     .map(|s| s.name)
                     .collect();
@@ -615,7 +624,7 @@ fn cli(
             Error => println!("\n      FAILED: {detail}"),
         }
     };
-    match installer::run_all_with(&exe, engine, with_renodx, with_mfg, upstream, &progress, &step) {
+    match installer::run_all_with(&exe, engine, extras, &progress, &step) {
         Ok(_) => {
             if engine == installer::Engine::Opti {
                 println!(
