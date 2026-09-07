@@ -312,6 +312,11 @@ fn uninstall_opti(d: &Path, removed: &mut Vec<String>) -> Result<()> {
 
 pub const BRIDGE_DOWNLOAD: &str =
     "https://github.com/NIGos/dlss5-bridge/releases/latest/download/dlss5-bridge.addon64";
+/// matiasLombo/neural-upstream: the neural consumer that runs the network at the
+/// game's render resolution instead of at output resolution, replacing the
+/// RenoDX DLSS 5 add-on rather than joining it.
+const UPSTREAM_DOWNLOAD: &str =
+    "https://github.com/matiasLombo/neural-upstream/releases/latest/download/nvngx.dll.addon64";
 pub const RHI_RELEASES: &str =
     "https://api.github.com/repos/RankFTW/rhi-repo/releases?per_page=100";
 pub const RHI_REPO: &str = "RankFTW/rhi-repo";
@@ -350,6 +355,10 @@ const STEP_DLSSNR_ONLY: Step = Step {
 const STEP_BRIDGE: Step = Step {
     name: "DLSS 5 DX11 bridge",
     run: step_bridge,
+};
+const STEP_UPSTREAM: Step = Step {
+    name: "Neural Upstream add-on (experimental)",
+    run: step_upstream,
 };
 const STEP_CONFIG: Step = Step {
     name: "ReShade config",
@@ -603,7 +612,13 @@ fn step_mfg(
 /// `with_renodx` adds the game's RenoDX HDR mod after the DLSS 5 add-on. On
 /// the OptiScaler engine that needs ReShade too, loaded by OptiScaler as
 /// `ReShade64.dll`. RE Engine games get REFramework first on either engine.
-pub fn plan_with(st: &GameStatus, engine: Engine, with_renodx: bool, with_mfg: bool) -> Vec<Step> {
+pub fn plan_with(
+    st: &GameStatus,
+    engine: Engine,
+    with_renodx: bool,
+    with_mfg: bool,
+    upstream: bool,
+) -> Vec<Step> {
     let mut v = if engine == Engine::Opti {
         // Only games with native DLSS: the NR pass reads the inputs the game
         // hands to DLSS. Callers gate on mode; return the plan regardless so
@@ -615,7 +630,7 @@ pub fn plan_with(st: &GameStatus, engine: Engine, with_renodx: bool, with_mfg: b
         }
         v
     } else {
-        let mut v = plan_reshade(st);
+        let mut v = plan_reshade(st, upstream);
         if with_renodx {
             let at = v.len() - 1; // before ReShade config
             v.insert(at, STEP_RENODX);
@@ -632,7 +647,7 @@ pub fn plan_with(st: &GameStatus, engine: Engine, with_renodx: bool, with_mfg: b
     v
 }
 
-fn plan_reshade(st: &GameStatus) -> Vec<Step> {
+fn plan_reshade(st: &GameStatus, upstream: bool) -> Vec<Step> {
     match st.mode {
         game::Mode::Feeder => {
             let mut v = vec![STEP_RESHADE];
@@ -653,7 +668,15 @@ fn plan_reshade(st: &GameStatus) -> Vec<Step> {
             if st.feeder {
                 v.push(STEP_FEEDER_CLEANUP);
             }
-            v.push(STEP_DLSS5);
+            // Neural Upstream is itself the neural consumer: it creates the
+            // DLSSNR feature and needs only the model beside it, so it takes
+            // the RenoDX add-on's place rather than sitting next to it.
+            if upstream {
+                v.push(STEP_UPSTREAM);
+                v.push(STEP_DLSSNR_ONLY);
+            } else {
+                v.push(STEP_DLSS5);
+            }
             if st.needs_bridge() {
                 v.push(STEP_BRIDGE);
             }
@@ -1194,6 +1217,46 @@ fn step_bridge(
     Ok(vec![game::BRIDGE_ADDON.into()])
 }
 
+// ── step 5c: neural-upstream (experimental consumer, native DLSS only) ──
+
+fn step_upstream(
+    client: &Client,
+    st: &GameStatus,
+    _work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    let dest = st.game_dir().join(game::UPSTREAM_ADDON);
+    // Like the bridge, its releases carry no tag in the file name, so an
+    // existing copy is refreshed whenever the published file differs in size.
+    if st.upstream && dest.is_file() {
+        let local = fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+        match net::remote_len(client, UPSTREAM_DOWNLOAD) {
+            Ok(Some(remote)) if remote != local => {
+                progress(0, "neural-upstream changed upstream, refreshing");
+            }
+            Ok(_) => {
+                return Ok(vec![format!("{} already current", game::UPSTREAM_ADDON)]);
+            }
+            Err(_) => {
+                return Ok(vec![format!(
+                    "{} present (could not check for a newer one)",
+                    game::UPSTREAM_ADDON
+                )]);
+            }
+        }
+    } else {
+        progress(0, "Fetching latest neural-upstream");
+    }
+    net::download(
+        client,
+        UPSTREAM_DOWNLOAD,
+        &dest,
+        game::UPSTREAM_ADDON,
+        progress,
+    )?;
+    Ok(vec![game::UPSTREAM_ADDON.into()])
+}
+
 // ── step 6: config ─────────────────────────────────────────────────
 
 fn step_config(_c: &Client, st: &GameStatus, _w: &Path, progress: Progress) -> Result<Vec<String>> {
@@ -1273,6 +1336,7 @@ pub fn run_all_with(
     engine: Engine,
     with_renodx: bool,
     with_mfg: bool,
+    upstream: bool,
     progress: Progress,
     step_cb: &(dyn Fn(usize, usize, &str, StepState, &str) + Sync),
 ) -> Result<Vec<(String, Vec<String>)>> {
@@ -1284,6 +1348,11 @@ pub fn run_all_with(
         if let Some(p) = st.reshade_engine_problem() {
             bail!("{p}");
         }
+    }
+    if upstream && (engine != Engine::ReShade || st.mode != game::Mode::Native) {
+        bail!(
+            "Neural Upstream runs the network on the colour buffer the game hands its own DLSS, so it needs a game with DLSS of its own on the ReShade engine. This game has none - use the stable ReShade add-on."
+        );
     }
     if engine == Engine::Opti && st.is32() {
         bail!("The OptiScaler engine is 64-bit only; a 32-bit game takes the Feeder path.");
@@ -1300,7 +1369,7 @@ pub fn run_all_with(
     let work = tempfile::Builder::new()
         .prefix("dlss5oneclick-")
         .tempdir()?;
-    let steps = plan_with(&st, engine, with_renodx, with_mfg);
+    let steps = plan_with(&st, engine, with_renodx, with_mfg, upstream);
     let n = steps.len();
     let mut results = Vec::new();
     for (i, step) in steps.iter().enumerate() {
@@ -1339,6 +1408,7 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
         game::join_ci(d, &[game::DLSS5_ADDON]),
         game::join_ci(d, &[game::DLSSNR_DLL]),
         game::join_ci(d, &[game::BRIDGE_ADDON]),
+        game::join_ci(d, &[game::UPSTREAM_ADDON]),
         game::join_ci(d, &["dlss5-dx11-bridge.addon64"]),
         game::join_ci(&shaders, &[game::FEEDER_FX]),
         game::join_ci(d, &["reshade-shaders", "Textures", game::LUMENITE_BLUENOISE]),
@@ -1677,7 +1747,7 @@ mod tests {
         assert!(st.is32());
         assert_eq!(st.mode, game::Mode::Feeder);
         assert!(st.problems.is_empty(), "{:?}", st.problems);
-        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false, false)
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false, false, false)
             .iter()
             .map(|s| s.name)
             .collect();
@@ -1723,7 +1793,7 @@ mod tests {
         assert!(st.re_engine && !st.reframework);
         st.mode = game::Mode::Native;
         st.api = game::Api::Dx12;
-        let names: Vec<&str> = plan_with(&st, Engine::ReShade, true, false)
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, true, false, false)
             .iter()
             .map(|s| s.name)
             .collect();
@@ -1738,7 +1808,7 @@ mod tests {
                 "GPU preference"
             ]
         );
-        let names: Vec<&str> = plan_with(&st, Engine::Opti, true, false)
+        let names: Vec<&str> = plan_with(&st, Engine::Opti, true, false, false)
             .iter()
             .map(|s| s.name)
             .collect();
@@ -1922,7 +1992,7 @@ RestoreComputeSignature=true
         let t = tempfile::tempdir().unwrap();
         let exe = make_pe(&t.path().join("game.exe"), game::PE_X64);
         let mut st = game::inspect(&exe).unwrap();
-        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false, false)
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false, false, false)
             .iter()
             .map(|s| s.name)
             .collect();
@@ -1930,7 +2000,7 @@ RestoreComputeSignature=true
         assert_eq!(names[2], "DLSS5-Feeder");
         st.mode = game::Mode::Native;
         st.api = game::Api::Dx12;
-        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false, false)
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false, false, false)
             .iter()
             .map(|s| s.name)
             .collect();
@@ -1944,7 +2014,7 @@ RestoreComputeSignature=true
             ]
         );
         st.api = game::Api::Dx11;
-        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false, false)
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false, false, false)
             .iter()
             .map(|s| s.name)
             .collect();
@@ -1994,13 +2064,61 @@ RestoreComputeSignature=true
         assert!(d.join("dxgi.dll").is_file());
     }
 
+    /// Neural Upstream is the neural consumer itself, so it takes the RenoDX
+    /// add-on's place in the plan rather than being added next to it, and it
+    /// needs the model beside it (#50).
+    #[test]
+    fn upstream_plan_replaces_the_renodx_consumer() {
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe(&t.path().join("game.exe"), game::PE_X64);
+        let mut st = game::inspect(&exe).unwrap();
+        st.mode = game::Mode::Native;
+        let stable: Vec<&str> = plan_with(&st, Engine::ReShade, false, false, false)
+            .iter()
+            .map(|s| s.name)
+            .collect();
+        let upstream: Vec<&str> = plan_with(&st, Engine::ReShade, false, false, true)
+            .iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(stable.contains(&"DLSS 5 add-on + models"));
+        assert!(!stable.contains(&"Neural Upstream add-on (experimental)"));
+        assert!(upstream.contains(&"Neural Upstream add-on (experimental)"));
+        assert!(upstream.contains(&"DLSS 5 model (nvngx_dlssnr.dll)"));
+        assert!(!upstream.contains(&"DLSS 5 add-on + models"));
+    }
+
+    /// It reads the colour buffer the game hands its own DLSS, so a game
+    /// without DLSS cannot feed it: refuse by name instead of installing.
+    #[test]
+    fn upstream_refuses_a_game_with_no_dlss_of_its_own() {
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe(&t.path().join("game.exe"), game::PE_X64);
+        let e = run_all_with(
+            &exe,
+            Engine::ReShade,
+            false,
+            false,
+            true,
+            &|_, _| {},
+            &|_, _, _, _, _| {},
+        )
+        .unwrap_err();
+        assert!(
+            format!("{e:#}").contains("needs a game with DLSS of its own"),
+            "{e:#}"
+        );
+    }
+
     #[test]
     fn opti_plan_and_engine_gate() {
         std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
         let t = tempfile::tempdir().unwrap();
         let exe = make_pe(&t.path().join("game.exe"), game::PE_X64);
         let st = game::inspect(&exe).unwrap();
-        let names: Vec<&str> = plan_with(&st, Engine::Opti, false, false)
+        let names: Vec<&str> = plan_with(&st, Engine::Opti, false, false, false)
             .iter()
             .map(|s| s.name)
             .collect();
@@ -2013,8 +2131,16 @@ RestoreComputeSignature=true
             ]
         );
         // Feeder-mode game + Opti engine is refused before any network
-        let err =
-            run_all_with(&exe, Engine::Opti, false, false, &|_, _| {}, &|_, _, _, _, _| {}).unwrap_err();
+        let err = run_all_with(
+            &exe,
+            Engine::Opti,
+            false,
+            false,
+            false,
+            &|_, _| {},
+            &|_, _, _, _, _| {},
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("own DLSS"));
     }
 
@@ -2043,8 +2169,16 @@ RestoreComputeSignature=true
     fn run_all_refuses_opti_on_32bit_before_network() {
         let t = tempfile::tempdir().unwrap();
         let exe = make_pe(&t.path().join("game.exe"), game::PE_X86);
-        let err =
-            run_all_with(&exe, Engine::Opti, false, false, &|_, _| {}, &|_, _, _, _, _| {}).unwrap_err();
+        let err = run_all_with(
+            &exe,
+            Engine::Opti,
+            false,
+            false,
+            false,
+            &|_, _| {},
+            &|_, _, _, _, _| {},
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("64-bit only"));
     }
 }

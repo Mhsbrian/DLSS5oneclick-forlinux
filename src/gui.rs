@@ -100,6 +100,9 @@ pub struct App {
     renodx_on: bool,
     /// "Also unlock RTX 40 DLSS MFG" checkbox.
     mfg_on: bool,
+    /// ReShade engine: run the experimental neural-upstream consumer instead of
+    /// the stable RenoDX DLSS 5 add-on.
+    upstream_on: bool,
     renodx: RenodxLookup,
     renodx_rx: Option<Receiver<RenodxLookup>>,
     /// Exe the current lookup belongs to, so a refresh does not re-fetch.
@@ -194,6 +197,7 @@ impl App {
             finishing_install: false,
             renodx_on: false,
             mfg_on: false,
+            upstream_on: false,
             renodx: RenodxLookup::Idle,
             renodx_rx: None,
             renodx_for: None,
@@ -306,6 +310,7 @@ impl App {
         let engine = self.engine;
         let with_renodx = self.renodx_on;
         let with_mfg = self.mfg_on;
+        let upstream = self.upstream_on;
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
         self.rx = Some(rx);
         self.running = true;
@@ -342,6 +347,7 @@ impl App {
                     engine,
                     with_renodx,
                     with_mfg,
+                    upstream,
                     &move |pct, msg| {
                         let _ = p_tx.send(Msg::Progress(pct, msg.to_owned()));
                     },
@@ -422,7 +428,8 @@ impl App {
                             game::Api::Dx10 => "DirectX 10",
                             game::Api::Dx11 => "DirectX 11",
                             game::Api::Dx12 => "DirectX 12",
-                            game::Api::Unknown => "DirectX 12?",
+                            game::Api::Dx9 => "DirectX 9",
+                            game::Api::Unknown => "Unknown",
                         },
                         has_dlss: st.mode == game::Mode::Native,
                         addon: st.dlss5_addon || st.opti,
@@ -566,7 +573,8 @@ impl App {
                         game::Api::Dx10 => "DirectX 10",
                         game::Api::Dx11 => "DirectX 11",
                         game::Api::Dx12 => "DirectX 12",
-                        game::Api::Unknown => "DirectX 12?",
+                        game::Api::Dx9 => "DirectX 9",
+                        game::Api::Unknown => "Unknown",
                     },
                     has_dlss: st.mode == game::Mode::Native,
                     addon: st.dlss5_addon || st.opti,
@@ -940,6 +948,13 @@ const TILES_NATIVE: [Tile; 4] = [
     },
 ];
 
+const TILE_UPSTREAM: Tile = Tile {
+    title: "Neural Upstream \u{00b7} experimental",
+    detail: "nvngx.dll.addon64 (matiasLombo) \u{00b7} nvngx_dlssnr.dll",
+    ok: |s| s.upstream && s.dlssnr,
+    optional: false,
+};
+
 const TILE_HOST: Tile = Tile {
     title: "host64 helper (32-bit game)",
     detail: "dlss5-feed-host64.exe + 64-bit ReShade · add-on and models live in host64\\",
@@ -968,8 +983,14 @@ const TILE_REFRAMEWORK: Tile = Tile {
     optional: false,
 };
 
-fn tiles_for(st: Option<&GameStatus>, engine: Engine, renodx_on: bool, mfg_on: bool) -> Vec<&'static Tile> {
-    let mut v = base_tiles(st, engine);
+fn tiles_for(
+    st: Option<&GameStatus>,
+    engine: Engine,
+    renodx_on: bool,
+    mfg_on: bool,
+    upstream_on: bool,
+) -> Vec<&'static Tile> {
+    let mut v = base_tiles(st, engine, upstream_on);
     if st.is_some_and(|s| s.re_engine) {
         v.insert(0, &TILE_REFRAMEWORK);
     }
@@ -985,16 +1006,24 @@ fn tiles_for(st: Option<&GameStatus>, engine: Engine, renodx_on: bool, mfg_on: b
     v
 }
 
-fn base_tiles(st: Option<&GameStatus>, engine: Engine) -> Vec<&'static Tile> {
+fn base_tiles(st: Option<&GameStatus>, engine: Engine, upstream_on: bool) -> Vec<&'static Tile> {
     match st.map(|s| s.mode) {
         Some(game::Mode::Native) if engine == Engine::Opti || st.is_some_and(|s| s.opti) => {
             vec![&TILES_NATIVE[0], &TILE_OPTI, &TILES_NATIVE[2]]
         }
         Some(game::Mode::Native) => {
             let needs_bridge = st.is_some_and(|s| s.needs_bridge());
+            let upstream = upstream_on || st.is_some_and(|s| s.upstream);
             TILES_NATIVE
                 .iter()
                 .filter(|t| t.title != "DX11 bridge" || needs_bridge)
+                .map(|t| {
+                    if upstream && t.title == "DLSS 5 add-on \u{00b7} leaked" {
+                        &TILE_UPSTREAM
+                    } else {
+                        t
+                    }
+                })
                 .collect()
         }
         _ => TILES_FEEDER.iter().collect(),
@@ -1277,7 +1306,7 @@ impl App {
                 }
                 if ui.add(btn("Add a game", false)).clicked() {
                     if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("Executables", &["exe"])
+                        .add_filter("Executables", &["exe", "bin"])
                         .pick_file()
                     {
                         self.add_game(p, ui.ctx());
@@ -2198,7 +2227,7 @@ impl eframe::App for App {
                         }
                     }
                     if ui.add_sized([96.0, 40.0], egui::Button::new("Exe…")).clicked() {
-                        let mut dlg = rfd::FileDialog::new().add_filter("Executables", &["exe"]);
+                        let mut dlg = rfd::FileDialog::new().add_filter("Executables", &["exe", "bin"]);
                         if let Some(d) = &start_dir { dlg = dlg.set_directory(d); }
                         if let Some(p) = dlg.pick_file() {
                             self.exe_text = p.to_string_lossy().into_owned();
@@ -2351,6 +2380,99 @@ impl eframe::App for App {
                         self.engine = Engine::Opti;
                     }
                 }
+                if self.engine == Engine::ReShade {
+                    ui.add_space(6.0);
+                    if !native {
+                        self.upstream_on = false;
+                    }
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(
+                            RichText::new("WHICH NEURAL ADD-ON")
+                                .font(t::plex_semibold(11.0))
+                                .color(t::TEXT_MUTED),
+                        );
+                        ui.label(
+                            RichText::new(if native {
+                                "\u{2014} both run DLSS 5; they differ in where the network runs"
+                            } else {
+                                "\u{2014} only the stable add-on works in a game with no DLSS of its own"
+                            })
+                            .font(t::plex(11.0))
+                            .color(t::TEXT_DIM),
+                        );
+                    });
+                    let gap = 8.0;
+                    let card_h = 74.0;
+                    let row_w = ui.available_width();
+                    let col_w = ((row_w - gap) / 2.0).floor();
+                    let (row_rect, _) =
+                        ui.allocate_exact_size(Vec2::new(row_w, card_h), egui::Sense::hover());
+                    let left = egui::Rect::from_min_size(row_rect.min, Vec2::new(col_w, card_h));
+                    let right = egui::Rect::from_min_size(
+                        egui::pos2(row_rect.left() + col_w + gap, row_rect.top()),
+                        Vec2::new(col_w, card_h),
+                    );
+                    if engine_card(
+                        ui,
+                        left,
+                        !self.upstream_on,
+                        true,
+                        "Stable \u{2014} RenoDX DLSS 5 add-on",
+                        &[
+                            "The proven route. The network runs after the upscaler, at output resolution.",
+                            "In game: Home \u{2192} Add-ons \u{2192} DLSS 5 Neural Rendering.",
+                        ],
+                        "",
+                    ) {
+                        self.upstream_on = false;
+                    }
+                    if engine_card(
+                        ui,
+                        right,
+                        self.upstream_on,
+                        native,
+                        "Experimental \u{2014} Neural Upstream",
+                        &[
+                            "Runs the network before the upscaler, at render resolution, so it costs less.",
+                            "Replaces the add-on on the left. Read the warning below first.",
+                        ],
+                        if native {
+                            ""
+                        } else {
+                            "Needs a game with its own DLSS \u{2014} this one has none."
+                        },
+                    ) {
+                        self.upstream_on = true;
+                    }
+                    if self.upstream_on {
+                        ui.add_space(6.0);
+                        let warn = "EXPERIMENTAL. Using DLSS Frame Generation? Set this add-on to \
+                                    Quality in the ReShade overlay, so the network runs on every \
+                                    frame. At any lower setting it runs on one frame in two or \
+                                    three, the rendered frame interval alternates, and frame \
+                                    generation cannot pace through the swing: stutter and flashes \
+                                    that get worse the higher the multiplier. Its author tested it \
+                                    against GTA V Enhanced and Bright Memory: Infinite only.";
+                        Frame::new()
+                            .fill(Color32::from_rgb(0x2a, 0x22, 0x18))
+                            .stroke(Stroke::new(1.0, Color32::from_rgb(0x7a, 0x5a, 0x22)))
+                            .corner_radius(CornerRadius::same(8))
+                            .inner_margin(Margin {
+                                left: 12,
+                                right: 12,
+                                top: 9,
+                                bottom: 9,
+                            })
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(warn)
+                                        .font(t::plex(11.0))
+                                        .color(Color32::from_rgb(0xe8, 0xc9, 0x8a)),
+                                );
+                            });
+                    }
+                }
                 ui.add_space(2.0);
 
                 // ── component list (status, not controls) ────────
@@ -2363,7 +2485,13 @@ impl eframe::App for App {
                 let tile_h = 44.0;
                 let row_w = ui.available_width();
                 let col_w = ((row_w - gap) / 2.0).floor();
-                let tiles = tiles_for(ok_status.as_ref(), self.engine, self.renodx_on, self.mfg_on);
+                let tiles = tiles_for(
+                    ok_status.as_ref(),
+                    self.engine,
+                    self.renodx_on,
+                    self.mfg_on,
+                    self.upstream_on,
+                );
                 for row in tiles.chunks(2) {
                     let (row_rect, _) =
                         ui.allocate_exact_size(Vec2::new(row_w, tile_h), egui::Sense::hover());

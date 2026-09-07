@@ -23,6 +23,10 @@ pub const DLSS_DLL: &str = "nvngx_dlss.dll";
 pub const LUMENITE_KERNEL_FX: &str = "lumenite_Kernel.fx";
 pub const LUMENITE_BLUENOISE: &str = "lumenite_bluenoise256.png";
 pub const BRIDGE_ADDON: &str = "dlss5-bridge.addon64";
+/// matiasLombo's neural-upstream add-on. The name is not ours to choose: the
+/// NGX snippet gates feature creation on the calling module's path containing
+/// `nvngx.dll`, and under any other name it returns 0xBAD00002 and does nothing.
+pub const UPSTREAM_ADDON: &str = "nvngx.dll.addon64";
 /// Files this tool wrote for an OptiScaler install, one path per line.
 pub const OPTI_MANIFEST: &str = ".dlss5oneclick-optiscaler-manifest";
 /// Sidecar written next to an `nvngx_dlss.dll` this tool placed, so it is never mistaken for the game's own.
@@ -148,6 +152,11 @@ pub enum Api {
     Dx10,
     Dx11,
     Dx12,
+    /// Imports `d3d9.dll` and no newer Direct3D. DLSS needs a D3D11/12 device,
+    /// so these need dgVoodoo2 in front before anything here applies -- and the
+    /// system d3d9.dll is loaded by name, so a local ReShade d3d9.dll is what
+    /// hooks it, never the dxgi.dll this tool installs (#16, Aion).
+    Dx9,
     /// Imports `vulkan-1.dll` and no Direct3D. ReShade reaches a Vulkan game
     /// through a registered Vulkan layer, not through a `dxgi.dll` beside the
     /// exe, so this install has nothing to load (#6, Detroit: Become Human).
@@ -162,6 +171,7 @@ impl Api {
             Api::Dx10 => "DX10",
             Api::Dx11 => "DX11",
             Api::Dx12 => "DX12",
+            Api::Dx9 => "DX9",
             Api::Vulkan => "Vulkan",
             Api::Unknown => "API unknown, assuming DX12",
         }
@@ -169,6 +179,119 @@ impl Api {
 }
 
 /// Lower-cased DLL names from the exe's static import table. Empty on any parse problem.
+/// Every function name the PE imports from `dll` (lowercased).
+///
+/// Needed because importing `d3d9.dll` does not make a game a Direct3D 9 game:
+/// engines from the D3D9 era onward import it for the `D3DPERF_*` debug markers
+/// alone and render with something far newer, which is how RDR2 read as
+/// DirectX 9 (#53). A real D3D9 renderer calls `Direct3DCreate9`.
+pub fn pe_import_fns(exe: &Path, dll: &str) -> Vec<String> {
+    let Ok(data) = fs::read(exe) else {
+        return vec![];
+    };
+    let rd32 = |o: usize| -> Option<u32> {
+        data.get(o..o + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let rd64 = |o: usize| -> Option<u64> {
+        data.get(o..o + 8)
+            .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    };
+    let rd16 =
+        |o: usize| -> Option<u16> { data.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]])) };
+    let cstr = |off: usize| -> String {
+        let end = data[off..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|n| off + n)
+            .unwrap_or(off);
+        String::from_utf8_lossy(&data[off..end]).to_ascii_lowercase()
+    };
+    let parse = || -> Option<Vec<String>> {
+        if data.get(..2)? != b"MZ" {
+            return None;
+        }
+        let pe = rd32(0x3C)? as usize;
+        if data.get(pe..pe + 4)? != b"PE\0\0" {
+            return None;
+        }
+        let coff = pe + 4;
+        let nsec = rd16(coff + 2)? as usize;
+        let opt_size = rd16(coff + 16)? as usize;
+        let opt = coff + 20;
+        let magic = rd16(opt)?;
+        let (dd_off, pe32_plus) = match magic {
+            0x20B => (112, true),
+            0x10B => (96, false),
+            _ => return None,
+        };
+        let import_rva = rd32(opt + dd_off + 8)? as usize;
+        if import_rva == 0 {
+            return Some(vec![]);
+        }
+        let sec = opt + opt_size;
+        let mut sections = Vec::new();
+        for i in 0..nsec {
+            let s = sec + i * 40;
+            sections.push((
+                rd32(s + 12)? as usize,
+                rd32(s + 16)? as usize,
+                rd32(s + 20)? as usize,
+            ));
+        }
+        let to_off = |rva: usize| -> Option<usize> {
+            sections
+                .iter()
+                .find(|(va, size, _)| rva >= *va && rva < va + size)
+                .map(|(va, _, raw)| raw + (rva - va))
+        };
+        let want = dll.to_ascii_lowercase();
+        let mut out = Vec::new();
+        let mut desc = to_off(import_rva)?;
+        for _ in 0..512 {
+            let name_rva = rd32(desc + 12)? as usize;
+            if name_rva == 0 && rd32(desc)? == 0 {
+                break;
+            }
+            let is_ours = to_off(name_rva).map(&cstr).is_some_and(|n| n == want);
+            if is_ours {
+                // OriginalFirstThunk when present, else FirstThunk.
+                let thunk_rva = match rd32(desc)? {
+                    0 => rd32(desc + 16)? as usize,
+                    v => v as usize,
+                };
+                if let Some(mut t) = to_off(thunk_rva) {
+                    for _ in 0..4096 {
+                        let (entry, step) = if pe32_plus {
+                            (rd64(t)?, 8)
+                        } else {
+                            (rd32(t)? as u64, 4)
+                        };
+                        if entry == 0 {
+                            break;
+                        }
+                        let by_ordinal = if pe32_plus {
+                            entry & (1 << 63) != 0
+                        } else {
+                            entry & (1 << 31) != 0
+                        };
+                        if !by_ordinal {
+                            // IMAGE_IMPORT_BY_NAME: 2-byte hint, then the name.
+                            if let Some(off) = to_off(entry as usize & 0x7fff_ffff) {
+                                out.push(cstr(off + 2));
+                            }
+                        }
+                        t += step;
+                    }
+                }
+            }
+            desc += 20;
+        }
+        Some(out)
+    };
+    parse().unwrap_or_default()
+}
+
 pub fn pe_imports(exe: &Path) -> Vec<String> {
     let Ok(data) = fs::read(exe) else {
         return vec![];
@@ -253,6 +376,8 @@ pub fn classify_imports(imports: &[String]) -> Api {
         Api::Dx10
     } else if has("vulkan-1.dll") {
         Api::Vulkan
+    } else if has("d3d9.dll") {
+        Api::Dx9
     } else {
         Api::Unknown
     }
@@ -272,9 +397,45 @@ pub fn has_agility_redist(dir: &Path) -> Option<PathBuf> {
     .find(|p| p.is_file())
 }
 
+/// An import that only a renderer newer than Direct3D 9 would carry.
+///
+/// Direct3D 9 predates DXGI and never uses it, so `dxgi.dll` settles it alone.
+/// Beyond that, upscaler and latency libraries are shipped per graphics API and
+/// name it in the file: FidelityFX FSR2's backends are `..._dx12_x64.dll` and
+/// `..._vk_x64.dll` (AMD ships one per target API), and NVIDIA's Reflex library
+/// for Vulkan is `nvlowlatencyvk.dll`. Red Dead Redemption 2 imports all three
+/// while creating its real device at runtime, and statically imports
+/// `Direct3DCreate9Ex` besides, so neither the marker rule nor DXGI alone
+/// caught it (#53).
+fn implies_newer_than_d3d9(import: &str) -> bool {
+    let stem = import.strip_suffix(".dll").unwrap_or(import);
+    matches!(
+        stem,
+        "dxgi" | "d3d10" | "d3d10_1" | "d3d11" | "d3d12" | "vulkan-1"
+    ) || stem.contains("dx11")
+        || stem.contains("dx12")
+        || stem.contains("vulkan")
+        || stem.ends_with("vk")
+        || stem.contains("_vk_")
+}
+
+/// True when the PE imports `d3d9.dll` for something other than the
+/// `D3DPERF_*` debug markers *and* carries nothing that implies a newer API.
+fn d3d9_is_the_renderer(pe: &Path) -> bool {
+    let imports = pe_imports(pe);
+    if imports.iter().any(|i| implies_newer_than_d3d9(i)) {
+        return false;
+    }
+    let fns = pe_import_fns(pe, "d3d9.dll");
+    fns.is_empty() || fns.iter().any(|f| !f.starts_with("d3dperf_"))
+}
+
 pub fn detect_api(exe: &Path) -> Api {
     use classify_imports as classify;
-    let api = classify(&pe_imports(exe));
+    let mut api = classify(&pe_imports(exe));
+    if api == Api::Dx9 && !d3d9_is_the_renderer(exe) {
+        api = Api::Unknown;
+    }
     let agility_sdk = exe
         .parent()
         .is_some_and(|d| has_agility_redist(d).is_some());
@@ -314,12 +475,20 @@ pub fn detect_api(exe: &Path) -> Api {
         .collect();
     dlls.sort_by_key(|(size, _)| std::cmp::Reverse(*size));
     let mut seen_dx11 = false;
+    let mut seen_dx9 = false;
     for (_, dll) in dlls.into_iter().take(12) {
         match classify_imports(&pe_imports(&dll)) {
             Api::Dx12 => return Api::Dx12,
             Api::Dx11 => seen_dx11 = true,
+            // Aion renders through XRenderD3D9.dll rather than from the exe,
+            // so the renderer DLL is the only place the API shows (#16). The
+            // marker-only case is excluded here too (#53).
+            Api::Dx9 => seen_dx9 |= d3d9_is_the_renderer(&dll),
             Api::Dx10 | Api::Vulkan | Api::Unknown => {}
         }
+    }
+    if seen_dx9 && !seen_dx11 {
+        return Api::Dx9;
     }
     if seen_dx11 {
         Api::Dx11
@@ -486,6 +655,8 @@ pub struct GameStatus {
     /// Capcom RE Engine (needs REFramework before ReShade will run).
     pub re_engine: bool,
     pub reframework: bool,
+    /// matiasLombo's neural-upstream add-on is in the folder.
+    pub upstream: bool,
     /// RenoDX game mod this tool installed, from its manifest.
     pub renodx_mod: Option<String>,
     /// Other RenoDX game mods found in the folder (not ours, not the DLSS 5 add-on).
@@ -591,9 +762,11 @@ impl GameStatus {
                     && (!self.is32() || (self.host_exe && self.host_reshade))
             }
             Mode::Native => {
+                // Either neural consumer counts: the RenoDX add-on, or the
+                // experimental Neural Upstream one that stands in its place.
                 (self.opti && self.dlssnr)
                     || (self.reshade
-                        && self.dlss5_addon
+                        && (self.dlss5_addon || self.upstream)
                         && self.dlssnr
                         && (!self.needs_bridge() || self.bridge))
             }
@@ -638,7 +811,26 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
                 .into(),
         );
     }
-    let api = detect_api(exe);
+    let mut api = detect_api(exe);
+    // dgVoodoo2 is the route this tool tells D3D9 users to take: it presents the
+    // game as D3D11, which is what ReShade and the Feeder then attach to. Once it
+    // is in place the game is a D3D11 game at run time, so refusing it here left
+    // people who had followed the instructions with nowhere to go (Spore, #56).
+    if api == Api::Dx9 && is_dgvoodoo(d) {
+        api = Api::Dx11;
+    }
+    if api == Api::Dx9 {
+        problems.push(
+            "This is a DirectX 9 game. DLSS needs a Direct3D 11 or 12 device, which D3D9 \
+             never creates, so nothing here can attach to it as it stands -- and the game \
+             loads the system d3d9.dll by name, so the dxgi.dll this tool installs is never \
+             even asked for (no ReShade overlay, no ReShade.log). The route that works is \
+             dgVoodoo 2.87.3 first: it turns D3D9 into D3D11, and everything else follows \
+             from there. Put its D3D9.dll from the MS/x86 folder beside the exe with \
+             OutputAPI = bestavailable, confirm the game still starts, then run Install again."
+                .into(),
+        );
+    }
     let is32 = bitness == 32;
     if is32 && api == Api::Dx12 {
         problems.push(
@@ -677,6 +869,7 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         api,
         bridge: file_ci(d, BRIDGE_ADDON) || file_ci(d, "dlss5-dx11-bridge.addon64"),
         opti: file_ci(d, OPTI_MANIFEST),
+        upstream: file_ci(d, UPSTREAM_ADDON),
         gpu,
         exe: exe.to_path_buf(),
         bitness,
@@ -735,15 +928,24 @@ fn norm(s: &str) -> String {
 ///
 /// Looks in the folder itself and in any `*/Binaries/Win64/` (Unreal layout,
 /// where ReShade must sit next to the `-Shipping.exe`, not the root launcher).
-/// Keeps 64-bit PEs only, drops known helpers, then ranks: Unreal shipping
-/// exe > name matches the folder name > larger file.
+/// Prefers 64-bit PEs, drops known helpers, then ranks: Unreal shipping
+/// exe > name matches the folder name > larger file. A folder with no 64-bit
+/// game at all falls back to its 32-bit exes, which the feeder drives through
+/// its host64 helper (Max Payne, #17).
 pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = Vec::new();
     let mut push_dir = |d: &Path| {
         if let Ok(rd) = fs::read_dir(d) {
             for e in rd.flatten() {
                 let p = e.path();
-                if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("exe")) && p.is_file() {
+                // Not every game launcher is named .exe: Aion ships aion.bin,
+                // which is an ordinary PE (#16). Anything that is not really a
+                // PE is dropped by the bitness read further down, so widening
+                // the extension costs nothing.
+                if p.extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("exe") || x.eq_ignore_ascii_case("bin"))
+                    && p.is_file()
+                {
                     found.push(p);
                 }
             }
@@ -800,11 +1002,12 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
     // Import-table scoring reads each exe in full; only pay for it when there
     // is an actual choice to make.
     let contested = found.len() > 1;
-    let mut scored: Vec<(i64, PathBuf)> = found
+    let mut scored: Vec<(u8, i64, PathBuf)> = found
         .into_iter()
         .filter_map(|p| {
             let stem = p.file_stem()?.to_str()?.to_ascii_lowercase();
-            if is_helper_name(&stem) || exe_bitness(&p).ok()? != 64 {
+            let bits = exe_bitness(&p).ok()?;
+            if is_helper_name(&stem) {
                 return None;
             }
             let size = fs::metadata(&p).map(|m| m.len()).unwrap_or(0) as i64;
@@ -830,11 +1033,17 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
                 score += 500_000_000;
             }
             score += size.min(400_000_000);
-            Some((score, p))
+            Some((bits, score, p))
         })
         .collect();
-    scored.sort_by_key(|s| std::cmp::Reverse(s.0));
-    scored.into_iter().map(|(_, p)| p).collect()
+    // A 32-bit exe sitting beside a 64-bit one is a tool, not the game, so
+    // 64-bit wins whenever one exists. Only a folder with nothing 64-bit in it
+    // (Max Payne, #17) falls back to 32-bit.
+    if scored.iter().any(|s| s.0 == 64) {
+        scored.retain(|s| s.0 == 64);
+    }
+    scored.sort_by_key(|s| std::cmp::Reverse(s.1));
+    scored.into_iter().map(|(_, _, p)| p).collect()
 }
 
 /// Accepts either a game exe or a game folder; returns the exe to use plus
@@ -864,7 +1073,7 @@ pub fn resolve_target(input: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
         let c = find_game_exes(input);
         return match c.first() {
             Some(first) => Ok((first.clone(), c)),
-            None => bail!("no 64-bit game executable found in {}", input.display()),
+            None => bail!("no game executable found in {}", input.display()),
         };
     }
     bail!("not found: {}", input.display())
@@ -938,6 +1147,76 @@ pub mod testutil {
             out.resize(pad, 0);
         }
         fs::write(path, out).unwrap();
+        path.to_path_buf()
+    }
+
+    /// A minimal PE32+ with one import descriptor, so the import reader can be
+    /// tested on a file whose contents are known exactly.
+    pub fn make_pe_importing(path: &Path, dll: &str, fns: &[&str]) -> PathBuf {
+        make_pe_importing_many(path, &[(dll, fns)])
+    }
+
+    /// The same, with one descriptor per (DLL, functions) pair.
+    pub fn make_pe_importing_many(path: &Path, dlls: &[(&str, &[&str])]) -> PathBuf {
+        // One section mapped 1:1 (RVA == file offset) keeps the maths trivial.
+        const SEC: usize = 0x400;
+        let mut img = vec![0u8; SEC];
+        img[..2].copy_from_slice(b"MZ");
+        img[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        let pe = 0x80usize;
+        img[pe..pe + 4].copy_from_slice(b"PE\0\0");
+        img[pe + 4..pe + 6].copy_from_slice(&PE_X64.to_le_bytes());
+        img[pe + 6..pe + 8].copy_from_slice(&1u16.to_le_bytes()); // 1 section
+        let opt_size: u16 = 240;
+        img[pe + 20..pe + 22].copy_from_slice(&opt_size.to_le_bytes());
+        let opt = pe + 24;
+        img[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes()); // PE32+
+
+        let mut blob: Vec<u8> = Vec::new();
+        let at = |b: &Vec<u8>| (SEC + b.len()) as u32;
+        // Names and thunks first, one set per DLL; the descriptors follow.
+        let mut parts: Vec<(u32, u32)> = Vec::new(); // (dll name RVA, thunk RVA)
+        for (dll, fns) in dlls {
+            let mut name_rvas = Vec::new();
+            for f in *fns {
+                name_rvas.push(at(&blob));
+                blob.extend_from_slice(&0u16.to_le_bytes());
+                blob.extend_from_slice(f.as_bytes());
+                blob.push(0);
+            }
+            let dll_rva = at(&blob);
+            blob.extend_from_slice(dll.as_bytes());
+            blob.push(0);
+            while !blob.len().is_multiple_of(8) {
+                blob.push(0);
+            }
+            let thunk_rva = at(&blob);
+            for r in &name_rvas {
+                blob.extend_from_slice(&(*r as u64).to_le_bytes());
+            }
+            blob.extend_from_slice(&0u64.to_le_bytes()); // terminator
+            parts.push((dll_rva, thunk_rva));
+        }
+        let desc_rva = at(&blob);
+        for (dll_rva, thunk_rva) in &parts {
+            blob.extend_from_slice(&thunk_rva.to_le_bytes()); // OriginalFirstThunk
+            blob.extend_from_slice(&[0u8; 8]); // TimeDateStamp, ForwarderChain
+            blob.extend_from_slice(&dll_rva.to_le_bytes()); // Name
+            blob.extend_from_slice(&thunk_rva.to_le_bytes()); // FirstThunk
+        }
+        blob.extend_from_slice(&[0u8; 20]); // null descriptor
+
+        // PE32+ data directories start at optional-header offset 112, and the
+        // import table is index 1, so it sits eight bytes further in.
+        img[opt + 120..opt + 124].copy_from_slice(&desc_rva.to_le_bytes());
+        // Section header: VirtualAddress == PointerToRawData == SEC.
+        let sh = opt + opt_size as usize;
+        img[sh + 8..sh + 12].copy_from_slice(&(blob.len() as u32).to_le_bytes()); // VirtualSize
+        img[sh + 12..sh + 16].copy_from_slice(&(SEC as u32).to_le_bytes()); // VirtualAddress
+        img[sh + 16..sh + 20].copy_from_slice(&(blob.len() as u32).to_le_bytes()); // SizeOfRawData
+        img[sh + 20..sh + 24].copy_from_slice(&(SEC as u32).to_le_bytes()); // PointerToRawData
+        img.extend_from_slice(&blob);
+        fs::write(path, &img).unwrap();
         path.to_path_buf()
     }
 
@@ -1063,6 +1342,18 @@ mod tests {
         assert!(!st.problems.iter().any(|p| p.contains("32-bit")));
     }
 
+    /// Max Payne is a 32-bit game and has no 64-bit exe at all; picking the
+    /// folder used to find nothing, so it only worked when the exe was chosen
+    /// by hand (#17). The feeder drives 32-bit games through its host64 helper.
+    #[test]
+    fn find_game_exes_falls_back_to_32bit_when_no_64bit_exists() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("Max Payne");
+        fs::create_dir_all(&d).unwrap();
+        make_pe(&d.join("maxpayne.exe"), PE_X86);
+        assert_eq!(find_game_exes(&d), vec![d.join("maxpayne.exe")]);
+    }
+
     #[test]
     fn find_game_exes_skips_helpers_and_prefers_folder_name() {
         let t = tempfile::tempdir().unwrap();
@@ -1101,6 +1392,73 @@ mod tests {
     /// A Vulkan-only game imports vulkan-1.dll and no Direct3D; the dxgi.dll
     /// proxy can never load in one, so it has to be named rather than
     /// reported as "API unknown, assuming DX12" (#6).
+    /// Red Dead Redemption 2 imports d3d9.dll only for the D3DPERF debug
+    /// markers and renders with something far newer, so v0.11.17's renderer
+    /// scan read it as a DirectX 9 game and refused to install (#53).
+    #[test]
+    fn d3d9_debug_markers_alone_are_not_a_d3d9_game() {
+        let t = tempfile::tempdir().unwrap();
+        let markers = testutil::make_pe_importing(
+            &t.path().join("markers.exe"),
+            "d3d9.dll",
+            &["D3DPERF_BeginEvent", "D3DPERF_EndEvent"],
+        );
+        assert_eq!(
+            pe_import_fns(&markers, "d3d9.dll"),
+            vec!["d3dperf_beginevent", "d3dperf_endevent"]
+        );
+        assert_eq!(pe_imports(&markers), vec!["d3d9.dll"]);
+        assert_eq!(detect_api(&markers), Api::Unknown);
+
+        // A real Direct3D 9 renderer still reads as one.
+        let real = testutil::make_pe_importing(
+            &t.path().join("real.exe"),
+            "d3d9.dll",
+            &["Direct3DCreate9", "D3DPERF_BeginEvent"],
+        );
+        assert_eq!(detect_api(&real), Api::Dx9);
+
+        // Direct3D 9 predates DXGI, so a PE importing both is not a D3D9 game
+        // however it uses d3d9.dll - it creates its real device at runtime.
+        let dxgi = testutil::make_pe_importing_many(
+            &t.path().join("dxgi.exe"),
+            &[
+                ("d3d9.dll", &["Direct3DCreate9"][..]),
+                ("dxgi.dll", &["CreateDXGIFactory1"][..]),
+            ],
+        );
+        assert_eq!(detect_api(&dxgi), Api::Unknown);
+
+        // Red Dead Redemption 2's own import table (#53): a real
+        // Direct3DCreate9Ex import, no dxgi.dll at all, and the FSR2 and Reflex
+        // libraries for D3D12 and Vulkan beside it.
+        let rdr2 = testutil::make_pe_importing_many(
+            &t.path().join("RDR2.exe"),
+            &[
+                ("d3d9.dll", &["Direct3DCreate9Ex"][..]),
+                ("nvlowlatencyvk.dll", &["NvLL_VK_Initialize"][..]),
+                (
+                    "ffx_fsr2_api_dx12_x64.dll",
+                    &["ffxFsr2GetInterfaceDX12"][..],
+                ),
+                ("ffx_fsr2_api_vk_x64.dll", &["ffxFsr2GetInterfaceVK"][..]),
+            ],
+        );
+        assert_eq!(detect_api(&rdr2), Api::Unknown);
+    }
+
+    #[test]
+    fn classify_imports_reads_d3d9() {
+        // Aion imports d3d9.dll (through XRenderD3D9.dll) and nothing newer;
+        // before this it read as "unknown, assume DX12" and the tool installed
+        // a dxgi.dll the game never loads (#16).
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(classify_imports(&s(&["d3d9.dll"])), Api::Dx9);
+        // A game that also uses something newer is not a D3D9 game.
+        assert_eq!(classify_imports(&s(&["d3d9.dll", "d3d11.dll"])), Api::Dx11);
+        assert_eq!(classify_imports(&s(&["d3d9.dll", "d3d12.dll"])), Api::Dx12);
+    }
+
     #[test]
     fn classify_imports_reads_vulkan() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
@@ -1212,6 +1570,25 @@ mod tests {
     }
 
     #[test]
+    fn find_game_exes_accepts_bin_launchers() {
+        // Aion's launcher is aion.bin, an ordinary PE with an unusual
+        // extension; before this it was invisible to the scan (#16).
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("Aion");
+        fs::create_dir_all(&d).unwrap();
+        let exe = d.join("aion.bin");
+        make_pe(&exe, PE_X64);
+        assert_eq!(find_game_exes(&d), vec![exe]);
+
+        // A .bin that is not a PE at all is still ignored.
+        let t2 = tempfile::tempdir().unwrap();
+        let d2 = t2.path().join("Game");
+        fs::create_dir_all(&d2).unwrap();
+        fs::write(d2.join("data.bin"), b"not a PE, just data").unwrap();
+        assert!(find_game_exes(&d2).is_empty());
+    }
+
+    #[test]
     fn find_game_exes_finds_exe_four_levels_down() {
         // Dying Light: The Beast keeps its exe at ph_ft\work\bin\x64 (#43);
         // two levels of search reported "no 64-bit game executable found".
@@ -1286,6 +1663,30 @@ mod tests {
         assert_eq!(detect_api(&exe), Api::Unknown);
     }
 
+    /// A D3D9 game with dgVoodoo2 beside it is a D3D11 game at run time, and
+    /// that is the route the refusal text itself sends people to. Refusing it
+    /// anyway left Spore users stuck after doing exactly as told (#56).
+    #[test]
+    fn dgvoodoo_turns_a_d3d9_game_into_the_d3d11_path() {
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe =
+            testutil::make_pe_importing(&d.join("SporeApp.exe"), "d3d9.dll", &["Direct3DCreate9"]);
+        assert_eq!(detect_api(&exe), Api::Dx9);
+        let st = inspect(&exe).unwrap();
+        assert_eq!(st.api, Api::Dx9);
+        assert!(st.problems.iter().any(|p| p.contains("DirectX 9 game")));
+
+        // dgVoodoo2 in place: no refusal, and the D3D11 path from there on.
+        fs::write(d.join("dgVoodoo.conf"), b"[General]").unwrap();
+        fs::write(d.join("d3d9.dll"), b"MZ...dgVoodoo2 wrapper...").unwrap();
+        let st = inspect(&exe).unwrap();
+        assert_eq!(st.api, Api::Dx11);
+        assert!(!st.problems.iter().any(|p| p.contains("DirectX 9 game")));
+        assert!(!st.problems.iter().any(|p| p.contains("d3d9.dll proxy")));
+    }
+
     #[test]
     fn dgvoodoo_d3d9_is_allowed_other_d3d9_is_not() {
         let t = tempfile::tempdir().unwrap();
@@ -1335,6 +1736,22 @@ mod tests {
         fs::remove_dir_all(d.join("Game")).unwrap();
         fs::write(d.join("Foo_BE.exe"), b"x").unwrap();
         assert_eq!(detect_anticheat(d), Some("BattlEye"));
+    }
+
+    /// Neural Upstream stands in for the RenoDX add-on, so an install that has
+    /// it plus the model is complete without `renodx-dlss5.addon64` (#50).
+    #[test]
+    fn upstream_counts_as_the_neural_consumer() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe(&t.path().join("game.exe"), PE_X64);
+        let mut st = inspect(&exe).unwrap();
+        st.mode = Mode::Native;
+        st.api = Api::Dx12;
+        st.reshade = true;
+        st.dlssnr = true;
+        assert!(!st.complete());
+        st.upstream = true;
+        assert!(st.complete());
     }
 
     #[test]

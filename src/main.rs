@@ -22,7 +22,8 @@ use std::io::Write;
 use std::path::PathBuf;
 
 /// `dlss5oneclick <GAME.exe | game folder | game name | appid> [--remove | --remove-all |
-/// --check | --diagnose | --engine=opti | --renodx | --mfg | --ignore-anticheat | --mode=feeder|native | --bridge |
+/// --check | --diagnose | --engine=opti | --renodx | --mfg | --upstream | --imports |
+/// --ignore-anticheat | --mode=feeder|native | --bridge |
 /// --launch-options | --revert-launch-options] | --list-games | --update` runs headless;
 /// no args opens the GUI.
 /// Read by the NVIDIA and AMD drivers from this exe's export table to choose
@@ -106,6 +107,32 @@ error: {e:#}"
         attach_parent_console();
         std::process::exit(cli_list_games());
     }
+    if args.iter().any(|a| a == "--imports") {
+        attach_parent_console();
+        let Some(first) = args.first().filter(|a| !a.starts_with('-')) else {
+            eprintln!("error: --imports needs a game exe or folder");
+            std::process::exit(1);
+        };
+        match game::resolve_target(&PathBuf::from(first)) {
+            Ok((exe, _)) => {
+                println!("{}", exe.display());
+                println!("  api read as: {}", game::detect_api(&exe).label());
+                let imports = game::pe_imports(&exe);
+                println!("  imports: {}", imports.join(", "));
+                for dll in ["d3d9.dll", "d3d11.dll", "d3d12.dll", "dxgi.dll"] {
+                    let fns = game::pe_import_fns(&exe, dll);
+                    if !fns.is_empty() {
+                        println!("  from {dll}: {}", fns.join(", "));
+                    }
+                }
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
     if args.iter().any(|a| a == "--ignore-anticheat") {
         game::set_ignore_anticheat(true);
     }
@@ -139,13 +166,16 @@ error: {e:#}"
             args.iter().any(|a| a == "--remove-all"),
             args.iter().any(|a| a == "--check"),
             args.iter().any(|a| a == "--diagnose"),
-            if args.iter().any(|a| a == "--engine=opti" || a == "--opti") {
-                installer::Engine::Opti
-            } else {
-                installer::Engine::ReShade
+            Choice {
+                engine: if args.iter().any(|a| a == "--engine=opti" || a == "--opti") {
+                    installer::Engine::Opti
+                } else {
+                    installer::Engine::ReShade
+                },
+                with_renodx: args.iter().any(|a| a == "--renodx"),
+                with_mfg: args.iter().any(|a| a == "--mfg"),
+                upstream: args.iter().any(|a| a == "--upstream"),
             },
-            args.iter().any(|a| a == "--renodx"),
-            args.iter().any(|a| a == "--mfg"),
             if args.iter().any(|a| a == "--revert-launch-options") {
                 Some(true)
             } else if args.iter().any(|a| a == "--launch-options") {
@@ -352,18 +382,29 @@ fn print_advice(advice: &platform::LaunchAdvice) -> i32 {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// What to install, as chosen on the command line.
+struct Choice {
+    engine: installer::Engine,
+    with_renodx: bool,
+    with_mfg: bool,
+    upstream: bool,
+}
+
 fn cli(
     target: PathBuf,
     remove: bool,
     remove_all: bool,
     check: bool,
     diagnose_only: bool,
-    engine: installer::Engine,
-    with_renodx: bool,
-    with_mfg: bool,
+    choice: Choice,
     launch_only: Option<bool>,
 ) -> i32 {
+    let Choice {
+        engine,
+        with_renodx,
+        with_mfg,
+        upstream,
+    } = choice;
     let (exe, candidates) = match game::resolve_target(&target) {
         Ok(v) => v,
         Err(e) => {
@@ -439,7 +480,8 @@ fn cli(
                 for p in &st.problems {
                     println!("  ! {}", text::tidy(p));
                 }
-                let names: Vec<&str> = installer::plan_with(&st, engine, with_renodx, with_mfg)
+                let names: Vec<&str> =
+                    installer::plan_with(&st, engine, with_renodx, with_mfg, upstream)
                     .iter()
                     .map(|s| s.name)
                     .collect();
@@ -573,7 +615,7 @@ fn cli(
             Error => println!("\n      FAILED: {detail}"),
         }
     };
-    match installer::run_all_with(&exe, engine, with_renodx, with_mfg, &progress, &step) {
+    match installer::run_all_with(&exe, engine, with_renodx, with_mfg, upstream, &progress, &step) {
         Ok(_) => {
             if engine == installer::Engine::Opti {
                 println!(
