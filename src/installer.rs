@@ -371,6 +371,10 @@ const REMIX_RUNTIME_ASSETS: [&str; 2] = ["d3d9.dll", "remix_nvngx.dll"];
 const REMIX_MARKER: &str = ".dlss5oneclick-remix";
 /// Suffix for a Remix runtime file we replaced, so a swap can be reverted.
 const REMIX_ORIG: &str = ".dlss5oneclick-orig";
+/// Records every file a downloaded RTX Remix *mod* placed, for exact removal.
+const REMIX_MOD_MANIFEST: &str = ".dlss5oneclick-remix-mod";
+/// Suffix for a game file the mod install replaced, so removal restores it.
+const REMIX_MOD_ORIG: &str = ".dlss5oneclick-remix-orig";
 pub const RHI_RELEASES: &str =
     "https://api.github.com/repos/RankFTW/rhi-repo/releases?per_page=100";
 pub const RHI_REPO: &str = "RankFTW/rhi-repo";
@@ -1594,6 +1598,145 @@ fn step_upstream(
     Ok(vec![game::UPSTREAM_ADDON.into()])
 }
 
+// ── RTX Remix: download a complete mod for a game that has one ──────
+
+/// Fetch and lay in a complete RTX Remix mod (runtime + assets) from its GitHub
+/// release, for a game the catalogue matched. This does not install DLSS 5 —
+/// it makes the game a Remix game; the Remix route then installs the model.
+/// Refuses when a `.trex` runtime is already present, and when the release
+/// carries no complete runtime (source or a bare proxy) — the caller shows the
+/// link instead.
+pub fn install_remix_mod(
+    client: &Client,
+    repo: &str,
+    game_dir: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    if crate::remix::find_runtime(game_dir).is_some() {
+        bail!(
+            "This game already has an RTX Remix runtime (.trex) — remove the existing mod first, \
+             or just install DLSS 5 into it."
+        );
+    }
+    progress(0, "Looking up the RTX Remix mod release");
+    let tag = net::latest_tag(client, repo).map_err(|_| {
+        anyhow!("{repo} publishes no installable release — open its page and add the mod by hand.")
+    })?;
+    let url = net::github_asset_url_html(client, repo, &tag, r#"[^"]+\.zip"#).map_err(|_| {
+        anyhow!("{repo} {tag} has no downloadable .zip — open its page and add the mod by hand.")
+    })?;
+    let work = tempfile::Builder::new()
+        .prefix("dlss5oneclick-remix-")
+        .tempdir()?;
+    let zip_path = work.path().join("remix-mod.zip");
+    net::download(client, &url, &zip_path, "RTX Remix mod", progress)?;
+    progress(50, "Extracting the RTX Remix mod");
+    place_remix_mod(&zip_path, game_dir, &format!("{repo} {tag}"))
+}
+
+/// Extract a complete Remix mod's runtime subtree from `zip_path` into
+/// `game_dir` (backing up any game file it replaces) and record a manifest.
+/// Split out from the download so the extraction is testable on a fixture zip.
+fn place_remix_mod(zip_path: &Path, game_dir: &Path, header: &str) -> Result<Vec<String>> {
+    let f = fs::File::open(zip_path)?;
+    let mut zip = zip::ZipArchive::new(f).context("the RTX Remix mod download is not a valid zip")?;
+    let members: Vec<String> = zip.file_names().map(str::to_owned).collect();
+    let root = crate::remix::mod_root(&members).ok_or_else(|| {
+        anyhow!(
+            "This release carries no complete Remix runtime (a `.trex` folder) — it is source or a \
+             proxy that needs manual steps. Open the mod's page for the full download."
+        )
+    })?;
+    let mut written: Vec<String> = Vec::new();
+    for member in &members {
+        let norm = member.replace('\\', "/");
+        if norm.ends_with('/') {
+            continue; // directory entry
+        }
+        let Some(rel) = crate::remix::strip_root(&norm, &root) else {
+            continue;
+        };
+        let parts: Vec<&str> = rel
+            .split('/')
+            .filter(|p| !p.is_empty() && *p != "." && *p != "..")
+            .collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let dest = parts
+            .iter()
+            .fold(game_dir.to_path_buf(), |acc, p| acc.join(p));
+        // Keep any game file we are about to overwrite, so removal restores it.
+        if dest.is_file() {
+            let bak = dest.with_file_name(format!(
+                "{}{REMIX_MOD_ORIG}",
+                dest.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            if !bak.exists() {
+                let _ = fs::rename(&dest, &bak);
+            }
+        }
+        net::extract_member(&mut zip, member, &dest)?;
+        written.push(parts.join("/"));
+    }
+    if crate::remix::find_runtime(game_dir).is_none() {
+        bail!("Extracted the mod but no .trex runtime landed — the archive layout is unexpected.");
+    }
+    fs::write(
+        game_dir.join(REMIX_MOD_MANIFEST),
+        format!("# {header}\n{}\n", written.join("\n")),
+    )?;
+    Ok(vec![format!(
+        "RTX Remix mod installed ({header}, {} files). Now Install DLSS 5 to add neural rendering.",
+        written.len()
+    )])
+}
+
+/// Remove a downloaded RTX Remix mod: delete every file it placed, restore the
+/// game files it replaced, and drop the now-empty folders. The base game is
+/// left as it was before the mod.
+pub fn uninstall_remix_mod(game_dir: &Path) -> Result<Vec<String>> {
+    let manifest = game_dir.join(REMIX_MOD_MANIFEST);
+    let list = fs::read_to_string(&manifest)
+        .map_err(|_| anyhow!("no downloaded RTX Remix mod is recorded in this folder."))?;
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut count = 0usize;
+    for rel in list
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+    {
+        let parts: Vec<&str> = rel
+            .split('/')
+            .filter(|p| !p.is_empty() && *p != "." && *p != "..")
+            .collect();
+        let p = parts
+            .iter()
+            .fold(game_dir.to_path_buf(), |acc, x| acc.join(x));
+        if p.is_file() {
+            fs::remove_file(&p)?;
+            count += 1;
+        }
+        let bak = p.with_file_name(format!(
+            "{}{REMIX_MOD_ORIG}",
+            p.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        if bak.is_file() {
+            let _ = fs::rename(&bak, &p);
+        }
+        if let Some(parent) = p.parent() {
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    // Deepest folders first, so a directory empties before its parent is tried.
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+    dirs.dedup();
+    for d in dirs {
+        let _ = fs::remove_dir(&d); // only succeeds when empty
+    }
+    let _ = fs::remove_file(&manifest);
+    Ok(vec![format!("RTX Remix mod removed ({count} files)")])
+}
+
 // ── RTX Remix: model into .trex + one rtx.conf line ─────────────────
 
 fn step_remix(
@@ -2123,6 +2266,52 @@ mod tests {
             .map(|s| s.name)
             .collect();
         assert!(!off.contains(&STEP_OPTI_FG.name));
+    }
+
+    #[test]
+    fn remix_mod_extract_and_remove_round_trip() {
+        let t = tempfile::tempdir().unwrap();
+        let game = t.path().join("game");
+        std::fs::create_dir_all(&game).unwrap();
+        // A game file the mod will replace, so backup/restore is exercised.
+        std::fs::write(game.join("d3d9.dll"), b"vanilla proxy").unwrap();
+
+        // Build a fixture mod zip: the runtime sits one folder down.
+        let zip_path = t.path().join("mod.zip");
+        {
+            let f = std::fs::File::create(&zip_path).unwrap();
+            let mut w = zip::ZipWriter::new(f);
+            let opt = SimpleFileOptions::default();
+            for (name, body) in [
+                ("GTAIV-Remix/.trex/d3d9.dll", &b"remix runtime"[..]),
+                ("GTAIV-Remix/.trex/rtx-remix.conf", b"conf"),
+                ("GTAIV-Remix/rtx.conf", b"rtx.a = 1"),
+                ("GTAIV-Remix/d3d9.dll", b"mod proxy"), // replaces the vanilla one
+            ] {
+                w.start_file(name, opt).unwrap();
+                w.write_all(body).unwrap();
+            }
+            w.finish().unwrap();
+        }
+
+        let placed = place_remix_mod(&zip_path, &game, "xoxor4d/gta4-rtx v1.5.2").unwrap();
+        assert!(placed[0].contains("4 files"));
+        // The runtime landed and the game is now a Remix game.
+        assert!(game.join(".trex").join("d3d9.dll").is_file());
+        assert!(crate::remix::find_runtime(&game).is_some());
+        // The vanilla file was backed up, the mod's copy is in place.
+        assert_eq!(std::fs::read(game.join("d3d9.dll")).unwrap(), b"mod proxy");
+        assert!(game
+            .join(format!("d3d9.dll{REMIX_MOD_ORIG}"))
+            .is_file());
+        assert!(game.join(REMIX_MOD_MANIFEST).is_file());
+
+        // Remove: files gone, the vanilla proxy restored, folders cleaned.
+        uninstall_remix_mod(&game).unwrap();
+        assert!(!game.join(".trex").exists());
+        assert_eq!(std::fs::read(game.join("d3d9.dll")).unwrap(), b"vanilla proxy");
+        assert!(!game.join(format!("d3d9.dll{REMIX_MOD_ORIG}")).exists());
+        assert!(!game.join(REMIX_MOD_MANIFEST).exists());
     }
 
     #[test]

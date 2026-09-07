@@ -22,13 +22,13 @@ mod theme;
 mod update;
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// `dlss5oneclick <GAME.exe | game folder | game name | appid> [--remove | --remove-all |
 /// --check | --diagnose | --engine=opti | --renodx | --mfg | --upstream | --fg |
-/// --model-res=25..100 | --remix-swap | --imports |
+/// --model-res=25..100 | --remix-swap | --install-remix-mod | --remove-remix-mod | --imports |
 /// --ignore-anticheat | --mode=feeder|native | --bridge |
-/// --launch-options | --revert-launch-options] | --list-games | --update` runs headless;
+/// --launch-options | --revert-launch-options] | --list-games | --remix-list | --update` runs headless;
 /// no args opens the GUI.
 /// Read by the NVIDIA and AMD drivers from this exe's export table to choose
 /// the discrete GPU for the whole process. Exported by the linker flags in
@@ -111,6 +111,10 @@ error: {e:#}"
         attach_parent_console();
         std::process::exit(cli_list_games());
     }
+    if args.iter().any(|a| a == "--remix-list") {
+        attach_parent_console();
+        std::process::exit(cli_remix_list());
+    }
     if args.iter().any(|a| a == "--imports") {
         attach_parent_console();
         let Some(first) = args.first().filter(|a| !a.starts_with('-')) else {
@@ -164,6 +168,12 @@ error: {e:#}"
                 }
             }
         };
+        if args.iter().any(|a| a == "--install-remix-mod") {
+            std::process::exit(cli_remix_mod(&target, false));
+        }
+        if args.iter().any(|a| a == "--remove-remix-mod") {
+            std::process::exit(cli_remix_mod(&target, true));
+        }
         let code = cli(
             target,
             args.iter().any(|a| a == "--remove"),
@@ -278,6 +288,102 @@ fn cli_list_games() -> i32 {
         );
     }
     0
+}
+
+/// List the RTX Remix projects the tool knows about, marking the ones in your
+/// library and which can be installed automatically.
+fn cli_remix_list() -> i32 {
+    let owned: Vec<String> = {
+        let mut v: Vec<String> = platform::scan_all().into_iter().map(|g| g.name).collect();
+        if v.is_empty() {
+            v = library::scan().into_iter().map(|g| g.title).collect();
+        }
+        v.iter().map(|s| s.to_ascii_lowercase()).collect()
+    };
+    let owns = |p: &remix::Project| {
+        p.names
+            .iter()
+            .any(|n| owned.iter().any(|o| o.contains(n)))
+    };
+    println!("RTX Remix projects (a mod existing is not the same as it running well):\n");
+    for p in remix::PROJECTS {
+        let mark = if owns(p) { "*" } else { " " };
+        let kind = if p.official {
+            "already Remix"
+        } else if p.repo.is_some() {
+            "download & install"
+        } else {
+            "link only"
+        };
+        println!("{mark} {:<44} {:<20} {}", p.game, kind, p.url);
+    }
+    println!(
+        "\n  * = in your library.  Install a downloadable mod:  dlss5oneclick \"<game>\" --install-remix-mod"
+    );
+    0
+}
+
+/// Install or remove a downloadable RTX Remix mod for a game the catalogue
+/// matches. The target is the game folder (or an exe inside it).
+fn cli_remix_mod(target: &Path, remove: bool) -> i32 {
+    let dir = if target.is_dir() {
+        target.to_path_buf()
+    } else {
+        target.parent().map(Path::to_path_buf).unwrap_or_default()
+    };
+    if remove {
+        return match installer::uninstall_remix_mod(&dir) {
+            Ok(msgs) => {
+                msgs.iter().for_each(|m| println!("{m}"));
+                0
+            }
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                1
+            }
+        };
+    }
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let Some(p) = remix::match_project(&name) else {
+        eprintln!("No known RTX Remix mod for \"{name}\". See --remix-list.");
+        return 1;
+    };
+    let Some(repo) = p.repo else {
+        println!(
+            "{} has a community RTX Remix mod, but not one this tool can install automatically.",
+            p.game
+        );
+        println!("Get it from: {}", p.url);
+        return 0;
+    };
+    println!("Installing the {} RTX Remix mod ({repo}) — this can be a large download.", p.game);
+    let client = match net::client() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            return 1;
+        }
+    };
+    let progress = |pct: u8, msg: &str| {
+        print!("\r{pct:3}% {msg:<64}");
+        let _ = std::io::stdout().flush();
+    };
+    match installer::install_remix_mod(&client, repo, &dir, &progress) {
+        Ok(msgs) => {
+            println!();
+            msgs.iter().for_each(|m| println!("{m}"));
+            0
+        }
+        Err(e) => {
+            println!();
+            eprintln!("{e:#}");
+            eprintln!("Get it from: {}", p.url);
+            1
+        }
+    }
 }
 
 /// A non-path target: exact launcher id (Steam appid) first, then a

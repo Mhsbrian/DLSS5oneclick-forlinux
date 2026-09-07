@@ -25,7 +25,7 @@ pub const RUNTIME_DLL: &str = "d3d9.dll";
 
 /// Directories never worth descending when hunting for `.trex/` — a Remix mod's
 /// asset trees can hold hundreds of thousands of files.
-const SKIP: [&str; 6] = ["mods", "rtx-remix", "g[a-z]", ".git", "reshade-shaders", "renodx"];
+const SKIP: [&str; 6] = ["mods", "rtx-remix", "gamedata", ".git", "reshade-shaders", "renodx"];
 
 /// Which neural fork a Remix runtime is, by the config-key strings it embeds.
 /// The two community forks name their option differently, so the runtime binary
@@ -52,6 +52,100 @@ impl Flavour {
         }
     }
 
+}
+
+// ── catalogue of known RTX Remix projects ──────────────────────────
+//
+// So the tool can say "this game of yours has a Remix mod" and, for the few
+// that publish a complete runtime as a plain zip, fetch and lay it in. Whether
+// a project is actually installable is decided at download time (the release
+// must carry a `.trex/` runtime), not asserted here — a mod can lose or gain a
+// complete build between versions. `repo` names where to look; `link_only`
+// projects are always just pointed to.
+
+/// A game that has (or is) an RTX Remix build.
+pub struct Project {
+    /// The base game's name.
+    pub game: &'static str,
+    /// Who made the Remix mod (or "NVIDIA / Orbifold" for the official ones).
+    pub by: &'static str,
+    /// Where a person gets it — the mod's page.
+    pub url: &'static str,
+    /// `owner/repo` when the mod is on GitHub and *might* publish a complete
+    /// zip this tool can install; `None` for a link-only project.
+    pub repo: Option<&'static str>,
+    /// Lower-case substrings that identify the base game by name or folder.
+    pub names: &'static [&'static str],
+    /// The game already ships as a Remix title — nothing to install, it *is*
+    /// the game (Portal RTX and friends).
+    pub official: bool,
+}
+
+/// Every RTX Remix project the tool knows about. A mod existing is not the same
+/// as it running well — these are pointers, honestly labelled.
+pub const PROJECTS: &[Project] = &[
+    Project { game: "Portal with RTX", by: "NVIDIA", url: "https://store.steampowered.com/app/2012840", repo: None, names: &["portal with rtx"], official: true },
+    Project { game: "Portal: Prelude RTX", by: "NVIDIA / Nicolas Grevet", url: "https://store.steampowered.com/app/2456740", repo: None, names: &["portal prelude rtx", "portal: prelude rtx"], official: true },
+    Project { game: "Half-Life 2 RTX", by: "Orbifold Studios", url: "https://store.steampowered.com/app/2477540", repo: None, names: &["half-life 2 rtx", "half life 2 rtx"], official: true },
+    Project { game: "Grand Theft Auto IV", by: "xoxor4d", url: "https://github.com/xoxor4d/gta4-rtx", repo: Some("xoxor4d/gta4-rtx"), names: &["grand theft auto iv", "gtaiv"], official: false },
+    Project { game: "Need for Speed: Underground 2", by: "Ekozmaster", url: "https://github.com/Ekozmaster/NFSU2-RTX-Remix", repo: Some("Ekozmaster/NFSU2-RTX-Remix"), names: &["need for speed underground 2", "nfs underground 2", "underground 2"], official: false },
+    Project { game: "Garry's Mod", by: "Xenthio", url: "https://github.com/Xenthio/garrys-mod-rtx-remixed", repo: None, names: &["garry's mod", "garrysmod", "gmod"], official: false },
+    Project { game: "Deus Ex (2000)", by: "onnoj", url: "https://github.com/onnoj/DeusExEchelonRenderer", repo: None, names: &["deus ex: game of the year", "deus ex goty"], official: false },
+    Project { game: "Thief Gold", by: "Night1099", url: "https://github.com/Night1099/thief-gold-rtx-remix", repo: None, names: &["thief gold"], official: false },
+    Project { game: "The Elder Scrolls III: Morrowind", by: "BrunchyChineapple", url: "https://github.com/BrunchyChineapple/Morrowind-RTX-Remix-source", repo: None, names: &["morrowind"], official: false },
+    Project { game: "Vampire: The Masquerade – Bloodlines", by: "CattoSalad", url: "https://github.com/CattoSalad/VTMB-RTX-Remix", repo: None, names: &["bloodlines", "vtmb"], official: false },
+    Project { game: "Prince of Persia: The Sands of Time", by: "kaminoer", url: "https://github.com/kaminoer/pop-sot-rtx", repo: None, names: &["sands of time"], official: false },
+    Project { game: "Saints Row 2", by: "BRAGme", url: "https://github.com/BRAGme/sr2-rtx-remix-proxy", repo: None, names: &["saints row 2"], official: false },
+    Project { game: "Saints Row: The Third", by: "PurrsianMilkman", url: "https://github.com/PurrsianMilkman/Saints-Row-The-Third-RTX-REMIX-compatibility-mod", repo: None, names: &["saints row: the third", "saints row the third"], official: false },
+    Project { game: "Red Faction", by: "BRAGme", url: "https://github.com/BRAGme/RedFaction-RTX", repo: None, names: &["red faction"], official: false },
+    Project { game: "Total Overdose", by: "Utkar5hM", url: "https://github.com/Utkar5hM/TotalOverDoseRTXRemix", repo: None, names: &["total overdose"], official: false },
+    Project { game: "Assassin's Creed II", by: "Kamzik123", url: "https://github.com/Kamzik123/ac2-rtx", repo: None, names: &["assassin's creed ii", "assassins creed ii"], official: false },
+    Project { game: "Populous: The Beginning", by: "xmarre", url: "https://github.com/xmarre/Populous-3-RTX-Remix", repo: None, names: &["populous"], official: false },
+    Project { game: "Silent Storm", by: "WormSlayer", url: "https://github.com/WormSlayer/silent-storm-rtx", repo: None, names: &["silent storm"], official: false },
+    Project { game: "Dungeon Keeper 2", by: "mencelot", url: "https://github.com/mencelot/dk2-dxwrapper-with-path-tracing-support", repo: None, names: &["dungeon keeper 2"], official: false },
+    Project { game: "Grand Theft Auto: Vice City", by: "GmanRO", url: "https://github.com/GmanRO/GTA-VICE-CITY-RTX-REMIX-.ASI-compiled-within-linux-", repo: None, names: &["vice city"], official: false },
+    Project { game: "Cry of Fear", by: "michaelabilliot", url: "https://github.com/michaelabilliot/CryofFear_RTX-REMIX", repo: None, names: &["cry of fear"], official: false },
+    Project { game: "Chess Titans", by: "Kamilkampfwagen-II", url: "https://github.com/Kamilkampfwagen-II/Chess-Titans-RTX", repo: None, names: &["chess titans"], official: false },
+];
+
+/// The directory prefix inside a mod's release zip that holds the whole Remix
+/// runtime — the path up to (not including) the `.trex/` folder that contains
+/// `d3d9.dll`. `""` when the runtime is at the zip root. `None` when the zip has
+/// no complete runtime at all (a source tree or a bare proxy), which is how a
+/// link-only release is told apart from an installable one.
+pub fn mod_root(members: &[String]) -> Option<String> {
+    const NEEDLE: &str = ".trex/d3d9.dll";
+    members.iter().find_map(|m| {
+        let norm = m.replace('\\', "/");
+        norm.to_ascii_lowercase()
+            .ends_with(NEEDLE)
+            .then(|| norm[..norm.len() - NEEDLE.len()].to_string())
+    })
+}
+
+/// Strip `root` from the front of a normalised zip path, case-insensitively
+/// (some archives mix case between the descriptor and the entries). `None` when
+/// the path is not under `root`.
+pub fn strip_root<'a>(member_norm: &'a str, root: &str) -> Option<&'a str> {
+    (member_norm.len() >= root.len()
+        && member_norm[..root.len()].eq_ignore_ascii_case(root))
+    .then(|| &member_norm[root.len()..])
+}
+
+/// The Remix project a game name/folder belongs to, if any. `text` is matched
+/// lower-cased against each project's `names`, longest name first so a specific
+/// entry wins over a looser one.
+pub fn match_project(text: &str) -> Option<&'static Project> {
+    let t = text.to_ascii_lowercase();
+    let mut best: Option<(usize, &'static Project)> = None;
+    for p in PROJECTS {
+        for n in p.names {
+            if t.contains(n) && best.is_none_or(|(len, _)| n.len() > len) {
+                best = Some((n.len(), p));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 /// The `.trex/` runtime folder beside or just below the game exe's folder, or
@@ -199,6 +293,49 @@ mod tests {
             Some("rtx.neuralRendering.enable")
         );
         assert_eq!(Flavour::None.enable_key(), None);
+    }
+
+    #[test]
+    fn mod_root_finds_the_runtime_subtree_or_says_no() {
+        // Runtime one folder down: the prefix strips that folder.
+        let m = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let members = m(&[
+            "GTAIV-Remix/",
+            "GTAIV-Remix/.trex/d3d9.dll",
+            "GTAIV-Remix/.trex/foo.dll",
+            "GTAIV-Remix/rtx.conf",
+        ]);
+        let root = mod_root(&members).unwrap();
+        assert_eq!(root, "GTAIV-Remix/");
+        assert_eq!(strip_root("GTAIV-Remix/.trex/foo.dll", &root), Some(".trex/foo.dll"));
+        assert_eq!(strip_root("GtaIV-Remix/rtx.conf", &root), Some("rtx.conf")); // case-insensitive
+        assert_eq!(strip_root("Other/x", &root), None);
+
+        // Runtime at the root: empty prefix.
+        assert_eq!(mod_root(&m(&[".trex/d3d9.dll", "rtx.conf"])), Some(String::new()));
+        // Backslash archives normalise.
+        assert_eq!(mod_root(&m(&["Mod\\.trex\\d3d9.dll"])), Some("Mod/".to_string()));
+        // A source tree / bare proxy is not installable.
+        assert_eq!(mod_root(&m(&["src/main.cpp", "d3d9.dll"])), None);
+    }
+
+    #[test]
+    fn match_project_recognises_games_by_name_or_folder() {
+        assert_eq!(
+            match_project("The Elder Scrolls III: Morrowind").map(|p| p.game),
+            Some("The Elder Scrolls III: Morrowind")
+        );
+        // Folder-name form works too, and matching is case-insensitive.
+        assert_eq!(match_project("GTAIV").map(|p| p.repo), Some(Some("xoxor4d/gta4-rtx")));
+        // The specific "underground 2" wins; an unrelated game matches nothing.
+        assert!(match_project("Need for Speed Underground 2").is_some());
+        assert!(match_project("Cyberpunk 2077").is_none());
+        // The official Remix titles are flagged as already-Remix.
+        assert!(match_project("Portal with RTX").unwrap().official);
+        // Every catalogue entry has at least one match string and a real URL.
+        for p in PROJECTS {
+            assert!(!p.names.is_empty() && p.url.starts_with("http"), "{}", p.game);
+        }
     }
 
     #[test]

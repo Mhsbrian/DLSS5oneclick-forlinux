@@ -482,6 +482,40 @@ impl App {
         });
     }
 
+    /// Download and lay in a complete RTX Remix mod for the selected game, then
+    /// re-inspect so it becomes a Remix game (the normal Install then adds DLSS
+    /// 5). Streams progress like a normal install.
+    fn start_remix_mod(&mut self, repo: &'static str) {
+        let Some(exe) = self.exe() else { return };
+        let Some(dir) = exe.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        self.finishing_install = true;
+        self.launch_panel = None;
+        let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
+        self.rx = Some(rx);
+        self.running = true;
+        self.progress = 0;
+        self.progress_msg.clear();
+        self.log.clear();
+        self.last_error = None;
+        thread::spawn(move || {
+            let out = (|| -> Result<String, String> {
+                let client = net::client().map_err(|e| format!("{e:#}"))?;
+                let p_tx = tx.clone();
+                let msgs = installer::install_remix_mod(&client, repo, &dir, &move |pct, m| {
+                    let _ = p_tx.send(Msg::Progress(pct, m.to_owned()));
+                })
+                .map_err(|e| format!("{e:#}"))?;
+                for m in &msgs {
+                    let _ = tx.send(Msg::Log(LogLine::Ok(m.clone())));
+                }
+                Ok("RTX Remix mod installed — now press Install DLSS 5 to add neural rendering.".to_owned())
+            })();
+            let _ = tx.send(Msg::Finished(out));
+        });
+    }
+
     fn start_scan(&mut self, ctx: &egui::Context) {
         let (tx, rx) = channel::<Vec<Game>>();
         self.scan_rx = Some(rx);
@@ -2462,6 +2496,51 @@ impl eframe::App for App {
                     if ui.add_enabled(!self.running, cb).changed() {
                         game::set_ignore_anticheat(on);
                         self.inspect_resolved();
+                    }
+                }
+
+                // ── RTX Remix mod available for this game ────────────
+                // Nudge toward the Remix mod when the catalogue matches a game
+                // that is not already a Remix game.
+                if let Some(st) = &ok_status {
+                    if st.remix.is_none() {
+                        let hay = self.exe().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
+                        if let Some(p) = crate::remix::match_project(&hay) {
+                            Frame::new()
+                                .fill(Color32::from_rgb(0x18, 0x14, 0x22))
+                                .stroke(Stroke::new(1.0, Color32::from_rgb(0x3a, 0x2f, 0x5a)))
+                                .corner_radius(CornerRadius::same(8))
+                                .inner_margin(Margin::same(12))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(format!("🎨  {} has an RTX Remix mod (by {})", p.game, p.by))
+                                            .font(t::plex_semibold(12.5))
+                                            .color(Color32::from_rgb(0xd7, 0xc9, 0xf5)),
+                                    );
+                                    ui.label(
+                                        RichText::new("A Remix mod path-traces the game; DLSS 5 then runs inside its runtime.")
+                                            .font(t::plex(11.0))
+                                            .color(t::TEXT_DIM),
+                                    );
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        if let Some(repo) = p.repo {
+                                            let b = egui::Button::new(RichText::new("Download & install the mod").font(t::plex_medium(12.0)).color(t::BG))
+                                                .fill(Color32::from_rgb(0xa9, 0x8b, 0xff))
+                                                .corner_radius(CornerRadius::same(7));
+                                            if ui.add_enabled(!self.running, b).on_hover_text("Fetches the complete Remix mod from its release page (can be a large download) and lays it in. If the release has no complete runtime, it falls back to the link. After this, press Install DLSS 5.").clicked() {
+                                                self.start_remix_mod(repo);
+                                            }
+                                        } else {
+                                            ui.label(RichText::new("— not a one-click install; get it from the mod's page.").font(t::plex(11.0)).color(t::TEXT_DIM));
+                                        }
+                                        if ui.button("Open mod page").clicked() {
+                                            open_url(p.url);
+                                        }
+                                    });
+                                });
+                            ui.add_space(8.0);
+                        }
                     }
                 }
 
