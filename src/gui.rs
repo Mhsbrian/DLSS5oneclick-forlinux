@@ -62,6 +62,34 @@ fn d3dcompiler_log_line(adv: &platform::D3dcompilerAdvice) -> Option<LogLine> {
     })
 }
 
+/// The two textures the before/after viewer shows, plus the folder its
+/// "Open folder" button reveals.
+struct CompareView {
+    before: egui::TextureHandle,
+    after: egui::TextureHandle,
+    before_name: String,
+    after_name: String,
+    folder: PathBuf,
+}
+
+/// Decode a screenshot and upload it as a texture, scaled to fit. `None` when
+/// the file cannot be read or decoded.
+fn load_shot(ctx: &egui::Context, path: &Path) -> Option<(egui::TextureHandle, String)> {
+    let img = image::open(path).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    let max_w = 560u32;
+    let (nw, nh) = if w > max_w {
+        (max_w, (h * max_w / w.max(1)).max(1))
+    } else {
+        (w.max(1), h.max(1))
+    };
+    let small = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle);
+    let ci = egui::ColorImage::from_rgba_unmultiplied([nw as usize, nh as usize], small.as_raw());
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    let tex = ctx.load_texture(format!("shot-{name}"), ci, egui::TextureOptions::LINEAR);
+    Some((tex, name))
+}
+
 pub struct App {
     exe_text: String,
     status: Option<Result<GameStatus, String>>,
@@ -79,6 +107,8 @@ pub struct App {
     update_rx: Option<Receiver<UpdateState>>,
     /// Launch-option outcome to show: (game dir it applies to, the advice).
     launch_panel: Option<(PathBuf, platform::LaunchAdvice)>,
+    /// The before/after screenshot viewer, when open.
+    compare: Option<CompareView>,
     /// The running worker is an install (not a removal): apply options after.
     finishing_install: bool,
     skipped_version: String,
@@ -196,6 +226,7 @@ impl App {
             update: UpdateState::Idle,
             update_rx: None,
             launch_panel: None,
+            compare: None,
             finishing_install: false,
             renodx_on: false,
             mfg_on: false,
@@ -649,6 +680,38 @@ impl App {
                 }
             }
         });
+    }
+
+    /// Open the before/after viewer on the game's two newest ReShade
+    /// screenshots. Sets an error box when there is no pair to show.
+    fn open_compare(&mut self, ctx: &egui::Context) {
+        let Some(dir) = self.exe().and_then(|e| e.parent().map(Path::to_path_buf)) else {
+            return;
+        };
+        let Some((before, after)) = crate::compare::newest_pair(&dir) else {
+            self.last_error = Some(
+                "No before/after pair found. In game, take a ReShade screenshot with neural \
+                 rendering off, toggle it on (F6 on the add-on routes, or the ReShade overlay), \
+                 and take another — then reopen this."
+                    .to_owned(),
+            );
+            return;
+        };
+        match (load_shot(ctx, &before), load_shot(ctx, &after)) {
+            (Some((bt, bn)), Some((at, an))) => {
+                self.compare = Some(CompareView {
+                    before: bt,
+                    after: at,
+                    before_name: bn,
+                    after_name: an,
+                    folder: crate::compare::save_path(&dir),
+                });
+            }
+            _ => {
+                self.last_error =
+                    Some("Could not decode the two newest screenshots (PNG/JPEG only).".to_owned());
+            }
+        }
     }
 
     fn run_diagnose(&mut self) {
@@ -2652,6 +2715,23 @@ impl eframe::App for App {
                     {
                         self.run_diagnose();
                     }
+                    let cmp = egui::Button::new(
+                        RichText::new("Before / after").font(t::plex_medium(13.0)).color(t::TEXT_OFF),
+                    )
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::new(1.0, t::BORDER_STRONG))
+                    .corner_radius(CornerRadius::same(8))
+                    .min_size(Vec2::new(120.0, 42.0));
+                    if ui
+                        .add_enabled(ok_status.is_some() && !self.running, cmp)
+                        .on_hover_text(
+                            "Shows the two newest ReShade screenshots side by side. Take one with neural rendering off, toggle it on, take another.",
+                        )
+                        .clicked()
+                    {
+                        let ctx = ui.ctx().clone();
+                        self.open_compare(&ctx);
+                    }
                     if cfg!(target_os = "linux") {
                         let lo = egui::Button::new(
                             RichText::new("Launch options").font(t::plex_medium(13.0)).color(t::TEXT_OFF),
@@ -2764,7 +2844,65 @@ Remove incl. ReShade also deletes ReShade (dxgi.dll, ini files, reshade-shaders)
                     }
                 });
         }
+        if self.compare.is_some() {
+            let mut close = false;
+            // `self.compare` stays Some for the body; the borrow is released
+            // before we may set it to None.
+            if let Some(cv) = &self.compare {
+                egui::Window::new(RichText::new("Before / after").font(t::sora(14.0)))
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ui.ctx(), |ui| {
+                        ui.horizontal(|ui| {
+                            for (tex, label, name) in [
+                                (&cv.before, "Before (neural rendering off)", &cv.before_name),
+                                (&cv.after, "After (neural rendering on)", &cv.after_name),
+                            ] {
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        RichText::new(label)
+                                            .font(t::plex_semibold(12.0))
+                                            .color(t::TEXT_SOFT),
+                                    );
+                                    ui.add(egui::Image::from_texture(tex).max_size(tex.size_vec2()));
+                                    ui.label(
+                                        RichText::new(name).font(t::plex(10.0)).color(t::TEXT_DIM),
+                                    );
+                                });
+                            }
+                        });
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Open folder").clicked() {
+                                let _ = open_folder(&cv.folder);
+                            }
+                            if ui.button("Close").clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+            }
+            if close {
+                self.compare = None;
+            }
+        }
     }
+}
+
+/// Reveal a folder in the desktop file manager (Linux `xdg-open`; the platform
+/// opener elsewhere). Best-effort — a failure is not worth interrupting for.
+fn open_folder(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    let program = "xdg-open";
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+    std::process::Command::new(program)
+        .arg(path)
+        .spawn()
+        .map(|_| ())
 }
 
 pub fn run() -> eframe::Result {

@@ -31,7 +31,7 @@ Everything else is upstream (currently merged at 0.11.24), unchanged: the two in
 3. Let it set the launch options (or paste the shown string into Steam → right-click the game → Properties → Launch Options yourself). Restart Steam if it edited the file.
 4. In game: **Home** opens ReShade → **Add-ons** tab → **DLSS 5 Neural Rendering** panel → enable it. **F6** toggles, **F5** saves the add-on's screenshot. On the OptiScaler engine: **Insert** opens the overlay instead.
 
-If nothing seems to happen in game, run `--diagnose` (button or CLI) — it reads the logs and the host setup and says exactly what is wrong.
+If nothing seems to happen in game, run `--diagnose` (button or CLI) — it reads the logs and the host setup and says exactly what is wrong. To *see* the difference, take a ReShade screenshot with neural rendering off, toggle it on and take another, then press **Before / after** — the tool puts the two newest shots side by side.
 
 CLI: `dlss5oneclick <folder | name | appid>` installs · `--check` detect only · `--diagnose` · `--imports` (print the exe's import table and the API the scan reads) · `--remove` / `--remove-all` · `--engine=opti` · `--fg` (OptiScaler FSR 3.1 frame generation, any RTX card) · `--renodx` · `--upstream` (experimental Neural Upstream consumer) · `--mfg` · `--mode=feeder|native` · `--bridge` (force the DX11 bridge when the renderer can't be proven) · `--ignore-anticheat` · `--launch-options` / `--revert-launch-options` · `--list-games` · `--update`.
 
