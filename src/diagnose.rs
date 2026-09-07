@@ -113,6 +113,16 @@ fn read(dir: &Path, name: &str) -> Option<String> {
     fs::read_to_string(dir.join(name)).ok()
 }
 
+/// The resolution the NR model was last running at, from OptiScaler.log's
+/// "DLSS-NR running at WxH" line — the size that decides the GPU load.
+fn last_nr_resolution(log: &str) -> String {
+    log.rmatch_indices("running at ")
+        .next()
+        .and_then(|(i, m)| log[i + m.len()..].split_whitespace().next())
+        .map(|s| s.trim_end_matches(',').to_string())
+        .unwrap_or_else(|| "full resolution".to_string())
+}
+
 /// The exe ReShade actually loaded into, from its first line:
 /// `... loaded from '...dxgi.dll' into 'C:\\...bg3_dx11.exe' (0x...)`.
 fn reshade_host_exe(log: &str) -> Option<String> {
@@ -170,6 +180,48 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
             )));
         }
         break;
+    }
+
+    // ── OptiScaler engine (its own log, no ReShade) ─────────────────
+    // The OptiScaler engine does not use ReShade, so ReShade.log never exists;
+    // everything is in OptiScaler.log. Reading it here also catches the GPU
+    // device-lost fault the NR runtime drives under Proton, which is otherwise
+    // invisible.
+    if st.opti {
+        let Some(ol) = read(d, "OptiScaler.log") else {
+            out.push(bad(
+                "No OptiScaler.log next to the game exe: OptiScaler never loaded. Either the game \
+                 was not started since the install, or it does not load dxgi.dll (wrong exe picked, \
+                 or a launcher starts a different one). Check the exe with --check.",
+            ));
+            return out;
+        };
+        if ol.contains("VK_ERROR_DEVICE_LOST") || ol.contains("GPU Crash") {
+            out.push(bad(format!(
+                "The GPU crashed while DLSS 5 was running (VK_ERROR_DEVICE_LOST in OptiScaler.log; \
+                 look for an Xid fault in `journalctl -k`). The neural runtime drives the GPU into \
+                 a device-lost fault under Proton, worst at full resolution — the model was running \
+                 at {}. Cheapest first: lower the Model resolution (this tool's slider, or \
+                 --model-res=50 — the model then runs at about a quarter of the pixels, a large drop \
+                 in GPU load, often enough to stop the fault); lower the game's output resolution; \
+                 try a different Proton; or Remove if it keeps faulting.",
+                last_nr_resolution(&ol)
+            )));
+        } else if ol.contains("DlssNr") && (ol.contains("composition") || ol.contains("Dispatch")) {
+            out.push(ok(
+                "OptiScaler DLSS 5 neural rendering is running (composition dispatches in OptiScaler.log).",
+            ));
+        } else if ol.contains("DlssNr") {
+            out.push(warn(
+                "OptiScaler loaded and DLSS-NR initialised, but no composition ran yet — press \
+                 Insert to open the overlay, make sure Neural Rendering is on, and move the camera.",
+            ));
+        } else {
+            out.push(warn(
+                "OptiScaler loaded but DLSS-NR has not run — press Insert and enable Neural Rendering.",
+            ));
+        }
+        return out;
     }
 
     // ── ReShade side ────────────────────────────────────────────────
@@ -862,6 +914,44 @@ mod tests {
 
     /// The missing-bridge case is owned by diagnose() (needs a ReShade.log to
     /// establish "no NGX call"); host_findings only confirms an installed one.
+    #[test]
+    fn optiscaler_gpu_device_lost_is_named_with_the_model_res_fix() {
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = game::testutil::make_pe_with_imports(&d.join("game.exe"), &["d3d12.dll"], 2_000_000);
+        fs::write(d.join(game::DLSS_DLL), b"x").unwrap(); // native mode
+        fs::write(d.join(game::OPTI_MANIFEST), "dxgi.dll\nOptiScaler.ini\n").unwrap();
+        fs::write(
+            d.join("OptiScaler.log"),
+            "[I] DlssNr_Dx12::Dispatch DLSS-NR running at 3840x2160, guides 3648x2052\n\
+             [I] DlssNr_Dx12::Dispatch DLSS-NR composition: model 3840x2160\n\
+             [E] Vulkan_wDx12::hk_vkQueueSubmit vkQueueSubmit failed with error code: VK_ERROR_DEVICE_LOST\n",
+        )
+        .unwrap();
+        let st = game::inspect(&exe).unwrap();
+        assert!(st.opti);
+        let d2 = diagnose(&st);
+        let crash = d2
+            .iter()
+            .find(|x| x.level == Level::Bad && x.text.contains("GPU crashed"))
+            .expect("names the GPU crash");
+        // It names the resolution and points at the model-resolution fix.
+        assert!(crash.text.contains("3840x2160"), "{}", crash.text);
+        assert!(crash.text.contains("--model-res"), "{}", crash.text);
+        // It does NOT wrongly say "ReShade never loaded".
+        assert!(!d2.iter().any(|x| x.text.contains("ReShade never loaded")));
+
+        // A clean OptiScaler run reads as running, not crashed.
+        fs::write(
+            d.join("OptiScaler.log"),
+            "[I] DlssNr_Dx12::Dispatch DLSS-NR composition: model 1920x1080\n",
+        )
+        .unwrap();
+        let d3 = diagnose(&game::inspect(&exe).unwrap());
+        assert!(d3.iter().any(|x| x.level == Level::Ok && x.text.contains("neural rendering is running")));
+    }
+
     #[test]
     fn native_dx11_missing_bridge_is_caught_by_diagnose() {
         std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
