@@ -510,46 +510,98 @@ pub fn is_dgvoodoo(game_dir: &Path) -> bool {
     }
 }
 
+/// Which anti-cheat, if any, one file/dir name in the install tree names.
+/// Kept specific so a clean game is never refused: a substring is used only
+/// where the token is itself distinctive. Bare `denuvo` is deliberately absent
+/// — Denuvo *DRM* is not Denuvo Anti-Cheat, and moddable DRM-only games (Nier,
+/// most single-player Denuvo titles) must not be refused.
+fn anticheat_marker(n: &str, is_dir: bool) -> Option<&'static str> {
+    // Easy Anti-Cheat: EasyAntiCheat[_EOS]/ folder, its setup/launcher exes.
+    if is_dir && (n == "easyanticheat" || n == "easyanticheat_eos") {
+        return Some("Easy Anti-Cheat");
+    }
+    if !is_dir && ((n.starts_with("easyanticheat") && n.ends_with(".exe")) || n == "eac_launcher.exe")
+    {
+        return Some("Easy Anti-Cheat");
+    }
+    // BattlEye: BattlEye/ folder, BEService/BEClient, Install_BattlEye, *_BE.exe.
+    if is_dir && n == "battleye" {
+        return Some("BattlEye");
+    }
+    if !is_dir
+        && (n == "beservice_x64.exe"
+            || n == "install_battleye.bat"
+            || n.ends_with("_be.exe")
+            || n.starts_with("beclient"))
+    {
+        return Some("BattlEye");
+    }
+    // nProtect GameGuard.
+    if is_dir && n == "gameguard" {
+        return Some("GameGuard");
+    }
+    if !is_dir && (n == "ggsetup.exe" || n == "gameguard.des") {
+        return Some("GameGuard");
+    }
+    // Riot Vanguard (kernel driver; a Proton prefix rarely holds it, but the
+    // folder/exe does — Valorant/LoL are also caught by known_anticheat_exe).
+    if is_dir && n == "vanguard" {
+        return Some("Riot Vanguard");
+    }
+    if !is_dir && n == "vgk.sys" {
+        return Some("Riot Vanguard");
+    }
+    // XIGNCODE3.
+    if n.contains("xigncode") || n == "xhunter1.sys" {
+        return Some("XIGNCODE3");
+    }
+    // PunkBuster.
+    if is_dir && n == "punkbuster" {
+        return Some("PunkBuster");
+    }
+    if !is_dir && (n == "pbsvc.exe" || n.starts_with("pnkbstr")) {
+        return Some("PunkBuster");
+    }
+    // FACEIT Anti-Cheat.
+    if (is_dir && n == "faceit") || (!is_dir && n.starts_with("faceit")) {
+        return Some("FACEIT Anti-Cheat");
+    }
+    // EA anti-cheat (Javelin / EA AntiCheat).
+    if n.contains("eaanticheat") || n.contains("ea_anticheat") {
+        return Some("EA anti-cheat");
+    }
+    // HoYoverse (mhyprot driver, shipped by Genshin/HSR/ZZZ).
+    if n.starts_with("mhyprot") {
+        return Some("HoYoverse anti-cheat");
+    }
+    // ACE — Anti-Cheat Expert (ACE-BASE.sys / ACE-GAME.sys, anticheatexpert/).
+    if n.contains("anticheatexpert") || n.starts_with("ace-base") {
+        return Some("Anti-Cheat Expert");
+    }
+    None
+}
+
 /// Anti-cheat present in the install tree, by the files those systems ship.
 /// ReShade add-on injection is exactly what they look for: kicks at best, bans
-/// at worst. Verified file names: EAC `EasyAntiCheat[_EOS]/EasyAntiCheat_EOS_Setup.exe`,
-/// BattlEye `BattlEye/BEService_x64.exe`, `Install_BattlEye.bat`, `*_BE.exe`,
-/// GameGuard `tools/GGSetup.exe` or a `GameGuard` folder.
+/// at worst. Ban risk is irreversible, so the marker set errs wide — but stays
+/// specific enough (see `anticheat_marker`) that a clean game is never refused.
 pub fn detect_anticheat(game_dir: &Path) -> Option<&'static str> {
     fn walk(d: &Path, depth: u8) -> Option<&'static str> {
         let rd = fs::read_dir(d).ok()?;
         for e in rd.flatten() {
             let p = e.path();
+            let is_dir = p.is_dir();
             let n = p
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            if p.is_dir() {
-                if n == "easyanticheat" || n == "easyanticheat_eos" {
-                    return Some("Easy Anti-Cheat");
-                }
-                if n == "battleye" {
-                    return Some("BattlEye");
-                }
-                if n == "gameguard" {
-                    return Some("GameGuard");
-                }
-                if depth > 0 {
-                    if let Some(hit) = walk(&p, depth - 1) {
-                        return Some(hit);
-                    }
-                }
-            } else {
-                if n.starts_with("easyanticheat") && n.ends_with(".exe") {
-                    return Some("Easy Anti-Cheat");
-                }
-                if n == "beservice_x64.exe" || n == "install_battleye.bat" || n.ends_with("_be.exe")
-                {
-                    return Some("BattlEye");
-                }
-                if n == "ggsetup.exe" || n == "gameguard.des" {
-                    return Some("GameGuard");
+            if let Some(hit) = anticheat_marker(&n, is_dir) {
+                return Some(hit);
+            }
+            if is_dir && depth > 0 {
+                if let Some(hit) = walk(&p, depth - 1) {
+                    return Some(hit);
                 }
             }
         }
@@ -570,6 +622,12 @@ pub fn known_anticheat_exe(exe: &Path) -> Option<&'static str> {
         "overwatch.exe" => Some("Blizzard anti-cheat (Overwatch)"),
         "valorant.exe" | "valorant-win64-shipping.exe" => Some("Riot Vanguard"),
         "leagueclient.exe" | "league of legends.exe" => Some("Riot Vanguard"),
+        // HoYoverse's anti-cheat is a system-wide driver installed by the
+        // launcher, so the game folder holds no reliable marker; the exe name
+        // is the evidence.
+        "genshinimpact.exe" | "yuanshen.exe" => Some("HoYoverse anti-cheat (Genshin Impact)"),
+        "starrail.exe" => Some("HoYoverse anti-cheat (Honkai: Star Rail)"),
+        "zenlesszonezero.exe" => Some("HoYoverse anti-cheat (Zenless Zone Zero)"),
         _ => None,
     }
 }
@@ -1736,6 +1794,52 @@ mod tests {
         fs::remove_dir_all(d.join("Game")).unwrap();
         fs::write(d.join("Foo_BE.exe"), b"x").unwrap();
         assert_eq!(detect_anticheat(d), Some("BattlEye"));
+    }
+
+    /// The broader anti-cheat set fires on the new systems and — importantly —
+    /// leaves a clean game and a Denuvo *DRM*-only game alone (Denuvo Anti-Cheat
+    /// is a different product; refusing DRM games would be a regression).
+    #[test]
+    fn anticheat_markers_are_broad_but_do_not_false_positive() {
+        let cases: &[(&str, bool, Option<&str>)] = &[
+            ("Vanguard", true, Some("Riot Vanguard")),
+            ("vgk.sys", false, Some("Riot Vanguard")),
+            ("XIGNCODE3", true, Some("XIGNCODE3")),
+            ("xhunter1.sys", false, Some("XIGNCODE3")),
+            ("PunkBuster", true, Some("PunkBuster")),
+            ("PnkBstrA.exe", false, Some("PunkBuster")),
+            ("FACEIT", true, Some("FACEIT Anti-Cheat")),
+            ("EAAntiCheat.Installer.exe", false, Some("EA anti-cheat")),
+            ("mhyprot3.sys", false, Some("HoYoverse anti-cheat")),
+            ("ACE-BASE.sys", false, Some("Anti-Cheat Expert")),
+            ("BEClient_x64.dll", false, Some("BattlEye")),
+            ("EAC_launcher.exe", false, Some("Easy Anti-Cheat")),
+            // Must NOT fire: Denuvo DRM, and ordinary files.
+            ("denuvo64.dll", false, None),
+            ("Denuvo", true, None),
+            ("bin", true, None),
+            ("game.exe", false, None),
+            ("acebase_notes.txt", false, None), // "ace-base" boundary, not this
+        ];
+        for (name, is_dir, want) in cases {
+            assert_eq!(
+                anticheat_marker(&name.to_ascii_lowercase(), *is_dir),
+                *want,
+                "marker for {name:?} (dir={is_dir})"
+            );
+        }
+        // Reaches through the tree and drives the refusal.
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        make_pe(&d.join("game.exe"), PE_X64);
+        fs::create_dir_all(d.join("live").join("Vanguard")).unwrap();
+        assert_eq!(detect_anticheat(d), Some("Riot Vanguard"));
+
+        // The exe-name path names HoYoverse titles that ship no folder marker.
+        assert_eq!(
+            known_anticheat_exe(Path::new("/x/GenshinImpact.exe")),
+            Some("HoYoverse anti-cheat (Genshin Impact)")
+        );
     }
 
     /// Neural Upstream stands in for the RenoDX add-on, so an install that has

@@ -57,7 +57,7 @@ NVIDIA RTX only (the DLSS 5 model needs tensor cores and NGX). The `310.8.SF` bu
 
 ## Not handled
 
-Same as upstream: DirectX 9 (except behind dgVoodoo2) and Vulkan-native games (X4, most native Linux ports have no Windows exe at all and are skipped), and games with anti-cheat (EAC/BattlEye/GameGuard — refused; `--ignore-anticheat` at your own risk, and under Proton that risk includes the anti-cheat's Linux path breaking outright). 32-bit DX11 games work since upstream 0.10.0 (Feeder + host64 helper, beta).
+Same as upstream: DirectX 9 (except behind dgVoodoo2) and Vulkan-native games (X4, most native Linux ports have no Windows exe at all and are skipped), and games with anti-cheat (EAC, BattlEye, GameGuard, Riot Vanguard, XIGNCODE3, PunkBuster, FACEIT, EA anti-cheat, HoYoverse, ACE — refused; `--ignore-anticheat` at your own risk, and under Proton that risk includes the anti-cheat's Linux path breaking outright). 32-bit DX11 games work since upstream 0.10.0 (Feeder + host64 helper, beta).
 
 - The DLSS 5 add-on and its model are a leaked, closed-source build. The tool downloads whatever the rhi-repo releases currently host and cannot vouch for them.
 - Heroic environment-variable writing is experimental (config format tolerances built in; falls back to showing you the variables).
