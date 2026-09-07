@@ -14,6 +14,7 @@
 //! 6. ReShade.ini + ReShadePreset.ini: DLSS5_MV_PROVIDER=3, Lumenite_Kernel above DLSS5_Feed.
 
 use crate::game::{self, GameStatus};
+use crate::gpu;
 use crate::gpupref;
 use crate::net::{self, Progress};
 use crate::renodx;
@@ -764,6 +765,153 @@ pub fn rhi_latest(client: &Client, prefix: &str) -> Result<(String, String)> {
     Ok((tag, url))
 }
 
+// ── add-on pinning (feeder ↔ renodx-dlss5, and the driver fault) ────
+//
+// The DLSS5-Feeder and the renodx-dlss5 add-on are one contract: a feeder
+// release supports only certain add-on generations, and pairing a newer add-on
+// with an older feeder is the `CreateFeature 0xC0000005` crash on an otherwise
+// correct install. jlrouzies-fr pins it in the feeder's own README — the stable
+// line (< 0.8.0-beta.3) works only with 4.55; 0.8.0-beta.3 added 4.6 and
+// 0.9.0-beta.1 added 4.7. Separately, NVIDIA's DLSS 5 launch drivers route NGX
+// feature 18 into the runtime itself, where renodx-dlss5 4.6/4.7 faults on every
+// evaluate (measured by the feeder's author: 4.7 passes 0/300, 4.55 300/300), so
+// on those drivers the add-on is pinned to 4.55 too. 4.55 is the known-good
+// build, so pinning to it is the safe direction when in doubt.
+
+/// The Windows driver number where NGX feature-18 routing starts faulting
+/// renodx-dlss5 4.6/4.7. The Linux kernel-driver number is a different space, so
+/// on Linux this only bites a very new driver (≥ this in the same numeric sense)
+/// — the conservative side, since it pins to the known-good 4.55.
+const DRIVER_FAULT_MIN: &str = "616.64";
+
+/// 'v0.9.0-beta.1' -> [0,9,0,0,1]: sortable, a beta sorting below its release.
+fn feeder_key(tag: &str) -> Vec<u64> {
+    let nums: Vec<u64> = tag
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|s| (!s.is_empty()).then(|| s.parse().ok()).flatten())
+        .collect();
+    let mut base: Vec<u64> = nums.iter().take(3).copied().collect();
+    base.resize(3, 0);
+    if tag.to_ascii_lowercase().contains("beta") {
+        base.push(0);
+        base.push(nums.get(3).copied().unwrap_or(0));
+    } else {
+        base.push(1);
+        base.push(0);
+    }
+    base
+}
+
+/// `have >= min`, comparing dotted numeric driver versions component by
+/// component ("610.57.04" < "616.64").
+fn driver_ge(have: &str, min: &str) -> bool {
+    let parse = |s: &str| -> Vec<u64> {
+        s.split('.')
+            .map(|p| {
+                p.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse()
+                    .unwrap_or(0)
+            })
+            .collect()
+    };
+    parse(have) >= parse(min)
+}
+
+/// Which renodx-dlss5 build to pin, or `None` to take the newest. Pins to 4.55
+/// when the feeder being installed is too old for a newer add-on, or when the
+/// driver is one that faults 4.6/4.7.
+pub fn renodx_dlss5_pin(feeder_tag: Option<&str>, driver: Option<&str>) -> Option<&'static str> {
+    if let Some(ft) = feeder_tag {
+        if feeder_key(ft) < feeder_key("v0.8.0-beta.3") {
+            return Some("4.55");
+        }
+    }
+    if let Some(d) = driver {
+        if driver_ge(d, DRIVER_FAULT_MIN) {
+            return Some("4.55");
+        }
+    }
+    None
+}
+
+/// The label part of an rhi-repo tag (`renodx-dlss5-4.55` -> `4.55`) equals or
+/// sits on the same dotted line as `want` (`4.55` matches `4.55` and `4.55.1`).
+fn label_is(tag: &str, prefix: &str, want: &str) -> bool {
+    match tag.strip_prefix(prefix) {
+        Some(rest) => rest == want || rest.starts_with(&format!("{want}.")),
+        None => false,
+    }
+}
+
+/// Like `rhi_latest`, but when `pin` is set it selects the newest release on
+/// that pinned line instead of the newest overall. Falls back to the newest if
+/// the pinned build cannot be found, so a pin can never make a route unavailable.
+pub fn rhi_pinned(client: &Client, prefix: &str, pin: Option<&str>) -> Result<(String, String)> {
+    let Some(pin) = pin else {
+        return rhi_latest(client, prefix);
+    };
+    if let Ok(releases) = net::get_json_github(client, RHI_RELEASES) {
+        if let Some(arr) = releases.as_array() {
+            let cands: Vec<(Vec<u64>, String, String)> = arr
+                .iter()
+                .filter_map(|r| {
+                    let tag = r.get("tag_name")?.as_str()?;
+                    if !label_is(tag, prefix, pin) {
+                        return None;
+                    }
+                    let url = r
+                        .get("assets")?
+                        .as_array()?
+                        .first()?
+                        .get("browser_download_url")?
+                        .as_str()?;
+                    Some((ver_key(tag, prefix), tag.to_owned(), url.to_owned()))
+                })
+                .collect();
+            if !cands.is_empty() {
+                return Ok(best_tag(cands));
+            }
+        }
+    }
+    let tags = net::github_release_tags_html(client, RHI_REPO, prefix, 20)?;
+    if let Some(tag) = tags.into_iter().find(|t| label_is(t, prefix, pin)) {
+        let url = net::github_asset_url_html(client, RHI_REPO, &tag, r#"[^"]+\.zip"#)?;
+        return Ok((tag, url));
+    }
+    // The pinned build is not on GitHub any more: newest is better than nothing.
+    rhi_latest(client, prefix)
+}
+
+/// Refuse a downloaded `nvngx_dlssnr.dll` that has no code for this card, before
+/// the install can look finished while nothing renders. Only refuses when the
+/// card's exact `sm` is known (nvidia-smi) and absent from the file's fatbins;
+/// silent otherwise, and skipped by `DLSS5ONECLICK_SKIP_GPU_CHECK`.
+fn validate_dlssnr(dll: &Path) -> Result<()> {
+    if std::env::var_os("DLSS5ONECLICK_SKIP_GPU_CHECK").is_some() {
+        return Ok(());
+    }
+    let Some(sm) = gpu::compute_capability() else {
+        return Ok(());
+    };
+    let archs = gpu::dll_architectures(dll);
+    if archs.is_empty() || archs.contains(&sm) {
+        return Ok(());
+    }
+    let have = archs
+        .iter()
+        .map(|a| format!("sm_{a}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!(
+        "This DLSS 5 model has no code for your card. It was built for {have}, and your card is \
+         sm_{sm} — it would load and never produce a neural frame (every log would still say \
+         success). Pick a different DLSS 5 model build, or set DLSS5ONECLICK_SKIP_GPU_CHECK=1 to \
+         install it anyway."
+    );
+}
+
 // ── step 1: ReShade ────────────────────────────────────────────────
 
 pub fn resolve_reshade_setup(client: &Client) -> Result<(String, String)> {
@@ -1065,11 +1213,22 @@ fn step_dlss5(
         ),
     ];
     progress(0, "Looking up DLSS 5 add-on releases");
+    // The renodx-dlss5 add-on is pinned to match the feeder step_feeder just
+    // placed (its marker carries the tag) and the driver, so a newer add-on is
+    // never paired with a feeder or driver that faults it.
+    let feeder_tag = fs::read_to_string(st.game_dir().join(game::FEEDER_MARKER))
+        .ok()
+        .map(|s| s.trim().to_owned());
+    let addon_pin = renodx_dlss5_pin(feeder_tag.as_deref(), gpu::driver_for_pin().as_deref());
     let cdir = st.consumer_dir();
     fs::create_dir_all(&cdir)?;
     let mut installed = Vec::new();
     for (prefix, fname, present, marker) in plan {
-        let (tag, url) = rhi_latest(client, prefix)?;
+        let pin = (prefix == "renodx-dlss5-").then_some(addon_pin).flatten();
+        if let Some(p) = pin {
+            progress(0, &format!("Pinning {fname} to {p} (matches the feeder/driver)"));
+        }
+        let (tag, url) = rhi_pinned(client, prefix, pin)?;
         if present {
             match marker.map(|m| fs::read_to_string(cdir.join(m))) {
                 Some(Ok(mine)) if mine.trim() == tag => {
@@ -1100,6 +1259,12 @@ fn step_dlss5(
             }
         }
         install_single_from_zip(&z, fname, &dest)?;
+        if fname == game::DLSSNR_DLL {
+            if let Err(e) = validate_dlssnr(&dest) {
+                let _ = fs::remove_file(&dest);
+                return Err(e);
+            }
+        }
         if let Some(m) = marker {
             fs::write(cdir.join(m), tag.as_bytes())?;
         }
@@ -1145,7 +1310,12 @@ fn step_dlssnr_only(
     }
     let z = work.join(format!("{tag}.zip"));
     net::download(client, &url, &z, game::DLSSNR_DLL, progress)?;
-    install_single_from_zip(&z, game::DLSSNR_DLL, &st.game_dir().join(game::DLSSNR_DLL))?;
+    let dest = st.game_dir().join(game::DLSSNR_DLL);
+    install_single_from_zip(&z, game::DLSSNR_DLL, &dest)?;
+    if let Err(e) = validate_dlssnr(&dest) {
+        let _ = fs::remove_file(&dest);
+        return Err(e);
+    }
     fs::write(st.game_dir().join(game::DLSSNR_MARKER), tag.as_bytes())?;
     Ok(vec![format!("{} ({tag})", game::DLSSNR_DLL)])
 }
@@ -1611,6 +1781,51 @@ mod tests {
             .iter()
             .map(|t| json!({"tag_name": t, "assets": [{"browser_download_url": format!("https://x/{t}.zip")}]}))
             .collect()
+    }
+
+    #[test]
+    fn feeder_key_orders_betas_below_the_release() {
+        assert!(feeder_key("v0.7.0") < feeder_key("v0.8.0-beta.3"));
+        assert!(feeder_key("v0.8.0-beta.3") < feeder_key("v0.8.0"));
+        assert!(feeder_key("v0.8.0-beta.1") < feeder_key("v0.8.0-beta.3"));
+        assert!(feeder_key("v0.9.0-beta.1") > feeder_key("v0.8.0"));
+    }
+
+    #[test]
+    fn driver_ge_compares_numeric_components() {
+        assert!(!driver_ge("610.57.04", "616.64")); // this machine: no fault
+        assert!(driver_ge("616.64", "616.64"));
+        assert!(driver_ge("616.86", "616.64"));
+        assert!(driver_ge("620.10", "616.64"));
+        assert!(!driver_ge("616.56", "616.64"));
+    }
+
+    #[test]
+    fn renodx_pin_matches_feeder_and_driver() {
+        // Stable feeder (< 0.8.0-beta.3) only works with 4.55.
+        assert_eq!(renodx_dlss5_pin(Some("v0.7.0"), None), Some("4.55"));
+        // A feeder that supports the newer add-on: no pin.
+        assert_eq!(renodx_dlss5_pin(Some("v0.9.0-beta.1"), None), None);
+        // The native route has no feeder; a faulting driver still pins.
+        assert_eq!(renodx_dlss5_pin(None, Some("616.86")), Some("4.55"));
+        assert_eq!(renodx_dlss5_pin(None, Some("610.57.04")), None);
+        assert_eq!(renodx_dlss5_pin(None, None), None);
+    }
+
+    #[test]
+    fn label_is_matches_the_pinned_line_only() {
+        assert!(label_is("renodx-dlss5-4.55", "renodx-dlss5-", "4.55"));
+        assert!(label_is("renodx-dlss5-4.55.1", "renodx-dlss5-", "4.55")); // same line
+        assert!(!label_is("renodx-dlss5-4.5", "renodx-dlss5-", "4.55"));
+        assert!(!label_is("renodx-dlss5-4.7", "renodx-dlss5-", "4.55"));
+        // The pinned filter over a release list selects exactly 4.55.
+        let r = rhi_releases();
+        let hit: Vec<&str> = r
+            .iter()
+            .filter_map(|v| v.get("tag_name")?.as_str())
+            .filter(|t| label_is(t, "renodx-dlss5-", "4.55"))
+            .collect();
+        assert_eq!(hit, vec!["renodx-dlss5-4.55"]);
     }
 
     #[test]

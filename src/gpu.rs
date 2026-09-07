@@ -382,9 +382,170 @@ pub fn list() -> Vec<Gpu> {
     Vec::new()
 }
 
+// ── CUDA fatbin validation ─────────────────────────────────────────
+//
+// The leaked `nvngx_dlssnr.dll` is 165 MB of CUDA fatbins. Each build is
+// compiled for a set of architectures; installing one that has no code for the
+// card is a silent failure — every log says success, no neural frame ever
+// lands. So before trusting a downloaded model, we open it and read the `sm_XX`
+// numbers its fatbin records actually carry, and refuse a build the card is not
+// in. Verified against the real ShortFuse `.SF` build on disk (RTX 4090 / sm_89):
+// it carries {75, 86, 89, 120} — Turing, Ampere, Ada, Blackwell.
+//
+// The parser reads the fatbin *container* headers, not the (compressed) cubins:
+// the `sm` field sits at a not-quite-fixed offset in each entry header, so we
+// probe a few offsets and accept the first value that is a real compute
+// capability. That membership gate is what makes the loose offset probing safe.
+
+/// Compute capabilities that exist, so a stray dword is not read as an arch.
+const KNOWN_SM: &[u32] = &[
+    75, 80, 86, 87, 89, 90, 100, 120, 121, 50, 52, 53, 60, 61, 62, 70, 72, 101,
+];
+
+/// The `sm_XX` architectures a CUDA-bearing DLL was built for, e.g. `[75, 86,
+/// 89, 120]`. Empty on any read/parse problem (caller then does not refuse).
+pub fn dll_architectures(path: &std::path::Path) -> Vec<u32> {
+    match std::fs::read(path) {
+        Ok(bytes) => architectures_in(&bytes),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn architectures_in(d: &[u8]) -> Vec<u32> {
+    const MAGIC: [u8; 4] = 0xBA55_ED50u32.to_le_bytes(); // classic CUDA fatbin magic
+    let rd_u16 = |o: usize| d.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let rd_u32 = |o: usize| {
+        d.get(o..o + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let rd_u64 = |o: usize| {
+        d.get(o..o + 8)
+            .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    };
+    let mut found = std::collections::BTreeSet::new();
+    let mut off = 0usize;
+    while let Some(rel) = d[off..].windows(4).position(|w| w == MAGIC) {
+        let i = off + rel;
+        off = i + 4;
+        let (Some(hsize), Some(fatsize)) = (rd_u16(i + 6), rd_u64(i + 8)) else {
+            continue;
+        };
+        let (hsize, fatsize) = (hsize as usize, fatsize as usize);
+        if hsize < 16 || fatsize == 0 || fatsize > d.len() {
+            continue;
+        }
+        let mut p = i + hsize;
+        let end = (i + hsize).saturating_add(fatsize);
+        while p + 32 < end {
+            let (Some(ehdr), Some(payload)) = (rd_u32(p + 4), rd_u64(p + 8)) else {
+                break;
+            };
+            let (ehdr, payload) = (ehdr as usize, payload as usize);
+            if !(24..=4096).contains(&ehdr) || payload == 0 || payload > d.len() {
+                break;
+            }
+            for so in [24usize, 28, 20] {
+                if let Some(sm) = rd_u32(p + so) {
+                    if KNOWN_SM.contains(&sm) {
+                        found.insert(sm);
+                        break;
+                    }
+                }
+            }
+            p += ehdr + payload;
+        }
+    }
+    found.into_iter().collect()
+}
+
+/// The card's CUDA compute capability as an `sm` number (8.9 → 89), the newest
+/// among the installed NVIDIA GPUs, read exactly from `nvidia-smi`. `None` when
+/// nvidia-smi is absent or unreadable — the fatbin check then does not fire, so
+/// a machine without nvidia-smi is never falsely refused.
+pub fn compute_capability() -> Option<u32> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_compute_caps(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The highest `sm` among nvidia-smi's `compute_cap` lines ("8.9\n12.0" → 120).
+fn parse_compute_caps(s: &str) -> Option<u32> {
+    s.lines()
+        .filter_map(|line| {
+            let (maj, min) = line.trim().split_once('.')?;
+            Some(maj.trim().parse::<u32>().ok()? * 10 + min.trim().parse::<u32>().ok()?)
+        })
+        .max()
+}
+
+/// The NVIDIA driver version used for add-on compatibility gating, portable.
+/// Linux reads `/sys/module/nvidia/version`; other platforms return `None`
+/// (the pin then relies on the feeder↔add-on match alone).
+pub fn driver_for_pin() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        driver_version()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_compute_caps_takes_the_highest() {
+        assert_eq!(parse_compute_caps("8.9\n"), Some(89));
+        assert_eq!(parse_compute_caps("12.0"), Some(120));
+        // A laptop with an iGPU-less NVIDIA plus a dGPU, or a dual-card box:
+        // the newest card decides which build must run.
+        assert_eq!(parse_compute_caps("8.6\n12.0\n"), Some(120));
+        assert_eq!(parse_compute_caps(""), None);
+        assert_eq!(parse_compute_caps("garbage"), None);
+    }
+
+    /// A hand-built fatbin with two entries (sm_89 and sm_120) must read back as
+    /// exactly {89, 120}; a dword that is not a real compute capability must be
+    /// ignored. This mirrors the real DLL, where the RTX 4090's sm_89 sits in a
+    /// build that also carries Blackwell's sm_120.
+    #[test]
+    fn architectures_in_reads_entry_sm_fields() {
+        fn entry(sm: u32) -> Vec<u8> {
+            // Entry header of 24 bytes: ehdr(u32)@+4 = 24, payload(u64)@+8 = 4,
+            // sm(u32)@+20, then a 4-byte payload. Next entry starts at +28.
+            let mut e = vec![0u8; 24];
+            e[4..8].copy_from_slice(&24u32.to_le_bytes());
+            e[8..16].copy_from_slice(&4u64.to_le_bytes());
+            e[20..24].copy_from_slice(&sm.to_le_bytes());
+            e.extend_from_slice(&[0u8; 4]); // payload
+            e
+        }
+        let mut body = entry(89);
+        body.extend(entry(120));
+        body.extend(entry(999)); // not a real sm: must be ignored
+        let mut buf = vec![0xEEu8; 8]; // some prefix bytes before the container
+        let i = buf.len();
+        buf.extend_from_slice(&0xBA55_ED50u32.to_le_bytes());
+        buf.resize(i + 16, 0); // 16-byte container header
+        buf[i + 6..i + 8].copy_from_slice(&16u16.to_le_bytes()); // hsize
+        buf[i + 8..i + 16].copy_from_slice(&(body.len() as u64).to_le_bytes()); // fatsize
+        buf.extend_from_slice(&body);
+        assert_eq!(architectures_in(&buf), vec![89, 120]);
+    }
+
+    #[test]
+    fn architectures_in_is_empty_on_junk() {
+        assert!(architectures_in(b"not a fatbin at all").is_empty());
+        assert!(architectures_in(&[]).is_empty());
+    }
 
     #[test]
     fn classifies_common_names() {

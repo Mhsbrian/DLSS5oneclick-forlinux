@@ -53,7 +53,7 @@ Steam edits are atomic and verified: the file is re-parsed after the edit and mu
 
 ## GPU support
 
-NVIDIA RTX only (the DLSS 5 model needs tensor cores and NGX). The `310.8.SF` build the tool installs adds patched binaries for RTX 40 and an FP16 path for RTX 20/30; RTX 50 runs the native FP8 kernels. The proprietary NVIDIA driver is required — including its Wine/NGX files (`nvngx.dll` under `/usr/lib/nvidia/wine` or your distro's equivalent; package `nvidia-utils` on Arch). Misdetected? `DLSS5ONECLICK_SKIP_GPU_CHECK=1` bypasses the refusal.
+NVIDIA RTX only (the DLSS 5 model needs tensor cores and NGX). The `310.8.SF` build the tool installs adds patched binaries for RTX 40 and an FP16 path for RTX 20/30; RTX 50 runs the native FP8 kernels. Before it installs the 165 MB model, the tool opens it and reads the CUDA architectures its fatbins actually carry (`sm_75/86/89/120` for the `.SF` build), then refuses one that has no code for your card rather than let it load and silently produce no neural frame — your card's exact compute capability comes from `nvidia-smi`, and `DLSS5ONECLICK_SKIP_GPU_CHECK=1` overrides. It also pins the `renodx-dlss5` add-on to the build the installed DLSS5-Feeder (and your driver) can actually run — the mismatch behind `CreateFeature 0xC0000005` and the launch-driver feature-18 fault — instead of always taking the newest. The proprietary NVIDIA driver is required — including its Wine/NGX files (`nvngx.dll` under `/usr/lib/nvidia/wine` or your distro's equivalent; package `nvidia-utils` on Arch). Misdetected? `DLSS5ONECLICK_SKIP_GPU_CHECK=1` bypasses the refusal.
 
 ## Not handled
 
