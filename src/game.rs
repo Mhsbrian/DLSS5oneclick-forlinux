@@ -725,6 +725,13 @@ pub struct GameStatus {
     pub has_fg: bool,
     /// Anti-cheat found (files or exe name), whether or not the refusal is overridden.
     pub anticheat: Option<&'static str>,
+    /// The `.trex/` runtime folder when this is an RTX Remix game — that route
+    /// then overrides everything (ReShade would crash a Remix game).
+    pub remix: Option<PathBuf>,
+    /// Remix route: `nvngx_dlssnr.dll` is already in the `.trex/` folder.
+    pub remix_model: bool,
+    /// Remix route: a neural pass is enabled in `rtx.conf`.
+    pub remix_enabled: bool,
     pub problems: Vec<String>,
 }
 
@@ -808,6 +815,11 @@ impl GameStatus {
         self.mode == Mode::Native && (self.api == Api::Dx11 || bridge_override())
     }
     pub fn complete(&self) -> bool {
+        // The Remix route is its own thing: the model inside `.trex/` and the
+        // neural pass enabled in rtx.conf, no ReShade/feeder involved.
+        if self.remix.is_some() {
+            return self.remix_model && self.remix_enabled;
+        }
         match self.mode {
             Mode::Feeder => {
                 self.reshade
@@ -837,6 +849,20 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         bail!("game executable not found: {}", exe.display());
     }
     let d = exe.parent().context("exe has no parent directory")?;
+    // A Remix game (a `.trex/` runtime beside it) takes the Remix route, which
+    // overrides everything: its own exe imports d3d9, so this must be settled
+    // before the D3D9 refusals below, and ReShade would crash it anyway.
+    let remix = crate::remix::find_runtime(d);
+    let (remix_model, remix_enabled) = match &remix {
+        Some(trex) => {
+            let model = join_ci(trex, &[DLSSNR_DLL]).is_file();
+            let enabled = fs::read_to_string(crate::remix::conf_path(trex))
+                .ok()
+                .is_some_and(|t| crate::remix::any_enabled(&t));
+            (model, enabled)
+        }
+        None => (false, false),
+    };
     let bitness = exe_bitness(exe)?;
     let shaders = join_ci(d, &["reshade-shaders", "Shaders"]);
     let textures = join_ci(d, &["reshade-shaders", "Textures"]);
@@ -863,9 +889,9 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     // A d3d9.dll is usually a wrapper this tool cannot work behind — except
     // dgVoodoo2, which is exactly how a D3D9 game reaches D3D11 and then the
     // Feeder (verified working on Dead or Alive 5 Last Round, #17).
-    if file_ci(d, "d3d9.dll") && !file_ci(d, RESHADE_PROXY) && !is_dgvoodoo(d) {
+    if remix.is_none() && file_ci(d, "d3d9.dll") && !file_ci(d, RESHADE_PROXY) && !is_dgvoodoo(d) {
         problems.push(
-            "A d3d9.dll proxy is present that is not dgVoodoo2. DirectX 9 itself is not a dead              end -- DLSS 5 needs a D3D11/12 device, and dgVoodoo2 provides one, which is how a              D3D9 game can work here (#17, #37) -- but this tool cannot install behind another              wrapper. Replace it with dgVoodoo 2.87.3 (MS\\x86\\D3D9.dll plus dgVoodoo.conf,              OutputAPI = bestavailable) and run Install again."
+            "A d3d9.dll proxy is present that is not dgVoodoo2. DirectX 9 itself is not a dead           end -- DLSS 5 needs a D3D11/12 device, and dgVoodoo2 provides one, which is how a              D3D9 game can work here (#17, #37) -- but this tool cannot install behind another              wrapper. Replace it with dgVoodoo 2.87.3 (MS\\x86\\D3D9.dll plus dgVoodoo.conf,              OutputAPI = bestavailable) and run Install again."
                 .into(),
         );
     }
@@ -877,7 +903,7 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     if api == Api::Dx9 && is_dgvoodoo(d) {
         api = Api::Dx11;
     }
-    if api == Api::Dx9 {
+    if api == Api::Dx9 && remix.is_none() {
         problems.push(
             "This is a DirectX 9 game. DLSS needs a Direct3D 11 or 12 device, which D3D9 \
              never creates, so nothing here can attach to it as it stands -- and the game \
@@ -948,6 +974,9 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         mfg: file_ci(d, crate::mfg::MFG_MANIFEST),
         has_fg: crate::mfg::has_streamline_fg(d),
         anticheat,
+        remix,
+        remix_model,
+        remix_enabled,
         problems,
     })
 }
@@ -1840,6 +1869,42 @@ mod tests {
             known_anticheat_exe(Path::new("/x/GenshinImpact.exe")),
             Some("HoYoverse anti-cheat (Genshin Impact)")
         );
+    }
+
+    /// A `.trex/` runtime beside the exe makes it a Remix game: the route
+    /// overrides the D3D9 refusals its own d3d9 imports would otherwise trigger.
+    #[test]
+    fn remix_game_takes_the_remix_route_not_a_d3d9_refusal() {
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        // An old game that really imports d3d9 (would read as DirectX 9)...
+        let exe =
+            testutil::make_pe_importing(&d.join("game.exe"), "d3d9.dll", &["Direct3DCreate9"]);
+        assert_eq!(detect_api(&exe), Api::Dx9);
+        // ...and a d3d9 proxy beside it (not dgVoodoo2), which alone is a refusal.
+        fs::write(d.join("d3d9.dll"), b"MZ some other wrapper").unwrap();
+        assert!(inspect(&exe)
+            .unwrap()
+            .problems
+            .iter()
+            .any(|p| p.contains("d3d9.dll proxy") || p.contains("DirectX 9 game")));
+
+        // With a Remix runtime present, it is a Remix game and neither fires.
+        fs::create_dir_all(d.join(".trex")).unwrap();
+        fs::write(d.join(".trex").join("d3d9.dll"), b"stub runtime, no markers").unwrap();
+        let st = inspect(&exe).unwrap();
+        assert_eq!(st.remix.as_deref(), Some(d.join(".trex").as_path()));
+        assert!(!st.remix_model && !st.remix_enabled && !st.complete());
+        assert!(!st
+            .problems
+            .iter()
+            .any(|p| p.contains("d3d9.dll proxy") || p.contains("DirectX 9 game")));
+
+        // Once the model and the enable line are in place, it is complete.
+        fs::write(d.join(".trex").join(DLSSNR_DLL), b"model").unwrap();
+        fs::write(d.join("rtx.conf"), "rtx.neuralUplift.enable = True\n").unwrap();
+        assert!(inspect(&exe).unwrap().complete());
     }
 
     /// Neural Upstream stands in for the RenoDX add-on, so an install that has

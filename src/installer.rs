@@ -281,6 +281,45 @@ fn step_opti(
     Ok(installed)
 }
 
+/// Take a Remix install back out: the model and marker from `.trex/`, the
+/// neural-enable lines from rtx.conf, and any runtime we swapped (the mod's own
+/// runtime is restored from the backup this tool kept). The mod itself is left
+/// entirely alone.
+fn uninstall_remix(trex: &Path) -> Result<Vec<String>> {
+    let mut removed = Vec::new();
+    for f in [game::DLSSNR_DLL, REMIX_MARKER] {
+        let p = game::join_ci(trex, &[f]);
+        if p.is_file() {
+            fs::remove_file(&p)?;
+            removed.push(format!(".trex/{f}"));
+        }
+    }
+    let conf = crate::remix::conf_path(trex);
+    if let Ok(text) = fs::read_to_string(&conf) {
+        let mut t = text.clone();
+        for key in ["rtx.neuralUplift.enable", "rtx.neuralRendering.enable"] {
+            t = crate::remix::remove_option(&t, key);
+        }
+        if t != text {
+            fs::write(&conf, &t)?;
+            removed.push("rtx.conf neural-rendering enable".to_owned());
+        }
+    }
+    for name in REMIX_RUNTIME_ASSETS {
+        let dest = game::join_ci(trex, &[name]);
+        let bak = dest.with_file_name(format!("{name}{REMIX_ORIG}"));
+        if bak.is_file() {
+            fs::copy(&bak, &dest)?;
+            fs::remove_file(&bak)?;
+            removed.push(format!(".trex/{name} (mod's own runtime restored)"));
+        }
+    }
+    if removed.is_empty() {
+        removed.push("no DLSS 5 Remix files to remove".to_owned());
+    }
+    Ok(removed)
+}
+
 /// Remove an OptiScaler install recorded in the manifest.
 fn uninstall_opti(d: &Path, removed: &mut Vec<String>) -> Result<()> {
     let manifest = d.join(game::OPTI_MANIFEST);
@@ -322,6 +361,16 @@ pub const BRIDGE_DOWNLOAD: &str =
 /// RenoDX DLSS 5 add-on rather than joining it.
 const UPSTREAM_DOWNLOAD: &str =
     "https://github.com/matiasLombo/neural-upstream/releases/latest/download/nvngx.dll.addon64";
+/// lunks/dxvk-remix-plus-dlssnr: an RTX Remix runtime with the DLSS-NR stage
+/// built in, a drop-in for a `.trex/` folder whose stock runtime has no neural
+/// pass. Two loose assets, fetched by the plain "latest" redirect (no API).
+const REMIX_RUNTIME_LATEST: &str =
+    "https://github.com/lunks/dxvk-remix-plus-dlssnr/releases/latest/download/";
+const REMIX_RUNTIME_ASSETS: [&str; 2] = ["d3d9.dll", "remix_nvngx.dll"];
+/// Tag of the DLSS 5 model this tool placed inside a `.trex/`, for refresh.
+const REMIX_MARKER: &str = ".dlss5oneclick-remix";
+/// Suffix for a Remix runtime file we replaced, so a swap can be reverted.
+const REMIX_ORIG: &str = ".dlss5oneclick-orig";
 pub const RHI_RELEASES: &str =
     "https://api.github.com/repos/RankFTW/rhi-repo/releases?per_page=100";
 pub const RHI_REPO: &str = "RankFTW/rhi-repo";
@@ -360,6 +409,14 @@ const STEP_DLSSNR_ONLY: Step = Step {
 const STEP_BRIDGE: Step = Step {
     name: "DLSS 5 DX11 bridge",
     run: step_bridge,
+};
+const STEP_REMIX: Step = Step {
+    name: "DLSS 5 into the RTX Remix runtime",
+    run: step_remix,
+};
+const STEP_REMIX_SWAP: Step = Step {
+    name: "Swap in a DLSS 5-capable Remix runtime",
+    run: step_remix_swap,
 };
 const STEP_UPSTREAM: Step = Step {
     name: "Neural Upstream add-on (experimental)",
@@ -710,9 +767,22 @@ pub struct Extras {
     /// (`[DlssNr] WorkingScale`; cost falls with its square). `None` leaves the
     /// OptiScaler default (1.0, full).
     pub model_scale: Option<f32>,
+    /// Remix route: replace a runtime that has no neural pass with a DLSS
+    /// 5-capable community one (originals backed up; experimental).
+    pub remix_swap: bool,
 }
 
 pub fn plan_with(st: &GameStatus, engine: Engine, x: Extras) -> Vec<Step> {
+    // A Remix game takes the Remix route regardless of engine: the neural pass
+    // lives inside the mod's runtime, so there is no ReShade/OptiScaler here.
+    if st.remix.is_some() {
+        let mut v = Vec::new();
+        if x.remix_swap {
+            v.push(STEP_REMIX_SWAP); // swap the runtime first, then feed the new one
+        }
+        v.push(STEP_REMIX);
+        return v;
+    }
     let mut v = if engine == Engine::Opti {
         // Only games with native DLSS: the NR pass reads the inputs the game
         // hands to DLSS. Callers gate on mode; return the plan regardless so
@@ -1524,6 +1594,89 @@ fn step_upstream(
     Ok(vec![game::UPSTREAM_ADDON.into()])
 }
 
+// ── RTX Remix: model into .trex + one rtx.conf line ─────────────────
+
+fn step_remix(
+    client: &Client,
+    st: &GameStatus,
+    work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    let trex = st
+        .remix
+        .as_ref()
+        .ok_or_else(|| anyhow!("not an RTX Remix game (no .trex runtime found)"))?;
+    let mut out = Vec::new();
+
+    // 1. The DLSS 5 model, inside the .trex folder, refreshed by tag marker.
+    let dest = game::join_ci(trex, &[game::DLSSNR_DLL]);
+    let (tag, url) = rhi_latest(client, "dlssnr-")?;
+    let marker = trex.join(REMIX_MARKER);
+    let current = st.remix_model
+        && fs::read_to_string(&marker)
+            .map(|t| t.trim() == tag)
+            .unwrap_or(false);
+    if current {
+        out.push(format!("{} already current ({tag})", game::DLSSNR_DLL));
+    } else {
+        let z = work.join(format!("remix-{tag}.zip"));
+        net::download(client, &url, &z, game::DLSSNR_DLL, progress)?;
+        install_single_from_zip(&z, game::DLSSNR_DLL, &dest)?;
+        if let Err(e) = validate_dlssnr(&dest) {
+            let _ = fs::remove_file(&dest);
+            return Err(e);
+        }
+        fs::write(&marker, tag.as_bytes())?;
+        out.push(format!("{}/{} ({tag})", ".trex", game::DLSSNR_DLL));
+    }
+
+    // 2. Turn the neural pass on in rtx.conf — which key depends on the fork.
+    let flavour = crate::remix::flavour(trex);
+    match flavour.enable_key() {
+        Some(key) => {
+            let conf = crate::remix::conf_path(trex);
+            let text = fs::read_to_string(&conf).unwrap_or_default();
+            let patched = crate::remix::set_option(&text, key, "True");
+            if patched != text {
+                fs::write(&conf, &patched)?;
+                out.push(format!("{key} = True in rtx.conf"));
+            } else {
+                out.push(format!("{key} already on"));
+            }
+        }
+        None => out.push(
+            "this Remix runtime ships no neural pass — reinstall with the runtime swap on \
+             (--remix-swap) to replace it with a DLSS 5-capable one"
+                .to_owned(),
+        ),
+    }
+    Ok(out)
+}
+
+fn step_remix_swap(
+    client: &Client,
+    st: &GameStatus,
+    _work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    let trex = st
+        .remix
+        .as_ref()
+        .ok_or_else(|| anyhow!("not an RTX Remix game (no .trex runtime found)"))?;
+    let mut out = Vec::new();
+    for name in REMIX_RUNTIME_ASSETS {
+        let dest = game::join_ci(trex, &[name]);
+        let bak = dest.with_file_name(format!("{name}{REMIX_ORIG}"));
+        // Keep the original once, so uninstall can put the mod's runtime back.
+        if dest.is_file() && !bak.exists() {
+            fs::copy(&dest, &bak)?;
+        }
+        net::download(client, &format!("{REMIX_RUNTIME_LATEST}{name}"), &dest, name, progress)?;
+        out.push(format!(".trex/{name} (DLSS 5 Remix runtime)"));
+    }
+    Ok(out)
+}
+
 // ── step 6: config ─────────────────────────────────────────────────
 
 fn step_config(_c: &Client, st: &GameStatus, _w: &Path, progress: Progress) -> Result<Vec<String>> {
@@ -1609,26 +1762,30 @@ pub fn run_all_with(
     if !st.problems.is_empty() {
         bail!("{}", st.problems.join("\n"));
     }
-    if engine == Engine::ReShade {
-        if let Some(p) = st.reshade_engine_problem() {
-            bail!("{p}");
+    // The engine constraints below are for the ReShade/OptiScaler routes; a
+    // Remix game bypasses them entirely (its plan is the Remix route).
+    if st.remix.is_none() {
+        if engine == Engine::ReShade {
+            if let Some(p) = st.reshade_engine_problem() {
+                bail!("{p}");
+            }
         }
-    }
-    if x.upstream && (engine != Engine::ReShade || st.mode != game::Mode::Native) {
-        bail!(
-            "Neural Upstream runs the network on the colour buffer the game hands its own DLSS, so it needs a game with DLSS of its own on the ReShade engine. This game has none - use the stable ReShade add-on."
-        );
-    }
-    if engine == Engine::Opti && st.is32() {
-        bail!("The OptiScaler engine is 64-bit only; a 32-bit game takes the Feeder path.");
-    }
-    if engine == Engine::Opti && st.mode != game::Mode::Feeder {
-        // fine: native DLSS present
-    } else if engine == Engine::Opti {
-        bail!(
-            "The OptiScaler engine needs a game with its own DLSS (its Neural Rendering pass \
-             reads the inputs the game hands to DLSS). This game has none — use the ReShade engine."
-        );
+        if x.upstream && (engine != Engine::ReShade || st.mode != game::Mode::Native) {
+            bail!(
+                "Neural Upstream runs the network on the colour buffer the game hands its own DLSS, so it needs a game with DLSS of its own on the ReShade engine. This game has none - use the stable ReShade add-on."
+            );
+        }
+        if engine == Engine::Opti && st.is32() {
+            bail!("The OptiScaler engine is 64-bit only; a 32-bit game takes the Feeder path.");
+        }
+        if engine == Engine::Opti && st.mode != game::Mode::Feeder {
+            // fine: native DLSS present
+        } else if engine == Engine::Opti {
+            bail!(
+                "The OptiScaler engine needs a game with its own DLSS (its Neural Rendering pass \
+                 reads the inputs the game hands to DLSS). This game has none — use the ReShade engine."
+            );
+        }
     }
     let client = net::client()?;
     let work = tempfile::Builder::new()
@@ -1683,6 +1840,11 @@ pub fn run_all_with(
 /// Remove everything this tool places except ReShade itself and nvngx_dlss.dll.
 pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
     let d = exe.parent().context("exe has no parent")?;
+    // A Remix game has none of the ReShade/feeder layout: its install is the
+    // model and marker inside `.trex/`, the rtx.conf line, and any runtime swap.
+    if let Some(trex) = crate::remix::find_runtime(d) {
+        return uninstall_remix(&trex);
+    }
     let shaders = game::join_ci(d, &["reshade-shaders", "Shaders"]);
     let include = game::join_ci(&shaders, &["include"]);
     let mut targets: Vec<PathBuf> = vec![
@@ -1804,6 +1966,10 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
 pub fn uninstall_all(exe: &Path) -> Result<(Vec<String>, Option<String>)> {
     let mut removed = uninstall(exe)?;
     let d = exe.parent().context("exe has no parent")?;
+    // A Remix game has no ReShade to also remove; uninstall() already did it all.
+    if crate::remix::find_runtime(d).is_some() {
+        return Ok((removed, None));
+    }
 
     let mut foreign: Vec<String> = Vec::new();
     if let Ok(rd) = fs::read_dir(d) {
@@ -1957,6 +2123,74 @@ mod tests {
             .map(|s| s.name)
             .collect();
         assert!(!off.contains(&STEP_OPTI_FG.name));
+    }
+
+    #[test]
+    fn uninstall_remix_removes_model_and_reverts_conf_and_swap() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe(&d.join("game.exe"), game::PE_X64);
+        let trex = d.join(".trex");
+        std::fs::create_dir_all(&trex).unwrap();
+        std::fs::write(trex.join("d3d9.dll"), b"swapped runtime").unwrap();
+        // A backup of the mod's own runtime, as a swap would have left.
+        std::fs::write(trex.join(format!("d3d9.dll{REMIX_ORIG}")), b"mod original").unwrap();
+        std::fs::write(trex.join(game::DLSSNR_DLL), b"model").unwrap();
+        std::fs::write(trex.join(REMIX_MARKER), b"dlssnr-310.8.SF").unwrap();
+        std::fs::write(
+            d.join("rtx.conf"),
+            "rtx.a = 1\nrtx.neuralUplift.enable = True\n",
+        )
+        .unwrap();
+
+        let removed = uninstall(&exe).unwrap();
+        // Model + marker gone; the mod's own runtime restored; enable line gone.
+        assert!(!trex.join(game::DLSSNR_DLL).is_file());
+        assert!(!trex.join(REMIX_MARKER).is_file());
+        assert!(!trex.join(format!("d3d9.dll{REMIX_ORIG}")).is_file());
+        assert_eq!(std::fs::read(trex.join("d3d9.dll")).unwrap(), b"mod original");
+        let conf = std::fs::read_to_string(d.join("rtx.conf")).unwrap();
+        assert_eq!(conf, "rtx.a = 1\n");
+        assert!(removed.iter().any(|r| r.contains("nvngx_dlssnr.dll")));
+    }
+
+    #[test]
+    fn remix_game_plans_the_remix_route_regardless_of_engine() {
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe(&d.join("game.exe"), game::PE_X64);
+        std::fs::create_dir_all(d.join(".trex")).unwrap();
+        std::fs::write(d.join(".trex").join("d3d9.dll"), b"stub runtime").unwrap();
+        let st = game::inspect(&exe).unwrap();
+        assert!(st.remix.is_some());
+        // The engine is ignored: both give the Remix route.
+        for engine in [Engine::ReShade, Engine::Opti] {
+            let names: Vec<&str> = plan_with(&st, engine, Extras::default())
+                .iter()
+                .map(|s| s.name)
+                .collect();
+            assert_eq!(names, ["DLSS 5 into the RTX Remix runtime"]);
+        }
+        // With the swap on, the runtime is replaced first, then fed.
+        let names: Vec<&str> = plan_with(
+            &st,
+            Engine::ReShade,
+            Extras {
+                remix_swap: true,
+                ..Default::default()
+            },
+        )
+        .iter()
+        .map(|s| s.name)
+        .collect();
+        assert_eq!(
+            names,
+            [
+                "Swap in a DLSS 5-capable Remix runtime",
+                "DLSS 5 into the RTX Remix runtime"
+            ]
+        );
     }
 
     #[test]

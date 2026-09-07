@@ -137,6 +137,8 @@ pub struct App {
     fg_on: bool,
     /// OptiScaler engine: model resolution as a percent of native (100 = off).
     opti_scale_pct: u32,
+    /// Remix route: replace a runtime that has no neural pass.
+    remix_swap_on: bool,
     renodx: RenodxLookup,
     renodx_rx: Option<Receiver<RenodxLookup>>,
     /// Exe the current lookup belongs to, so a refresh does not re-fetch.
@@ -235,6 +237,7 @@ impl App {
             upstream_on: false,
             fg_on: false,
             opti_scale_pct: 100,
+            remix_swap_on: false,
             renodx: RenodxLookup::Idle,
             renodx_rx: None,
             renodx_for: None,
@@ -312,6 +315,7 @@ impl App {
             self.mfg_on = false;
             self.fg_on = false;
             self.opti_scale_pct = 100;
+            self.remix_swap_on = false;
             self.start_renodx_lookup();
         }
     }
@@ -354,6 +358,7 @@ impl App {
             with_fg: self.fg_on,
             model_scale: (self.opti_scale_pct < 100)
                 .then(|| self.opti_scale_pct as f32 / 100.0),
+            remix_swap: self.remix_swap_on,
         };
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
         self.rx = Some(rx);
@@ -1029,6 +1034,20 @@ const TILE_UPSTREAM: Tile = Tile {
     optional: false,
 };
 
+const TILE_REMIX_MODEL: Tile = Tile {
+    title: "DLSS 5 model in .trex",
+    detail: "nvngx_dlssnr.dll placed inside the RTX Remix runtime",
+    ok: |s| s.remix_model,
+    optional: false,
+};
+
+const TILE_REMIX_ON: Tile = Tile {
+    title: "Neural rendering enabled",
+    detail: "rtx.conf \u{00b7} Alt+X \u{2192} Post-Processing \u{2192} Neural Uplift",
+    ok: |s| s.remix_enabled,
+    optional: false,
+};
+
 const TILE_HOST: Tile = Tile {
     title: "host64 helper (32-bit game)",
     detail: "dlss5-feed-host64.exe + 64-bit ReShade · add-on and models live in host64\\",
@@ -1065,6 +1084,10 @@ fn tiles_for(
     upstream_on: bool,
 ) -> Vec<&'static Tile> {
     let mut v = base_tiles(st, engine, upstream_on);
+    // A Remix game's status is only the two Remix tiles.
+    if st.is_some_and(|s| s.remix.is_some()) {
+        return v;
+    }
     if st.is_some_and(|s| s.re_engine) {
         v.insert(0, &TILE_REFRAMEWORK);
     }
@@ -1081,6 +1104,9 @@ fn tiles_for(
 }
 
 fn base_tiles(st: Option<&GameStatus>, engine: Engine, upstream_on: bool) -> Vec<&'static Tile> {
+    if st.is_some_and(|s| s.remix.is_some()) {
+        return vec![&TILE_REMIX_MODEL, &TILE_REMIX_ON];
+    }
     match st.map(|s| s.mode) {
         Some(game::Mode::Native) if engine == Engine::Opti || st.is_some_and(|s| s.opti) => {
             vec![&TILES_NATIVE[0], &TILE_OPTI, &TILES_NATIVE[2]]
@@ -2709,6 +2735,33 @@ impl eframe::App for App {
                         };
                         ui.label(RichText::new(note).font(t::plex(11.0)).color(t::TEXT_DIM));
                     });
+                }
+
+                // ── RTX Remix route (overrides the engine choice) ────
+                if ok_status.as_ref().is_some_and(|s| s.remix.is_some()) {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(
+                            RichText::new("RTX REMIX")
+                                .font(t::plex_semibold(11.0))
+                                .color(t::TEXT_MUTED),
+                        );
+                        ui.label(
+                            RichText::new("— DLSS 5 goes into the .trex runtime; the engine choice above does not apply. In game: Alt+X → Post-Processing → enable Neural Uplift.")
+                                .font(t::plex(11.0))
+                                .color(t::TEXT_DIM),
+                        );
+                    });
+                    let cb = egui::Checkbox::new(
+                        &mut self.remix_swap_on,
+                        RichText::new("Swap the Remix runtime for a DLSS 5-capable one")
+                            .font(t::plex(12.0))
+                            .color(t::TEXT_SOFT),
+                    );
+                    ui.add_enabled(!self.running, cb).on_hover_text(
+                        "Only when the installed Remix runtime has no neural pass. Replaces .trex/d3d9.dll with lunks/dxvk-remix-plus-dlssnr (the original is backed up). Experimental — it can undo a mod's own fixes.",
+                    );
+                    ui.add_space(4.0);
                 }
 
                 // ── actions ───────────────────────────────────────

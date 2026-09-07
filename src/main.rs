@@ -13,6 +13,7 @@ mod mfg;
 mod net;
 mod ngx;
 mod platform;
+mod remix;
 mod renodx;
 mod reshade_ini;
 mod text;
@@ -24,7 +25,7 @@ use std::path::PathBuf;
 
 /// `dlss5oneclick <GAME.exe | game folder | game name | appid> [--remove | --remove-all |
 /// --check | --diagnose | --engine=opti | --renodx | --mfg | --upstream | --fg |
-/// --model-res=25..100 | --imports |
+/// --model-res=25..100 | --remix-swap | --imports |
 /// --ignore-anticheat | --mode=feeder|native | --bridge |
 /// --launch-options | --revert-launch-options] | --list-games | --update` runs headless;
 /// no args opens the GUI.
@@ -182,6 +183,7 @@ error: {e:#}"
                     .iter()
                     .find_map(|a| a.strip_prefix("--model-res="))
                     .and_then(parse_model_res),
+                remix_swap: args.iter().any(|a| a == "--remix-swap"),
             },
             if args.iter().any(|a| a == "--revert-launch-options") {
                 Some(true)
@@ -397,6 +399,7 @@ struct Choice {
     upstream: bool,
     with_fg: bool,
     model_scale: Option<f32>,
+    remix_swap: bool,
 }
 
 /// `--model-res=N` (N a percent, 25–100) → the `WorkingScale` fraction the
@@ -422,6 +425,7 @@ fn cli(
         upstream,
         with_fg,
         model_scale,
+        remix_swap,
     } = choice;
     let extras = installer::Extras {
         with_renodx,
@@ -429,6 +433,7 @@ fn cli(
         upstream,
         with_fg,
         model_scale,
+        remix_swap,
     };
     let (exe, candidates) = match game::resolve_target(&target) {
         Ok(v) => v,
@@ -511,6 +516,12 @@ fn cli(
                     .map(|s| s.name)
                     .collect();
                 println!("  plan: {}", names.join(" -> "));
+                if let Some(trex) = &st.remix {
+                    println!(
+                        "  RTX Remix game: DLSS 5 installs into {} (mode/engine do not apply). In game: Alt+X -> Post-Processing -> Neural Uplift.",
+                        trex.display()
+                    );
+                }
                 if st.mode == game::Mode::Native
                     && st.api == game::Api::Unknown
                     && !st.needs_bridge()
