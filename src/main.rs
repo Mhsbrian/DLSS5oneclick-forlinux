@@ -15,6 +15,7 @@ mod ngx;
 mod platform;
 mod remix;
 mod renodx;
+mod report;
 mod reshade_ini;
 mod text;
 mod theme;

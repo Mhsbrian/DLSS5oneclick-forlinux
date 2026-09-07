@@ -346,20 +346,66 @@ impl App {
         }
     }
 
+    /// The install options selected in the UI.
+    fn extras(&self) -> installer::Extras {
+        installer::Extras {
+            with_renodx: self.renodx_on,
+            with_mfg: self.mfg_on,
+            upstream: self.upstream_on,
+            with_fg: self.fg_on,
+            model_scale: (self.opti_scale_pct < 100).then(|| self.opti_scale_pct as f32 / 100.0),
+            remix_swap: self.remix_swap_on,
+        }
+    }
+
+    /// Open a GitHub issue for this fork, prefilled with the current game's
+    /// version, card, driver, route, last diagnosis and log tails. Nothing is
+    /// sent — the browser opens the page and the user edits and submits it.
+    fn open_bug_report(&self) {
+        let Some(exe) = self.exe() else { return };
+        let Ok(st) = game::inspect(&exe) else { return };
+        let dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
+        let gpu = st
+            .gpu
+            .as_ref()
+            .map(|(g, t)| format!("{} [{}]", g.name, t.label()))
+            .unwrap_or_default();
+        let route = installer::plan_with(&st, self.engine, self.extras())
+            .iter()
+            .map(|s| s.name)
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        let diagnosis = diagnose::run_full(&exe)
+            .map(|fs| fs.iter().map(|f| text::tidy(&f.text)).collect())
+            .unwrap_or_default();
+        let logs = ["ReShade.log", "dlss5-feed.log", "OptiScaler.log"]
+            .iter()
+            .filter_map(|n| {
+                crate::report::tail(&game::join_ci(&dir, &[n]), 25).map(|t| (n.to_string(), t))
+            })
+            .collect();
+        let r = crate::report::Report {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            game: exe
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            gpu,
+            driver: crate::gpu::driver_for_pin().unwrap_or_default(),
+            api: st.api.label().to_string(),
+            route,
+            diagnosis,
+            logs,
+        };
+        open_url(&r.url());
+    }
+
     fn start(&mut self, remove: Option<bool>) {
         let Some(exe) = self.exe() else { return };
         self.finishing_install = remove.is_none();
         self.launch_panel = None;
         let engine = self.engine;
-        let extras = installer::Extras {
-            with_renodx: self.renodx_on,
-            with_mfg: self.mfg_on,
-            upstream: self.upstream_on,
-            with_fg: self.fg_on,
-            model_scale: (self.opti_scale_pct < 100)
-                .then(|| self.opti_scale_pct as f32 / 100.0),
-            remix_swap: self.remix_swap_on,
-        };
+        let extras = self.extras();
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
         self.rx = Some(rx);
         self.running = true;
@@ -2817,6 +2863,22 @@ impl eframe::App for App {
                         let ctx = ui.ctx().clone();
                         self.open_compare(&ctx);
                     }
+                    let bug = egui::Button::new(
+                        RichText::new("Report a bug").font(t::plex_medium(13.0)).color(t::TEXT_OFF),
+                    )
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::new(1.0, t::BORDER_STRONG))
+                    .corner_radius(CornerRadius::same(8))
+                    .min_size(Vec2::new(110.0, 42.0));
+                    if ui
+                        .add_enabled(ok_status.is_some() && !self.running, bug)
+                        .on_hover_text(
+                            "Opens a GitHub issue already filled in with your version, card, driver, game, route, the last diagnosis and log tails. Nothing is sent — you edit it in the browser and submit.",
+                        )
+                        .clicked()
+                    {
+                        self.open_bug_report();
+                    }
                     if cfg!(target_os = "linux") {
                         let lo = egui::Button::new(
                             RichText::new("Launch options").font(t::plex_medium(13.0)).color(t::TEXT_OFF),
@@ -2978,16 +3040,22 @@ Remove incl. ReShade also deletes ReShade (dxgi.dll, ini files, reshade-shaders)
 /// Reveal a folder in the desktop file manager (Linux `xdg-open`; the platform
 /// opener elsewhere). Best-effort — a failure is not worth interrupting for.
 fn open_folder(path: &Path) -> std::io::Result<()> {
+    open_external(path.as_os_str())
+}
+
+/// Open a URL in the default browser (best-effort).
+fn open_url(url: &str) {
+    let _ = open_external(std::ffi::OsStr::new(url));
+}
+
+fn open_external(arg: &std::ffi::OsStr) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     let program = "xdg-open";
     #[cfg(target_os = "macos")]
     let program = "open";
     #[cfg(target_os = "windows")]
     let program = "explorer";
-    std::process::Command::new(program)
-        .arg(path)
-        .spawn()
-        .map(|_| ())
+    std::process::Command::new(program).arg(arg).spawn().map(|_| ())
 }
 
 pub fn run() -> eframe::Result {
