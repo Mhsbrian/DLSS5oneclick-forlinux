@@ -1106,9 +1106,15 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
                 // which is an ordinary PE (#16). Anything that is not really a
                 // PE is dropped by the bitness read further down, so widening
                 // the extension costs nothing.
+                let name = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
                 if p.extension()
                     .is_some_and(|x| x.eq_ignore_ascii_case("exe") || x.eq_ignore_ascii_case("bin"))
                     && p.is_file()
+                    && name != HOST_EXE.to_ascii_lowercase()
                 {
                     found.push(p);
                 }
@@ -1134,6 +1140,12 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
                 | "commonredist"
                 | "redist"
                 | "redistributables"
+                // Our own 32-bit helper lives here. It is a 64-bit PE, so the
+                // "prefer 64-bit" rule ranked it above the real 32-bit game and
+                // the next Install treated the game as 64-bit — writing a
+                // 64-bit ReShade into a 32-bit game's folder, which the game
+                // cannot load, so the Home key did nothing (#69).
+                | HOST_DIR
         ) || n.ends_with("_data")
     };
     // Down to four levels, which is where games actually put the launch exe:
@@ -1539,6 +1551,26 @@ mod tests {
     /// Max Payne is a 32-bit game and has no 64-bit exe at all; picking the
     /// folder used to find nothing, so it only worked when the exe was chosen
     /// by hand (#17). The feeder drives 32-bit games through its host64 helper.
+    /// After one install a 32-bit game folder contains host64\dlss5-feed-host64.exe,
+    /// which is a 64-bit PE. The scan ranked it above the real 32-bit game exe,
+    /// so the next Install wrote a 64-bit ReShade into a 32-bit game's folder and
+    /// the game silently stopped loading it (#69).
+    #[test]
+    fn our_own_host_helper_is_never_the_game() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("Grand Theft Auto IV");
+        let host = d.join(HOST_DIR);
+        fs::create_dir_all(&host).unwrap();
+        let game = make_pe(&d.join("GTAIV.exe"), PE_X86);
+        make_pe(&host.join(HOST_EXE), PE_X64);
+
+        let found = find_game_exes(&d);
+        assert_eq!(found, vec![game.clone()], "{found:?}");
+        let (exe, _) = resolve_target(&d).unwrap();
+        assert_eq!(exe, game);
+        assert_eq!(exe_bitness(&exe).unwrap(), 32);
+    }
+
     #[test]
     fn find_game_exes_falls_back_to_32bit_when_no_64bit_exists() {
         let t = tempfile::tempdir().unwrap();

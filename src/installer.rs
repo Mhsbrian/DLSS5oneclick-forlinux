@@ -1426,9 +1426,13 @@ fn step_reshade(
             game::RESHADE_PROXY
         );
     }
+    // A proxy of the wrong bitness is invisible from inside the game: the
+    // loader simply does not load it, ReShade writes no log, and the Home key
+    // does nothing. Whatever the marker says, that one gets replaced (#69).
+    let wrong_bitness = st.reshade && game::exe_bitness(&proxy).is_ok_and(|b| b != st.bitness);
     progress(0, "Looking up latest ReShade");
     let (ver, url) = resolve_reshade_setup(client)?;
-    if st.reshade {
+    if st.reshade && !wrong_bitness {
         // Only a copy this tool placed is refreshed; a user's own ReShade stays.
         match fs::read_to_string(d.join(game::RESHADE_MARKER)) {
             Ok(mine) if mine.trim() == ver => {
@@ -1444,8 +1448,26 @@ fn step_reshade(
     }
     let setup = work.join(format!("ReShade_Setup_{ver}_Addon.exe"));
     net::download(client, &url, &setup, "ReShade", progress)?;
-    let out = install_reshade_from_setup(&setup, d, st.bitness, game::RESHADE_PROXY)?;
+    let mut out = install_reshade_from_setup(&setup, d, st.bitness, game::RESHADE_PROXY)?;
     fs::write(d.join(game::RESHADE_MARKER), ver.as_bytes())?;
+    if wrong_bitness {
+        out.push(format!(
+            "{} was {}-bit in a {}-bit game and has been replaced",
+            game::RESHADE_PROXY,
+            if st.bitness == 32 { 64 } else { 32 },
+            st.bitness
+        ));
+        // The 64-bit add-on cannot belong to a 32-bit game either; it came from
+        // the same mistaken install and ReShade would keep trying to load it.
+        let stray = d.join(game::FEEDER_ADDON);
+        if st.is32() && stray.is_file() {
+            fs::remove_file(&stray)?;
+            out.push(format!(
+                "{} removed (64-bit add-on in a 32-bit game)",
+                game::FEEDER_ADDON
+            ));
+        }
+    }
     Ok(out)
 }
 
