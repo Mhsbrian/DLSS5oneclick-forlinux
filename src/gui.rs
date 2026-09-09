@@ -2266,27 +2266,36 @@ impl eframe::App for App {
                         {
                             ui.ctx().open_url(egui::OpenUrl::new_tab(KOFI_URL));
                         }
-                        chip(
-                            ui,
-                            concat!("v", env!("CARGO_PKG_VERSION")),
-                            t::TEXT_DIM,
-                            false,
-                        );
-                        chip(ui, "LEAKED BUILD", t::ACCENT, true);
-                        let (r, _) =
-                            ui.allocate_exact_size(Vec2::new(64.0, 20.0), egui::Sense::hover());
-                        ui.painter().circle_filled(
-                            r.left_center() + Vec2::new(5.0, 0.0),
-                            3.5,
-                            t::ACCENT,
-                        );
-                        ui.painter().text(
-                            r.left_center() + Vec2::new(14.0, 0.0),
-                            egui::Align2::LEFT_CENTER,
-                            "Ready",
-                            t::plex_semibold(12.0),
-                            t::TEXT,
-                        );
+                        // In a narrow window these used to be drawn over the
+                        // page tabs — "About" and "Ready" on the same pixels.
+                        // Decoration goes first, the tabs stay reachable (#64).
+                        if ui.available_width() > 90.0 {
+                            chip(
+                                ui,
+                                concat!("v", env!("CARGO_PKG_VERSION")),
+                                t::TEXT_DIM,
+                                false,
+                            );
+                        }
+                        if ui.available_width() > 130.0 {
+                            chip(ui, "LEAKED BUILD", t::ACCENT, true);
+                        }
+                        if ui.available_width() > 64.0 {
+                            let (r, _) =
+                                ui.allocate_exact_size(Vec2::new(64.0, 20.0), egui::Sense::hover());
+                            ui.painter().circle_filled(
+                                r.left_center() + Vec2::new(5.0, 0.0),
+                                3.5,
+                                t::ACCENT,
+                            );
+                            ui.painter().text(
+                                r.left_center() + Vec2::new(14.0, 0.0),
+                                egui::Align2::LEFT_CENTER,
+                                "Ready",
+                                t::plex_semibold(12.0),
+                                t::TEXT,
+                            );
+                        }
                     });
                 });
             });
@@ -2477,7 +2486,12 @@ impl eframe::App for App {
                         return;
                     }
                     Page::Settings => {
-                        self.settings_page(ui);
+                        // Same fix Setup got: on a 768 px screen the Save /
+                        // Apply / Reset row is below the edge, and there was no
+                        // way to reach it (#64).
+                        egui::ScrollArea::both()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| self.settings_page(ui));
                         return;
                     }
                     Page::About => {
@@ -2521,12 +2535,15 @@ impl eframe::App for App {
                 }
                 // Everything below scrolls: on a 768 px-tall screen the button row
                 // and the log fell off the bottom with no way to reach them (#64).
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::both()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 12.0;
-                // The setup panel was designed at 720 px; keep it from stretching.
+                // The setup panel was designed at 720 px; keep it from stretching,
+                // and give it that width to lay out in even when the window is
+                // narrower — the scroll area is what makes the rest reachable (#64).
                 ui.set_max_width(860.0);
+                ui.set_min_width(720.0);
 
                 // ── path row ──────────────────────────────────────
                 ui.horizontal(|ui| {
@@ -3361,7 +3378,7 @@ pub fn run() -> eframe::Result {
         // title bar are gone, so a 620 px floor left the window unshrinkable there
         // and the buttons unreachable (#64). Everything scrolls now, so this can go
         // as small as the layout itself needs.
-        .with_min_inner_size([880.0, 420.0])
+        .with_min_inner_size([640.0, 420.0])
         .with_title(concat!("DLSS5oneclick ", env!("CARGO_PKG_VERSION")));
     if let Some(icon) = logo::icon_data() {
         viewport = viewport.with_icon(icon);
