@@ -717,6 +717,10 @@ const STEP_FEEDER_CLEANUP: Step = Step {
     name: "Remove DLSS5-Feeder (game has native DLSS)",
     run: step_feeder_cleanup,
 };
+const STEP_DLSS5_CLEANUP: Step = Step {
+    name: "Remove the RenoDX DLSS 5 add-on (Neural Upstream replaces it)",
+    run: step_dlss5_cleanup,
+};
 const STEP_REFRAMEWORK: Step = Step {
     name: "REFramework (RE Engine needs it before ReShade)",
     run: step_reframework,
@@ -1006,6 +1010,7 @@ fn plan_reshade(st: &GameStatus, upstream: bool) -> Vec<Step> {
             // DLSSNR feature and needs only the model beside it, so it takes
             // the RenoDX add-on's place rather than sitting next to it.
             if upstream {
+                v.push(STEP_DLSS5_CLEANUP);
                 v.push(STEP_UPSTREAM);
                 v.push(STEP_DLSSNR_ONLY);
             } else {
@@ -1826,6 +1831,34 @@ fn step_feeder_cleanup(
         100,
         "DLSS5-Feeder removed; the add-on hooks the game's own DLSS",
     );
+    Ok(removed)
+}
+
+/// The plan already declines to *install* the RenoDX add-on on the Neural
+/// Upstream route, but nothing removed one an earlier run had placed. Anyone who
+/// installed once without the box and again with it ends up with both, and
+/// ReShade loads every add-on it finds.
+///
+/// They are not additive. Both detour `NVSDK_NGX_D3D12_CreateFeature` and
+/// `EvaluateFeature`, and both create NGX feature 18 on the same device. The
+/// second create is refused, so the user gets no neural rendering at all rather
+/// than one of the two implementations.
+fn step_dlss5_cleanup(
+    _c: &Client,
+    st: &GameStatus,
+    _w: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    let d = st.game_dir();
+    let mut removed = Vec::new();
+    let f = d.join(game::DLSS5_ADDON);
+    if f.is_file() {
+        fs::remove_file(&f)?;
+        removed.push(game::DLSS5_ADDON.to_owned());
+        progress(100, "RenoDX DLSS 5 add-on removed; Neural Upstream replaces it");
+    } else {
+        progress(100, "no RenoDX DLSS 5 add-on to remove");
+    }
     Ok(removed)
 }
 
