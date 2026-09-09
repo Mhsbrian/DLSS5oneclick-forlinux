@@ -570,6 +570,13 @@ pub fn known_anticheat_exe(exe: &Path) -> Option<&'static str> {
         .to_ascii_lowercase();
     match n.as_str() {
         "overwatch.exe" => Some("Blizzard anti-cheat (Overwatch)"),
+        // Retail WoW has blocked a dxgi.dll override outright (11.1.7.61965,
+        // and again in 11.2.0: "Your 3D accelerator card is not supported"),
+        // and Blizzard's position is that injecting into the render chain is
+        // against its terms whether or not it is blocked that week. A 3.3.5a
+        // private-server client carries the same exe name and its own rules,
+        // so the warning is the same and the override tick is right there (#45).
+        "wow.exe" | "wowclassic.exe" => Some("Blizzard Warden (World of Warcraft)"),
         "valorant.exe" | "valorant-win64-shipping.exe" => Some("Riot Vanguard"),
         "leagueclient.exe" | "league of legends.exe" => Some("Riot Vanguard"),
         _ => None,
@@ -1591,6 +1598,21 @@ mod tests {
         let t2 = tempfile::tempdir().unwrap();
         fs::create_dir_all(t2.path().join("EAAntiCheat")).unwrap();
         assert_eq!(detect_anticheat(t2.path()), Some("EA Javelin Anticheat"));
+    }
+
+    /// Blizzard blocked a dxgi.dll override in retail WoW twice in 2025 and
+    /// treats render-chain injection as a terms violation. Installing into it
+    /// silently is the one outcome worth refusing outright (#45).
+    #[test]
+    fn world_of_warcraft_is_named_before_anything_is_installed() {
+        for n in ["Wow.exe", "WowClassic.exe", "wow.exe"] {
+            assert_eq!(
+                known_anticheat_exe(Path::new(n)),
+                Some("Blizzard Warden (World of Warcraft)"),
+                "{n}"
+            );
+        }
+        assert_eq!(known_anticheat_exe(Path::new("wowzers.exe")), None);
     }
 
     #[test]
