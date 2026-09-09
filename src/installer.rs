@@ -1984,8 +1984,38 @@ fn install_quality() -> ResolvedQuality {
 /// The feed retries three times and stops, before any DLSS create, so the whole
 /// install goes quiet and nothing on screen says why (#74).
 pub fn work_resolution_refused(game_dir: &Path) -> bool {
-    fs::read_to_string(game_dir.join("dlss5-feed.log"))
-        .is_ok_and(|l| l.contains("work-resolution staging SRV failed"))
+    let Ok(log) = fs::read_to_string(game_dir.join("dlss5-feed.log")) else {
+        return false;
+    };
+    if !log.contains("work-resolution staging SRV failed") {
+        return false;
+    }
+    // Feeder 0.15.0 fixed the cause: the staging copy was created in the
+    // backbuffer's exact ..._UNORM_SRGB format and then viewed as ..._UNORM,
+    // which a D3D11 view may not do unless the resource is typeless, so every
+    // reduced work resolution failed on an sRGB swapchain (DLSS5-Feeder#85).
+    // A failure logged by an older build says nothing about the one this very
+    // install is about to put in the folder, so it must not hold the setting
+    // down forever.
+    feeder_log_version(&log).is_none_or(|v| v >= FEEDER_SRGB_FIX)
+}
+
+/// First Feeder release where a reduced work resolution works on an sRGB
+/// swapchain.
+const FEEDER_SRGB_FIX: [u64; 3] = [0, 15, 0];
+
+/// `"HH:MM:SS.mmm  dlss5-feed 0.15.0 (built ...) attached."` -> `[0, 15, 0]`.
+fn feeder_log_version(log: &str) -> Option<[u64; 3]> {
+    let mut it = log.lines().next()?.split_whitespace();
+    it.find(|t| t.starts_with("dlss5-feed"))?;
+    let raw = it.next()?;
+    let mut parts = raw.split(['.', '-']).map(|p| p.parse::<u64>().unwrap_or(0));
+    let v = [
+        parts.next()?,
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    ];
+    raw.chars().next()?.is_ascii_digit().then_some(v)
 }
 
 /// True when this game's own logs say the DLSS 5 add-on faulted inside the
@@ -2582,6 +2612,47 @@ mod tests {
         assert!(!addon.exists());
         // A second run is a no-op rather than an error.
         step_dlss5_cleanup(&c, &st, t.path(), &|_, _| {}).unwrap();
+    }
+
+    /// Feeder 0.15.0 fixed the sRGB staging-view bug that made every reduced
+    /// work resolution fail. A failure logged by an older build must stop
+    /// holding the setting down, or the fix never reaches anyone who hit it
+    /// (DLSS5-Feeder#85).
+    #[test]
+    fn the_work_resolution_hold_expires_with_the_feeder_that_logged_it() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let log = |ver: &str| {
+            fs::write(
+                d.join("dlss5-feed.log"),
+                format!(
+                    "02:08:22.172  dlss5-feed {ver} (built Sep  7 2026 07:47:43) attached.\n\
+                     [feed] work-resolution staging SRV failed\n"
+                ),
+            )
+            .unwrap();
+        };
+
+        log("0.14.0-beta.5");
+        assert!(
+            !work_resolution_refused(d),
+            "an old build's failure is stale"
+        );
+        log("0.15.0");
+        assert!(
+            work_resolution_refused(d),
+            "the fixed build still failing counts"
+        );
+        log("0.16.2");
+        assert!(work_resolution_refused(d));
+
+        // A log with no version line at all is still taken at its word.
+        fs::write(
+            d.join("dlss5-feed.log"),
+            "[feed] work-resolution staging SRV failed\n",
+        )
+        .unwrap();
+        assert!(work_resolution_refused(d));
     }
 
     #[test]

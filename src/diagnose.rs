@@ -66,7 +66,7 @@ fn ngx_init_failure_for(log: &str, exe: Option<&std::path::Path>, out: &mut Vec<
 }
 
 /// Newest Feeder known at build time; only used to nudge users off stale copies.
-const CURRENT_FEEDER: &str = "0.12.0";
+const CURRENT_FEEDER: &str = "0.15.0";
 
 fn version_key(v: &str) -> Vec<u64> {
     v.split(['.', '-'])
