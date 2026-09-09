@@ -1741,8 +1741,11 @@ fn step_dlss5(
     // current add-on build faults in its driver. Fetching that build again just
     // reproduces it, so take the one the host names as passing — unless the
     // user pinned a build themselves, in which case that wins (#69).
-    let auto_classic =
-        std::env::var_os(RENODX_TAG_ENV).is_none() && addon_faulted_in_driver(&cdir) && !st.is32();
+    // A 32-bit game was excluded here for no reason I can defend: its add-on
+    // lives in host64\ and is fetched by this same loop, and its host is the
+    // very thing that prints the verdict. sempie27's GTA IV kept getting v4.7
+    // back while its own log said v4.7 faults on this driver (#69).
+    let auto_classic = std::env::var_os(RENODX_TAG_ENV).is_none() && addon_faulted_in_driver(&cdir);
     if auto_classic {
         std::env::set_var(RENODX_TAG_ENV, RENODX_CLASSIC_TAG);
     }
@@ -2067,9 +2070,15 @@ fn feeder_log_version(log: &str) -> Option<[u64; 3]> {
 /// the machine's own evidence rather than assuming it from a driver number —
 /// the measurement covers 616.64, and newer drivers are untested (#69).
 pub fn addon_faulted_in_driver(consumer_dir: &Path) -> bool {
-    ["dlss5-feed.log", "dlss5-feed-host.log"].iter().any(|n| {
-        fs::read_to_string(consumer_dir.join(n))
-            .is_ok_and(|l| l.contains("is a combination measured to fail"))
+    // On a 32-bit game the feed's log is beside the exe and the host's is in
+    // host64\; on a 64-bit one both are the same folder. Check the pair either
+    // way rather than assuming which layout this is.
+    let dirs = [consumer_dir.to_path_buf(), consumer_dir.join("..")];
+    dirs.iter().any(|d| {
+        ["dlss5-feed.log", "dlss5-feed-host.log"].iter().any(|n| {
+            fs::read_to_string(d.join(n))
+                .is_ok_and(|l| l.contains("is a combination measured to fail"))
+        })
     })
 }
 
@@ -2586,6 +2595,40 @@ mod tests {
     /// handed the same add-on build again. The evidence has to come from the
     /// log, not from a driver number, because the measurement upstream covers
     /// one driver and assumes the rest (#69).
+    /// On a 32-bit game the host writes that verdict into host64\ while the
+    /// feed's own log sits beside the exe. Reading only one folder missed it,
+    /// and the exclusion of 32-bit games on top of that meant GTA IV was handed
+    /// the faulting build every single install (#69).
+    #[test]
+    fn the_driver_verdict_is_found_from_either_side_of_a_32_bit_layout() {
+        let t = tempfile::tempdir().unwrap();
+        let game = t.path();
+        let host = game.join(game::HOST_DIR);
+        fs::create_dir_all(&host).unwrap();
+        assert!(!addon_faulted_in_driver(&host));
+
+        // The host's own log, which is where a 32-bit game records it.
+        fs::write(
+            host.join("dlss5-feed-host.log"),
+            "[host] WARNING: renodx-dlss5 v4.7 with NVIDIA driver 616.64 is a combination \
+             measured to fail\n",
+        )
+        .unwrap();
+        assert!(addon_faulted_in_driver(&host));
+
+        // And the feed's log beside the exe, one level up from the consumer dir.
+        let t2 = tempfile::tempdir().unwrap();
+        let host2 = t2.path().join(game::HOST_DIR);
+        fs::create_dir_all(&host2).unwrap();
+        fs::write(
+            t2.path().join("dlss5-feed.log"),
+            "[feed] WARNING: renodx-dlss5 v4.7 with NVIDIA driver 616.64 is a combination \
+             measured to fail\n",
+        )
+        .unwrap();
+        assert!(addon_faulted_in_driver(&host2));
+    }
+
     #[test]
     fn a_driver_fault_in_the_log_pins_the_classic_addon() {
         let t = tempfile::tempdir().unwrap();
