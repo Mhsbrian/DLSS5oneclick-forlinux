@@ -64,7 +64,7 @@ Adapters = all
 FullScreenOutput = default
 ScalingMode = unspecified
 [DirectX]
-VideoCard = internal3D
+VideoCard = geforce_9800_gt
 VRAM = 4096
 Filtering = appdriven
 Mipmapping = appdriven
@@ -1262,7 +1262,7 @@ fn merge_dgvoodoo_conf(existing: &str) -> String {
 
     if !saw_directx {
         out.push_str("\n[DirectX]\n");
-        out.push_str("VideoCard = internal3D\n");
+        out.push_str("VideoCard = geforce_9800_gt\n");
         out.push_str(&format!("VRAM = {DGVOODOO_VRAM_FLOOR}\n"));
         out.push_str("dgVoodooWatermark = false\n");
         out.push_str("Antialiasing = appdriven\n");
@@ -1549,11 +1549,25 @@ fn step_feeder(
     if st.is32() && host_member.is_none() {
         bail!("DLSS5-Feeder {tag} has no {}", game::HOST_EXE);
     }
+    // The 32-bit halves talk a versioned IPC protocol to each other, and a
+    // mismatch is fatal at runtime: "the game add-on speaks protocol v8, this
+    // host v9 -- the two halves are from different releases" and the host exits
+    // (#69). Sizes cannot see that, so the tag each half was taken from is
+    // recorded and both are replaced unless both markers name this release.
+    let marker_says = |dir: &Path| -> bool {
+        fs::read_to_string(dir.join(game::FEEDER_MARKER)).is_ok_and(|m| m.trim() == tag.as_str())
+    };
+    let halves_agree = !st.is32() || marker_says(&st.consumer_dir());
     let host_current = match &host_member {
         Some(m) => same_size(&mut zip, m, &st.consumer_dir().join(game::HOST_EXE)),
         None => true,
     };
-    if st.feeder && host_current && same_size(&mut zip, &addon, &d.join(addon_name)) {
+    if st.feeder
+        && halves_agree
+        && marker_says(d)
+        && host_current
+        && same_size(&mut zip, &addon, &d.join(addon_name))
+    {
         return Ok(vec![format!("DLSS5-Feeder already current ({tag}{note})")]);
     }
     net::extract_member(&mut zip, &addon, &d.join(addon_name))?;
@@ -1563,6 +1577,9 @@ fn step_feeder(
         let host = st.consumer_dir();
         fs::create_dir_all(&host)?;
         net::extract_member(&mut zip, m, &host.join(game::HOST_EXE))?;
+        // Both halves now carry the tag they came from, so a later install can
+        // tell "same release" from "same size".
+        fs::write(host.join(game::FEEDER_MARKER), tag.as_bytes())?;
         out.push(format!(
             "{}/{} ({tag}{note})",
             game::HOST_DIR,
@@ -2653,6 +2670,38 @@ mod tests {
         )
         .unwrap();
         assert!(work_resolution_refused(d));
+    }
+
+    /// The 32-bit halves talk a versioned protocol; if one is refreshed and the
+    /// other is not, the host exits at startup and nothing says why from inside
+    /// the game. Same size is not the same release (#69).
+    #[test]
+    fn both_thirty_two_bit_halves_carry_the_tag_they_came_from() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let host = d.join(game::HOST_DIR);
+        fs::create_dir_all(&host).unwrap();
+
+        // What an install writes.
+        fs::write(d.join(game::FEEDER_MARKER), b"v0.15.1").unwrap();
+        fs::write(host.join(game::FEEDER_MARKER), b"v0.15.1").unwrap();
+        let agree = |tag: &str| {
+            let says = |dir: &Path| {
+                fs::read_to_string(dir.join(game::FEEDER_MARKER)).is_ok_and(|m| m.trim() == tag)
+            };
+            says(d) && says(&host)
+        };
+        assert!(agree("v0.15.1"));
+
+        // A newer release: neither half is current, so both are replaced.
+        assert!(!agree("v0.16.0"));
+
+        // The failure this fixes: the helper refreshed, the in-game half not.
+        fs::write(host.join(game::FEEDER_MARKER), b"v0.16.0").unwrap();
+        assert!(
+            !agree("v0.16.0"),
+            "a half-updated pair must not look current"
+        );
     }
 
     #[test]

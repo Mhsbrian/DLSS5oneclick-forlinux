@@ -444,6 +444,25 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
         // the add-on's overlay says "HOOKS ARMED - NO DLSS CREATE SEEN" and
         // toggling neural rendering in game does nothing, which reads like the
         // add-on is broken rather than one setting being wrong (#74).
+        // The 32-bit halves talk a versioned protocol. When they disagree the
+        // host exits immediately and the game shows nothing at all (#69).
+        if let Some(line) = fd
+            .lines()
+            .chain(
+                read(&st.consumer_dir(), "dlss5-feed-host.log")
+                    .as_deref()
+                    .unwrap_or("")
+                    .lines(),
+            )
+            .find(|l| l.contains("speaks protocol v") && l.contains("this host v"))
+        {
+            out.push(bad(format!(
+                "The two halves of the 32-bit install are from different releases: {} \
+                 Run Install again — since 0.13.4 both halves are taken from one download and \
+                 each records the release it came from, so this cannot happen silently.",
+                line.trim()
+            )));
+        }
         if fd.contains("work-resolution staging SRV failed") {
             let pct = fd
                 .lines()
