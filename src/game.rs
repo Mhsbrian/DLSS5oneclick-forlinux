@@ -505,7 +505,9 @@ fn dll_mentions_dgvoodoo(b: &[u8]) -> bool {
 /// ReShade add-on injection is exactly what they look for: kicks at best, bans
 /// at worst. Verified file names: EAC `EasyAntiCheat[_EOS]/EasyAntiCheat_EOS_Setup.exe`,
 /// BattlEye `BattlEye/BEService_x64.exe`, `Install_BattlEye.bat`, `*_BE.exe`,
-/// GameGuard `tools/GGSetup.exe` or a `GameGuard` folder.
+/// GameGuard `tools/GGSetup.exe` or a `GameGuard` folder, EA Javelin an
+/// `EAAntiCheat` folder or `EAAntiCheat.GameServiceLauncher.exe/.dll` beside
+/// the exe.
 pub fn detect_anticheat(game_dir: &Path) -> Option<&'static str> {
     fn walk(d: &Path, depth: u8) -> Option<&'static str> {
         let rd = fs::read_dir(d).ok()?;
@@ -526,6 +528,12 @@ pub fn detect_anticheat(game_dir: &Path) -> Option<&'static str> {
                 if n == "gameguard" {
                     return Some("GameGuard");
                 }
+                // EA Javelin is kernel-mode and, by EA's own description, also
+                // guards single-player against tampering — so it is in play even
+                // in a game nobody is competing in (#21).
+                if n == "eaanticheat" {
+                    return Some("EA Javelin Anticheat");
+                }
                 if depth > 0 {
                     if let Some(hit) = walk(&p, depth - 1) {
                         return Some(hit);
@@ -541,6 +549,9 @@ pub fn detect_anticheat(game_dir: &Path) -> Option<&'static str> {
                 }
                 if n == "ggsetup.exe" || n == "gameguard.des" {
                     return Some("GameGuard");
+                }
+                if n.starts_with("eaanticheat") {
+                    return Some("EA Javelin Anticheat");
                 }
             }
         }
@@ -1562,6 +1573,24 @@ mod tests {
         let (exe, all) = resolve_target(&launcher).unwrap();
         assert_eq!(exe, ship);
         assert!(all.contains(&launcher));
+    }
+
+    /// Madden NFL 27 ships EA Javelin, which is kernel-mode and — by EA's own
+    /// description — guards single-player too. NGX then refuses to initialise in
+    /// the game's process (0xBAD00001 on the capability query itself), and the
+    /// tool said nothing about it, so the reporter spent days on reinstalls (#21).
+    #[test]
+    fn ea_javelin_is_detected_by_its_launcher_and_folder() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        assert_eq!(detect_anticheat(d), None);
+
+        fs::write(d.join("EAAntiCheat.GameServiceLauncher.exe"), b"x").unwrap();
+        assert_eq!(detect_anticheat(d), Some("EA Javelin Anticheat"));
+
+        let t2 = tempfile::tempdir().unwrap();
+        fs::create_dir_all(t2.path().join("EAAntiCheat")).unwrap();
+        assert_eq!(detect_anticheat(t2.path()), Some("EA Javelin Anticheat"));
     }
 
     #[test]
