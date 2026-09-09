@@ -477,6 +477,34 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
                 line.trim()
             )));
         }
+        // The create faults inside the driver rather than returning a code. The
+        // feed catches it, cannot retry (the consumer's own locks were skipped
+        // by the unwind), and stops — so the game runs and nothing happens,
+        // with the reason six lines up in a log nobody reads (#76).
+        if fd.contains("CreateFeature raised 0xC0000005") {
+            let stack = fd
+                .lines()
+                .find(|l| l.contains("CreateFeature fault stack"))
+                .map(|l| l.split("(innermost first):").nth(1).unwrap_or(l).trim())
+                .unwrap_or("")
+                .to_owned();
+            let two_modules = fd.contains("two copies of the DLSS NGX module are loaded");
+            let mut t = "The DLSS feature create faulted inside the driver (access violation),                  and the feed stopped: it cannot safely call back in, because the neural                  consumer's own code was on the faulting stack and its locks were skipped by the                  unwind."
+                .to_owned();
+            if !stack.is_empty() {
+                t.push_str(&format!(" Fault stack: {stack}."));
+            }
+            if two_modules {
+                t.push_str(
+                    " The log names the most likely cause: two copies of the DLSS NGX module are \
+                     loaded — the game-local nvngx_dlss.dll and the driver's own _nvngx.dll — and \
+                     the add-on hooks both. Try moving nvngx_dlss.dll out of the game folder (to \
+                     nvngx_dlss.dll.off) and starting the game again WITHOUT re-running Install, \
+                     which would put it back.",
+                );
+            }
+            out.push(bad(t));
+        }
         if fd.contains("work-resolution staging SRV failed") {
             let pct = fd
                 .lines()
@@ -678,6 +706,34 @@ mod tests {
                 .any(|x| x.level == Level::Bad && x.text.contains("No ReShade beside the game exe")),
             "{f:?}"
         );
+    }
+
+    /// A create that faults inside the driver stops the feed for good, and the
+    /// log's own hint about two NGX modules is the actionable part. Neither
+    /// reached the user (#76).
+    #[test]
+    fn a_faulting_feature_create_is_explained_with_its_stack() {
+        let (t, exe) = setup(true);
+        fs::write(
+            t.path().join("ReShade.log"),
+            "Initializing crosire's ReShade\nRegistered add-on \"DLSS 5 Neural Rendering\"\n",
+        )
+        .unwrap();
+        fs::write(
+            t.path().join("dlss5-feed.log"),
+            "[feed] CreateFeature raised 0xC0000005 (reading address 00000000575284C0) (caught; nothing submitted)\n\
+             [feed] CreateFeature fault stack, by module (innermost first): d3d12core.dll <- dxgi.dll <- nvapi64.dll <- nvngx_dlss.dll <- renodx-dlss5.addon64\n\
+             [feed] two copies of the DLSS NGX module are loaded (the game-local nvngx_dlss.dll and the driver's _nvngx.dll)\n",
+        )
+        .unwrap();
+        let f = run(&exe).unwrap();
+        let hit = f
+            .iter()
+            .find(|x| x.text.contains("faulted inside the driver"))
+            .unwrap_or_else(|| panic!("{f:?}"));
+        assert_eq!(hit.level, Level::Bad);
+        assert!(hit.text.contains("d3d12core.dll"), "{}", hit.text);
+        assert!(hit.text.contains("nvngx_dlss.dll.off"), "{}", hit.text);
     }
 
     #[test]
