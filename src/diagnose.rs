@@ -138,6 +138,39 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
         )));
     }
 
+    // ── dgVoodoo's reported VRAM vs what the game was told ─────────
+    // A game that reads VRAM from the adapter and sizes its own pools from it
+    // has to be told the same number, or it sizes for one figure and allocates
+    // against another. GTA IV is the case in hand: with dgVoodoo reporting
+    // 4096 MB and no matching -availablevidmem it black-screens after load,
+    // and with no conf at all it takes dgVoodoo's stock 256 MB and dies with
+    // "TEXP60: Unable to create color render target" (#69).
+    let conf = d.join("dgVoodoo.conf");
+    if conf.is_file() {
+        let vram = fs::read_to_string(&conf).ok().and_then(|t| {
+            t.lines()
+                .filter_map(|l| l.split_once('='))
+                .find(|(k, _)| k.trim().eq_ignore_ascii_case("VRAM"))
+                .and_then(|(_, v)| v.trim().trim_end_matches("MB").trim().parse::<u32>().ok())
+        });
+        let cmdline = d.join("commandline.txt");
+        if let (Some(vram), true) = (vram, cmdline.is_file()) {
+            let text = fs::read_to_string(&cmdline).unwrap_or_default();
+            if !text.to_ascii_lowercase().contains("-availablevidmem") {
+                out.push(warn(format!(
+                    "dgVoodoo reports {vram} MB of video memory and this game reads that number \
+                     to size its own memory pools, but commandline.txt does not set \
+                     -availablevidmem. Add \"-availablevidmem {}\" to commandline.txt — slightly \
+                     below the dgVoodoo figure on purpose, which is what the dgVoodoo guides for \
+                     this engine call for. Without it the game sizes for one number and allocates \
+                     against another, which shows up as a black screen after loading or as \
+                     TEXP60 / TEXP70 at startup.",
+                    vram.saturating_sub(64).max(256)
+                )));
+            }
+        }
+    }
+
     // ── which neural model is installed ────────────────────
     // Two builds of nvngx_dlssnr.dll are in circulation and only the version
     // resource separates them; every failing RTX 50 report so far carries the
@@ -734,6 +767,40 @@ mod tests {
         assert_eq!(hit.level, Level::Bad);
         assert!(hit.text.contains("d3d12core.dll"), "{}", hit.text);
         assert!(hit.text.contains("nvngx_dlss.dll.off"), "{}", hit.text);
+    }
+
+    /// GTA IV reads the adapter's VRAM and sizes its pools from it, so dgVoodoo
+    /// reporting 4096 MB without a matching -availablevidmem is a black screen
+    /// after load, and no conf at all is TEXP60 at startup (#69).
+    #[test]
+    fn dgvoodoo_vram_without_availablevidmem_is_flagged() {
+        let (t, exe) = setup(true);
+        fs::write(
+            t.path().join("ReShade.log"),
+            "Initializing crosire's ReShade\n",
+        )
+        .unwrap();
+        fs::write(t.path().join("dgVoodoo.conf"), "[DirectX]\nVRAM = 4096\n").unwrap();
+        fs::write(t.path().join("commandline.txt"), "-norestrictions\n").unwrap();
+        let f = run(&exe).unwrap();
+        let hit = f
+            .iter()
+            .find(|x| x.text.contains("-availablevidmem"))
+            .unwrap_or_else(|| panic!("{f:?}"));
+        assert_eq!(hit.level, Level::Warn);
+        assert!(hit.text.contains("4096"), "{}", hit.text);
+
+        // Already set: nothing to say.
+        fs::write(
+            t.path().join("commandline.txt"),
+            "-availablevidmem 4032\n-norestrictions\n",
+        )
+        .unwrap();
+        let f = run(&exe).unwrap();
+        assert!(
+            !f.iter().any(|x| x.text.contains("-availablevidmem")),
+            "{f:?}"
+        );
     }
 
     #[test]
