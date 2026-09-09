@@ -1693,7 +1693,21 @@ fn step_dlss5(
     progress(0, "Looking up DLSS 5 add-on releases");
     let cdir = st.consumer_dir();
     fs::create_dir_all(&cdir)?;
+    // This machine has already been told, by the Feeder's own host, that the
+    // current add-on build faults in its driver. Fetching that build again just
+    // reproduces it, so take the one the host names as passing — unless the
+    // user pinned a build themselves, in which case that wins (#69).
+    let auto_classic =
+        std::env::var_os(RENODX_TAG_ENV).is_none() && addon_faulted_in_driver(&cdir) && !st.is32();
+    if auto_classic {
+        std::env::set_var(RENODX_TAG_ENV, RENODX_CLASSIC_TAG);
+    }
     let mut installed = Vec::new();
+    if auto_classic {
+        installed.push(format!(
+            "{RENODX_CLASSIC_TAG}: this game's log reports the newer build faulting in the driver"
+        ));
+    }
     for (prefix, fname, present, marker) in plan {
         let (tag, url) = rhi_latest(client, prefix)?;
         if present {
@@ -1735,6 +1749,11 @@ fn step_dlss5(
             format!("{fname} ({tag})")
         };
         installed.push(shown);
+    }
+    // The pin belongs to this game, not to the session: leaving it set would
+    // quietly hold the next game on the classic build too.
+    if auto_classic {
+        std::env::remove_var(RENODX_TAG_ENV);
     }
     Ok(installed)
 }
@@ -1932,6 +1951,22 @@ fn install_quality() -> ResolvedQuality {
 pub fn work_resolution_refused(game_dir: &Path) -> bool {
     fs::read_to_string(game_dir.join("dlss5-feed.log"))
         .is_ok_and(|l| l.contains("work-resolution staging SRV failed"))
+}
+
+/// True when this game's own logs say the DLSS 5 add-on faulted inside the
+/// driver's NGX runtime.
+///
+/// The Feeder's host prints that verdict itself, having measured it: the neural
+/// evaluate takes an access violation in `D3D12Core.dll` reached through
+/// `nvngx_dlssnr.dll`, so DLSS 5 delivers nothing while everything else keeps
+/// working. It names the classic add-on build as one that passes there. Read
+/// the machine's own evidence rather than assuming it from a driver number —
+/// the measurement covers 616.64, and newer drivers are untested (#69).
+pub fn addon_faulted_in_driver(consumer_dir: &Path) -> bool {
+    ["dlss5-feed.log", "dlss5-feed-host.log"].iter().any(|n| {
+        fs::read_to_string(consumer_dir.join(n))
+            .is_ok_and(|l| l.contains("is a combination measured to fail"))
+    })
 }
 
 pub fn write_feeder_cfg(game_dir: &Path, r: &ResolvedQuality) -> Result<()> {
@@ -2441,6 +2476,42 @@ mod tests {
         let cfg = fs::read_to_string(d.join("dlss5-feed.cfg")).unwrap();
         assert!(cfg.contains("work_resolution=100"), "{cfg}");
         assert!(cfg.contains("work_upscale=0"), "{cfg}");
+    }
+
+    /// A machine whose own log carries the driver-fault verdict must not be
+    /// handed the same add-on build again. The evidence has to come from the
+    /// log, not from a driver number, because the measurement upstream covers
+    /// one driver and assumes the rest (#69).
+    #[test]
+    fn a_driver_fault_in_the_log_pins_the_classic_addon() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        assert!(!addon_faulted_in_driver(d));
+
+        fs::write(
+            d.join("dlss5-feed-host.log"),
+            "[host] WARNING: renodx-dlss5 v4.7 with NVIDIA driver 616.64 is a combination \
+             measured to fail (on 616.64 exactly; anything newer is untested here). The neural \
+             evaluate faults inside the driver's own NGX runtime -- an access violation in \
+             D3D12Core.dll, reached through nvngx_dlssnr.dll\n",
+        )
+        .unwrap();
+        assert!(addon_faulted_in_driver(d));
+
+        // The feed's own log carries the same verdict on a 64-bit game.
+        let d2 = tempfile::tempdir().unwrap();
+        fs::write(
+            d2.path().join("dlss5-feed.log"),
+            "[feed] WARNING: renodx-dlss5 v4.7 with NVIDIA driver 616.64 is a combination \
+             measured to fail\n",
+        )
+        .unwrap();
+        assert!(addon_faulted_in_driver(d2.path()));
+
+        // A healthy log changes nothing.
+        let d3 = tempfile::tempdir().unwrap();
+        fs::write(d3.path().join("dlss5-feed.log"), "[feed] feature ready\n").unwrap();
+        assert!(!addon_faulted_in_driver(d3.path()));
     }
 
     #[test]
