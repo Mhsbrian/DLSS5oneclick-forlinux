@@ -1520,20 +1520,24 @@ impl App {
             p.rect_filled(band, CornerRadius::ZERO, Color32::from_black_alpha(170));
             let mut x = band.left() + 10.0;
             let dlss_label = if m.has_dlss { "DLSS own" } else { "no DLSS" };
+            // A game nothing has been done to has no third state to report, and
+            // an em dash on its own read as a rendering fault rather than as
+            // "not installed" (#77).
             let ready_label = if !m.stale.is_empty() {
-                "stale"
+                Some("stale")
             } else if m.ready {
-                "ready"
+                Some("ready")
             } else if m.installed {
-                "partial"
+                Some("partial")
             } else {
-                "—"
+                None
             };
             for (on, label) in [
-                (m.has_dlss, dlss_label),
-                (m.addon || m.installed, m.engine_path),
+                (m.has_dlss, Some(dlss_label)),
+                (m.addon || m.installed, Some(m.engine_path)),
                 (m.ready && m.stale.is_empty(), ready_label),
             ] {
+                let Some(label) = label else { continue };
                 let cy = band.center().y;
                 p.circle_filled(
                     egui::pos2(x + 3.0, cy),
@@ -2446,7 +2450,12 @@ impl eframe::App for App {
                 )
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
+                        // The button is drawn after the text but sits on top of
+                        // it: reserve its width first, or the wrapped last line
+                        // runs underneath it (#77).
+                        let tip_w = (ui.available_width() - 92.0).max(120.0);
                         ui.vertical(|ui| {
+                            ui.set_max_width(tip_w);
                             ui.label(
                                 RichText::new("Quick tip")
                                     .font(t::plex_semibold(13.0))
@@ -3046,7 +3055,9 @@ impl eframe::App for App {
                             });
                     }
                 }
-                ui.add_space(2.0);
+                // The engine card's own border ended flush against this
+                // heading, which read as the two touching (#77).
+                ui.add_space(12.0);
 
                 // ── component list (status, not controls) ────────
                 ui.label(
