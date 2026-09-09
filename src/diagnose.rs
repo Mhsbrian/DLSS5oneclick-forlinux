@@ -166,6 +166,20 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
     // folder's log for a 32-bit game reads the *feeder's* 32-bit ReShade, which
     // never loads the add-on, so every 32-bit report came back "the add-on
     // never registered" no matter how healthy the install was (#69).
+    // A 32-bit game has two ReShades: the one beside the exe, which the Home key
+    // opens and which loads the feeder, and the 64-bit one in host64\ that hosts
+    // the neural add-on. Reporting only the second leaves "Home does nothing"
+    // unexplained, which is the first thing the player actually notices (#69).
+    if st.is32() && !game::is_reshade_dll(&d.join(game::RESHADE_PROXY)) {
+        out.push(bad(format!(
+            "No ReShade beside the game exe: {} is missing or is not ReShade, so the Home key \
+             opens nothing and the feeder never loads. That is upstream of anything in host64\\. \
+             Run Remove and then Install again, and if it comes back missing, check antivirus \
+             history for {}.",
+            game::RESHADE_PROXY,
+            game::RESHADE_PROXY
+        )));
+    }
     let Some(rs) = rs_log else {
         out.push(bad(if st.is32() {
             "No host64\\ReShade.log: the 64-bit helper's ReShade never loaded, which is what \
@@ -640,6 +654,30 @@ mod tests {
         assert_eq!(hit.level, Level::Bad);
         assert!(hit.text.contains("85%"), "{}", hit.text);
         assert!(hit.text.contains("work_resolution = 100"), "{}", hit.text);
+    }
+
+    /// "Home does nothing" on a 32-bit game means the ReShade beside the exe is
+    /// missing, which is upstream of every host64 finding. Diagnose used to
+    /// report only the host64 side and leave the player looking in the wrong
+    /// folder (#69).
+    #[test]
+    fn thirty_two_bit_missing_game_side_reshade_is_named_first() {
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe(&t.path().join("game.exe"), game::PE_X86);
+        let host = t.path().join(game::HOST_DIR);
+        fs::create_dir_all(&host).unwrap();
+        fs::write(
+            host.join("ReShade.log"),
+            "Initializing crosire's ReShade version '6.8.0'\n",
+        )
+        .unwrap();
+        let f = run(&exe).unwrap();
+        assert!(
+            f.iter()
+                .any(|x| x.level == Level::Bad && x.text.contains("No ReShade beside the game exe")),
+            "{f:?}"
+        );
     }
 
     #[test]
