@@ -1849,13 +1849,15 @@ fn step_dlss5_cleanup(
     _w: &Path,
     progress: Progress,
 ) -> Result<Vec<String>> {
-    let d = st.game_dir();
     let mut removed = Vec::new();
-    let f = d.join(game::DLSS5_ADDON);
+    let f = st.consumer_dir().join(game::DLSS5_ADDON);
     if f.is_file() {
         fs::remove_file(&f)?;
         removed.push(game::DLSS5_ADDON.to_owned());
-        progress(100, "RenoDX DLSS 5 add-on removed; Neural Upstream replaces it");
+        progress(
+            100,
+            "RenoDX DLSS 5 add-on removed; Neural Upstream replaces it",
+        );
     } else {
         progress(100, "no RenoDX DLSS 5 add-on to remove");
     }
@@ -2545,6 +2547,41 @@ mod tests {
         let d3 = tempfile::tempdir().unwrap();
         fs::write(d3.path().join("dlss5-feed.log"), "[feed] feature ready\n").unwrap();
         assert!(!addon_faulted_in_driver(d3.path()));
+    }
+
+    /// Two neural consumers in one folder is not two implementations to choose
+    /// from: both detour the same NGX entry points and create feature 18 on the
+    /// same device, the second create is refused (0xBAD0000B), and the user gets
+    /// neither. Installing once with the default and again with Neural Upstream
+    /// left exactly that (#75).
+    #[test]
+    fn the_upstream_route_removes_the_addon_it_replaces() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe(&t.path().join("game.exe"), game::PE_X64);
+        fs::write(t.path().join(game::DLSS_DLL), b"x").unwrap(); // native DLSS
+        let addon = t.path().join(game::DLSS5_ADDON);
+        fs::write(&addon, b"addon").unwrap();
+        let st = game::inspect(&exe).unwrap();
+
+        // The step is in the plan for that route, and not for the default one.
+        let named = |v: Vec<Step>| -> Vec<&'static str> { v.iter().map(|s| s.name).collect() };
+        let with = named(plan_with(&st, Engine::ReShade, false, true));
+        let without = named(plan_with(&st, Engine::ReShade, false, false));
+        assert!(
+            with.iter().any(|n| n.contains("Remove the RenoDX")),
+            "{with:?}"
+        );
+        assert!(
+            !without.iter().any(|n| n.contains("Remove the RenoDX")),
+            "{without:?}"
+        );
+
+        // And it takes the file out.
+        let c = reqwest::blocking::Client::new();
+        step_dlss5_cleanup(&c, &st, t.path(), &|_, _| {}).unwrap();
+        assert!(!addon.exists());
+        // A second run is a no-op rather than an error.
+        step_dlss5_cleanup(&c, &st, t.path(), &|_, _| {}).unwrap();
     }
 
     #[test]
