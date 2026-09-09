@@ -2069,17 +2069,55 @@ fn feeder_log_version(log: &str) -> Option<[u64; 3]> {
 /// working. It names the classic add-on build as one that passes there. Read
 /// the machine's own evidence rather than assuming it from a driver number —
 /// the measurement covers 616.64, and newer drivers are untested (#69).
+/// Where the driver verdict is remembered once a log has stated it. A game
+/// folder is the wrong place to keep it: Remove empties the folder, a fresh
+/// game has no log yet, and the fault belongs to the driver rather than to any
+/// one game.
+fn driver_fault_flag() -> PathBuf {
+    crate::settings::Settings::path().with_file_name("driver-fault.txt")
+}
+
 pub fn addon_faulted_in_driver(consumer_dir: &Path) -> bool {
+    faulted_in_driver_at(
+        consumer_dir,
+        &driver_fault_flag(),
+        crate::gpu::nvidia_driver(),
+    )
+}
+
+/// The decision itself, with its two pieces of state passed in so a test can
+/// exercise it without touching the machine's own file or its real driver.
+fn faulted_in_driver_at(consumer_dir: &Path, flag: &Path, driver: Option<String>) -> bool {
     // On a 32-bit game the feed's log is beside the exe and the host's is in
     // host64\; on a 64-bit one both are the same folder. Check the pair either
     // way rather than assuming which layout this is.
     let dirs = [consumer_dir.to_path_buf(), consumer_dir.join("..")];
-    dirs.iter().any(|d| {
+    let in_logs = dirs.iter().any(|d| {
         ["dlss5-feed.log", "dlss5-feed-host.log"].iter().any(|n| {
             fs::read_to_string(d.join(n))
                 .is_ok_and(|l| l.contains("is a combination measured to fail"))
         })
-    })
+    });
+    let Some(drv) = driver else {
+        return in_logs;
+    };
+    if in_logs {
+        // Record it against the driver that produced it, so a driver update
+        // retires the verdict by itself.
+        if let Some(dir) = flag.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        let _ = fs::write(flag, drv.as_bytes());
+        return true;
+    }
+    match fs::read_to_string(flag) {
+        Ok(seen) if seen.trim() == drv => true,
+        Ok(_) => {
+            let _ = fs::remove_file(flag);
+            false
+        }
+        Err(_) => false,
+    }
 }
 
 pub fn write_feeder_cfg(game_dir: &Path, r: &ResolvedQuality) -> Result<()> {
@@ -2361,12 +2399,10 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
             targets.push(host.join(game::RESHADE_PROXY));
             targets.push(host.join(game::RESHADE_MARKER));
         }
-        for n in [
-            "ReShade.ini",
-            "ReShade.log",
-            "dlss5-feed-host.log",
-            "ReShadePreset.ini",
-        ] {
+        // The two .log files are evidence, not installed files. Remove used to
+        // delete them, which erased the very verdict the next Install reads to
+        // decide which add-on build this machine can use (#69).
+        for n in ["ReShade.ini", "ReShadePreset.ini"] {
             targets.push(host.join(n));
         }
     }
@@ -2605,7 +2641,9 @@ mod tests {
         let game = t.path();
         let host = game.join(game::HOST_DIR);
         fs::create_dir_all(&host).unwrap();
-        assert!(!addon_faulted_in_driver(&host));
+        let flag = t.path().join("state").join("driver-fault.txt");
+        let faulted = |dir: &Path| faulted_in_driver_at(dir, &flag, Some("616.64".to_owned()));
+        assert!(!faulted(&host));
 
         // The host's own log, which is where a 32-bit game records it.
         fs::write(
@@ -2614,7 +2652,7 @@ mod tests {
              measured to fail\n",
         )
         .unwrap();
-        assert!(addon_faulted_in_driver(&host));
+        assert!(faulted(&host));
 
         // And the feed's log beside the exe, one level up from the consumer dir.
         let t2 = tempfile::tempdir().unwrap();
@@ -2626,14 +2664,55 @@ mod tests {
              measured to fail\n",
         )
         .unwrap();
-        assert!(addon_faulted_in_driver(&host2));
+        assert!(faulted(&host2));
+    }
+
+    /// Remove deletes the game folder's logs, and a fresh game has none yet, so
+    /// a verdict read out of a log has to outlive the folder it was read in.
+    /// sempie27 was told to Remove and Install, which erased the evidence and
+    /// handed him the faulting build again (#69).
+    #[test]
+    fn the_driver_verdict_outlives_the_folder_it_was_read_in() {
+        let t = tempfile::tempdir().unwrap();
+        let host = t.path().join(game::HOST_DIR);
+        fs::create_dir_all(&host).unwrap();
+        let flag = t.path().join("state").join("driver-fault.txt");
+        let drv = || Some("616.64".to_owned());
+
+        assert!(!faulted_in_driver_at(&host, &flag, drv()));
+
+        fs::write(
+            host.join("dlss5-feed-host.log"),
+            "[host] WARNING: renodx-dlss5 v4.7 with NVIDIA driver 616.64 is a combination \
+             measured to fail\n",
+        )
+        .unwrap();
+        assert!(faulted_in_driver_at(&host, &flag, drv()));
+        assert_eq!(fs::read_to_string(&flag).unwrap().trim(), "616.64");
+
+        // Remove empties the folder; the verdict survives it.
+        fs::remove_file(host.join("dlss5-feed-host.log")).unwrap();
+        assert!(
+            faulted_in_driver_at(&host, &flag, drv()),
+            "the verdict must outlive the log"
+        );
+
+        // A driver update retires it, and the stale flag is dropped.
+        assert!(!faulted_in_driver_at(
+            &host,
+            &flag,
+            Some("620.10".to_owned())
+        ));
+        assert!(!flag.is_file());
     }
 
     #[test]
     fn a_driver_fault_in_the_log_pins_the_classic_addon() {
         let t = tempfile::tempdir().unwrap();
         let d = t.path();
-        assert!(!addon_faulted_in_driver(d));
+        let flag = t.path().join("state").join("driver-fault.txt");
+        let faulted = |dir: &Path| faulted_in_driver_at(dir, &flag, Some("616.64".to_owned()));
+        assert!(!faulted(d));
 
         fs::write(
             d.join("dlss5-feed-host.log"),
@@ -2643,7 +2722,7 @@ mod tests {
              D3D12Core.dll, reached through nvngx_dlssnr.dll\n",
         )
         .unwrap();
-        assert!(addon_faulted_in_driver(d));
+        assert!(faulted(d));
 
         // The feed's own log carries the same verdict on a 64-bit game.
         let d2 = tempfile::tempdir().unwrap();
@@ -2653,12 +2732,17 @@ mod tests {
              measured to fail\n",
         )
         .unwrap();
-        assert!(addon_faulted_in_driver(d2.path()));
+        assert!(faulted(d2.path()));
 
         // A healthy log changes nothing.
         let d3 = tempfile::tempdir().unwrap();
         fs::write(d3.path().join("dlss5-feed.log"), "[feed] feature ready\n").unwrap();
-        assert!(!addon_faulted_in_driver(d3.path()));
+        let fresh = t.path().join("state2").join("driver-fault.txt");
+        assert!(!faulted_in_driver_at(
+            d3.path(),
+            &fresh,
+            Some("616.64".to_owned())
+        ));
     }
 
     /// Two neural consumers in one folder is not two implementations to choose
