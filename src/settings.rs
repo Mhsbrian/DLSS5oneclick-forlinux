@@ -1,4 +1,5 @@
-//! Global app settings: `%LOCALAPPDATA%\dlss5oneclick\settings.json`.
+//! Global app settings: `settings.json` under `$XDG_CONFIG_HOME/dlss5oneclick`
+//! (`~/.config/dlss5oneclick`) on Linux, `%LOCALAPPDATA%\dlss5oneclick` on Windows.
 //!
 //! These are **user install defaults**: saved here and applied on new Install
 //! (and optionally "Apply defaults to this game"). They are distinct from
@@ -130,10 +131,7 @@ impl Settings {
     }
 
     pub fn path() -> PathBuf {
-        dirs_local_appdata()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("dlss5oneclick")
-            .join("settings.json")
+        config_base().join("dlss5oneclick").join("settings.json")
     }
 
     pub fn load() -> Self {
@@ -183,8 +181,31 @@ impl Settings {
     }
 }
 
-fn dirs_local_appdata() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+/// Where per-user settings live. Never the working directory: an AppImage or a
+/// desktop entry can start the app with `/` or `$HOME` there, and a write to
+/// the wrong place would be silently lost.
+fn config_base() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    let base = xdg_config_base(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    );
+    #[cfg(not(target_os = "linux"))]
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    base.unwrap_or_else(std::env::temp_dir)
+}
+
+/// `$XDG_CONFIG_HOME` when it is absolute (the spec says relative values are
+/// invalid and must be ignored), else `$HOME/.config`. Pure, so it is tested
+/// without touching the process environment.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn xdg_config_base(
+    xdg: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    xdg.map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| home.map(|h| PathBuf::from(h).join(".config")))
 }
 
 /// Patch cfg text with overlay UX defaults from settings (log_detail, evaluate_stride, …).
@@ -229,6 +250,18 @@ pub fn apply_overlay_to_cfg(cfg: &str, s: &Settings) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn xdg_config_base_prefers_absolute_xdg_then_home() {
+        use super::xdg_config_base;
+        use std::path::PathBuf;
+        let some = |s: &str| Some(std::ffi::OsString::from(s));
+        assert_eq!(xdg_config_base(some("/x/cfg"), some("/home/u")), Some(PathBuf::from("/x/cfg")));
+        // A relative XDG_CONFIG_HOME is invalid per the spec and ignored.
+        assert_eq!(xdg_config_base(some("rel/cfg"), some("/home/u")), Some(PathBuf::from("/home/u/.config")));
+        assert_eq!(xdg_config_base(None, some("/home/u")), Some(PathBuf::from("/home/u/.config")));
+        assert_eq!(xdg_config_base(None, None), None);
+    }
+
     use super::*;
 
     #[test]
