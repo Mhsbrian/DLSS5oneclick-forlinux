@@ -241,7 +241,7 @@ fn meta_from_status(st: &GameStatus, latest: &installer::Latest) -> GameMeta {
             game::Api::Dx10 => "DirectX 10",
             game::Api::Dx11 => "DirectX 11",
             game::Api::Dx12 => "DirectX 12",
-            game::Api::Unknown => "DirectX 12?",
+            game::Api::Unknown => "Unknown",
         },
         has_dlss: st.mode == game::Mode::Native,
         engine_path: if st.opti {
@@ -1619,7 +1619,7 @@ impl App {
             ui.spacing_mut().item_spacing.x = 10.0;
             ui.label(RichText::new("Games").font(t::sora(16.0)).color(t::TEXT));
             let summary = if self.scanning {
-                "scanning Steam, Epic, GOG and Xbox…".to_owned()
+                format!("scanning {LAUNCHERS}…")
             } else {
                 format!("{} found · {dx12} on DirectX 12", self.games.len())
             };
@@ -1811,9 +1811,7 @@ impl App {
                     ui.add_space(40.0);
                     ui.vertical_centered(|ui| {
                         ui.label(
-                            RichText::new(
-                                "No installed games found from Steam, Epic, GOG or Xbox.",
-                            )
+                            RichText::new(format!("No installed games found from {LAUNCHERS}."))
                             .font(t::plex(13.0))
                             .color(t::TEXT_MUTED),
                         );
@@ -2516,8 +2514,12 @@ fn about_page(ui: &mut egui::Ui) {
             "https://github.com/praydog/REFramework",
         ),
         (
-            "Source, issues and releases",
+            "faisalkindi — DLSS5oneclick, the Windows original",
             "https://github.com/faisalkindi/DLSS5oneclick",
+        ),
+        (
+            "Source, issues and releases of this Linux port",
+            "https://github.com/Mhsbrian/DLSS5oneclick-forlinux",
         ),
     ] {
         ui.hyperlink_to(
@@ -2526,6 +2528,12 @@ fn about_page(ui: &mut egui::Ui) {
         );
     }
 }
+
+/// The launchers the Games page reads, as a user would name them.
+#[cfg(target_os = "linux")]
+const LAUNCHERS: &str = "Steam, Heroic and Lutris";
+#[cfg(not(target_os = "linux"))]
+const LAUNCHERS: &str = "Steam, Epic, GOG and Xbox";
 
 impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -2898,11 +2906,17 @@ impl eframe::App for App {
                                     .color(t::TEXT),
                             );
                             ui.label(
-                                RichText::new(
+                                RichText::new(format!(
                                     "This tool installs ReShade + DLSS5-Feeder + neural DLSS for games that ship without DLSS. \
                                      After Install: in-game press Home → Add-ons tab → enable DLSS 5 Neural Rendering. \
-                                     Use Settings to seed Feeder defaults on the next Install.",
-                                )
+                                     Use Settings to seed Feeder defaults on the next Install.{}",
+                                    if cfg!(target_os = "linux") {
+                                        " Under Proton the game also needs its launch options: Install sets them for \
+                                         a Steam game while Steam is closed, and the Launch options button shows them."
+                                    } else {
+                                        ""
+                                    }
+                                ))
                                 .font(t::plex(12.0))
                                 .color(t::TEXT_SOFT),
                             );
@@ -3600,9 +3614,11 @@ impl eframe::App for App {
                                 RenodxLookup::Found(m) => {
                                     let label = format!("Also install {} — {}", m.file, m.status_label());
                                     let cb = egui::Checkbox::new(&mut self.renodx_on, RichText::new(label).font(t::plex(12.0)).color(t::TEXT_SOFT));
-                                    ui.add_enabled(!self.running, cb).on_hover_text(
-                                        "Game-specific HDR / tone-mapping mod from the RenoDX project. Loads beside the DLSS 5 add-on (different add-on name, different settings section). Turn Windows AutoHDR / RTX HDR off to avoid double tone mapping.",
-                                    );
+                                    ui.add_enabled(!self.running, cb).on_hover_text(if cfg!(target_os = "linux") {
+                                        "Game-specific HDR / tone-mapping mod from the RenoDX project. Loads beside the DLSS 5 add-on (different add-on name, different settings section). Turn any other HDR tone mapping off (gamescope's inverse tone mapping, for one) to avoid doing it twice."
+                                    } else {
+                                        "Game-specific HDR / tone-mapping mod from the RenoDX project. Loads beside the DLSS 5 add-on (different add-on name, different settings section). Turn Windows AutoHDR / RTX HDR off to avoid double tone mapping."
+                                    });
                                     if self.engine == Engine::Opti {
                                         dim(ui, "— ReShade goes in as ReShade64.dll, loaded by OptiScaler (LoadReshade=true)".into());
                                     }
@@ -3742,60 +3758,6 @@ impl eframe::App for App {
                     {
                         self.run_diagnose();
                     }
-                    let cmp = egui::Button::new(
-                        RichText::new("Before / after").font(t::plex_medium(13.0)).color(t::TEXT_OFF),
-                    )
-                    .fill(Color32::TRANSPARENT)
-                    .stroke(Stroke::new(1.0, t::BORDER_STRONG))
-                    .corner_radius(CornerRadius::same(8))
-                    .min_size(Vec2::new(120.0, 42.0));
-                    if ui
-                        .add_enabled(ok_status.is_some() && !self.running, cmp)
-                        .on_hover_text(
-                            "Shows the two newest ReShade screenshots side by side. Take one with neural rendering off, toggle it on, take another.",
-                        )
-                        .clicked()
-                    {
-                        let ctx = ui.ctx().clone();
-                        self.open_compare(&ctx);
-                    }
-                    let bug = egui::Button::new(
-                        RichText::new("Report a bug").font(t::plex_medium(13.0)).color(t::TEXT_OFF),
-                    )
-                    .fill(Color32::TRANSPARENT)
-                    .stroke(Stroke::new(1.0, t::BORDER_STRONG))
-                    .corner_radius(CornerRadius::same(8))
-                    .min_size(Vec2::new(110.0, 42.0));
-                    if ui
-                        .add_enabled(ok_status.is_some() && !self.running, bug)
-                        .on_hover_text(
-                            "Opens a GitHub issue already filled in with your version, card, driver, game, route, the last diagnosis and log tails. Nothing is sent — you edit it in the browser and submit.",
-                        )
-                        .clicked()
-                    {
-                        self.open_bug_report();
-                    }
-                    if cfg!(target_os = "linux") {
-                        let lo = egui::Button::new(
-                            RichText::new("Launch options").font(t::plex_medium(13.0)).color(t::TEXT_OFF),
-                        )
-                        .fill(Color32::TRANSPARENT)
-                        .stroke(Stroke::new(1.0, t::BORDER_STRONG))
-                        .corner_radius(CornerRadius::same(8))
-                        .min_size(Vec2::new(120.0, 42.0));
-                        if ui
-                            .add_enabled(ok_status.is_some() && !self.running, lo)
-                            .on_hover_text(
-                                "Sets the WINEDLLOVERRIDES/Proton launch options this game needs (Steam: applied for you when Steam is closed).",
-                            )
-                            .clicked()
-                        {
-                            if let Some(dir) = self.exe().and_then(|e| e.parent().map(|d| d.to_path_buf())) {
-                                let advice = platform::ensure_launch_options(&dir, self.engine, false);
-                                self.launch_panel = Some((dir, advice));
-                            }
-                        }
-                    }
                     let vulkan = ok_status
                         .as_ref()
                         .is_some_and(|s| s.api == game::Api::Vulkan);
@@ -3811,10 +3773,15 @@ impl eframe::App for App {
                         .min_size(Vec2::new(170.0, 42.0));
                         if ui
                             .add_enabled(!self.running, vk_btn)
-                            .on_hover_text(
+                            .on_hover_text(if cfg!(target_os = "linux") {
                                 "Copies dlss5-feed.addon64 + DLSS5_Feed.fx + VULKAN-SETUP.txt. \
-                                 Does not register a Vulkan layer — finish with ReShade Setup.",
-                            )
+                                 Does not register a Vulkan layer — finish with ReShade Setup, run \
+                                 inside the game's Proton prefix (protontricks-launch --appid <appid> \
+                                 ReShade_Setup.exe). Untested under Proton."
+                            } else {
+                                "Copies dlss5-feed.addon64 + DLSS5_Feed.fx + VULKAN-SETUP.txt. \
+                                 Does not register a Vulkan layer — finish with ReShade Setup."
+                            })
                             .clicked()
                         {
                             if let Some(exe) = self.exe() {
@@ -3871,6 +3838,67 @@ impl eframe::App for App {
                         };
                         ui.label(RichText::new(msg).font(t::plex_medium(12.0)).color(color));
                     });
+                });
+                // Tools that read or explain an install rather than change it,
+                // on a row of their own: with the status line they do not fit
+                // beside Install / Remove / Diagnose at the minimum width.
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    let cmp = egui::Button::new(
+                        RichText::new("Before / after").font(t::plex_medium(13.0)).color(t::TEXT_OFF),
+                    )
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::new(1.0, t::BORDER_STRONG))
+                    .corner_radius(CornerRadius::same(8))
+                    .min_size(Vec2::new(120.0, 42.0));
+                    if ui
+                        .add_enabled(ok_status.is_some() && !self.running, cmp)
+                        .on_hover_text(
+                            "Shows the two newest ReShade screenshots side by side. Take one with neural rendering off, toggle it on, take another.",
+                        )
+                        .clicked()
+                    {
+                        let ctx = ui.ctx().clone();
+                        self.open_compare(&ctx);
+                    }
+                    let bug = egui::Button::new(
+                        RichText::new("Report a bug").font(t::plex_medium(13.0)).color(t::TEXT_OFF),
+                    )
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::new(1.0, t::BORDER_STRONG))
+                    .corner_radius(CornerRadius::same(8))
+                    .min_size(Vec2::new(110.0, 42.0));
+                    if ui
+                        .add_enabled(ok_status.is_some() && !self.running, bug)
+                        .on_hover_text(
+                            "Opens a GitHub issue already filled in with your version, card, driver, game, route, the last diagnosis and log tails. Nothing is sent — you edit it in the browser and submit.",
+                        )
+                        .clicked()
+                    {
+                        self.open_bug_report();
+                    }
+                    if cfg!(target_os = "linux") {
+                        let lo = egui::Button::new(
+                            RichText::new("Launch options").font(t::plex_medium(13.0)).color(t::TEXT_OFF),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::new(1.0, t::BORDER_STRONG))
+                        .corner_radius(CornerRadius::same(8))
+                        .min_size(Vec2::new(120.0, 42.0));
+                        if ui
+                            .add_enabled(ok_status.is_some() && !self.running, lo)
+                            .on_hover_text(
+                                "Sets the WINEDLLOVERRIDES/Proton launch options this game needs (Steam: applied for you when Steam is closed).",
+                            )
+                            .clicked()
+                        {
+                            if let Some(dir) = self.exe().and_then(|e| e.parent().map(|d| d.to_path_buf())) {
+                                let advice = platform::ensure_launch_options(&dir, self.engine, false);
+                                self.launch_panel = Some((dir, advice));
+                            }
+                        }
+                    }
                 });
 
                 // Offline knobs / expected FPS from Feeder perf log. The knobs
