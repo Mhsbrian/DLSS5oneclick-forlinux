@@ -25,6 +25,13 @@ pub struct LaunchReq {
 }
 
 /// The options this game needs with the given engine and Proton build.
+/// `name=n,b` (native, then builtin), once.
+fn push_native(req: &mut LaunchReq, name: &str) {
+    if !req.overrides.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) {
+        req.overrides.push((name.to_owned(), "n,b".into()));
+    }
+}
+
 pub fn required(game_dir: &Path, engine: Engine, proton: Option<&ProtonInfo>) -> LaunchReq {
     let mut req = LaunchReq::default();
     if engine == Engine::ReShade && d3dcompiler_present(game_dir) {
@@ -36,9 +43,26 @@ pub fn required(game_dir: &Path, engine: Engine, proton: Option<&ProtonInfo>) ->
     // under a proxy DLL the game imports (version/winmm/…); Proton loads it only
     // with its own override. The proxy is recorded in the MFG manifest.
     if let Some(proxy) = crate::mfg::manifest_proxy(game_dir) {
-        if !req.overrides.iter().any(|(n, _)| n == &proxy) {
-            req.overrides.push((proxy, "n,b".into()));
-        }
+        push_native(&mut req, &proxy);
+    }
+    // A d3d9.dll beside the exe — dgVoodoo 2 on the DirectX 9 route, or an RTX
+    // Remix bridge — is loaded over Wine's builtin (DXVK's d3d9) only with its
+    // own override; without it the DX9 route installs and then silently renders
+    // through DXVK instead, and a Remix game never reaches its runtime.
+    if crate::game::is_dgvoodoo(game_dir)
+        || (crate::remix::find_runtime(game_dir).is_some()
+            && crate::game::join_ci(game_dir, &["d3d9.dll"]).is_file())
+    {
+        push_native(&mut req, "d3d9");
+    }
+    // REFramework is dinput8.dll, and RE Engine games need it to load before
+    // ReShade does. Only when the file really is REFramework: another mod's
+    // dinput8 is its owner's to configure.
+    if crate::game::is_reframework_dll(&crate::game::join_ci(
+        game_dir,
+        &[crate::game::REFRAMEWORK_DLL],
+    )) {
+        push_native(&mut req, "dinput8");
     }
     if super::steam::nvapi_env_needed(proton) {
         req.env.push(("PROTON_ENABLE_NVAPI".into(), "1".into()));
@@ -237,6 +261,30 @@ mod tests {
             r.env.push(("PROTON_ENABLE_NVAPI".into(), "1".into()));
         }
         r
+    }
+
+    /// dgVoodoo's d3d9.dll and REFramework's dinput8.dll load under Proton only
+    /// with their own overrides; a plain game gets neither, and a dinput8.dll
+    /// that is some other mod is left alone.
+    #[test]
+    fn dgvoodoo_and_reframework_get_their_proton_overrides() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let has = |r: &LaunchReq, n: &str| r.overrides.iter().any(|(k, v)| k == n && v == "n,b");
+        let plain = required(d, Engine::ReShade, None);
+        assert!(!has(&plain, "d3d9") && !has(&plain, "dinput8"));
+
+        std::fs::write(d.join("dinput8.dll"), b"MZ some other mod").unwrap();
+        assert!(!has(&required(d, Engine::ReShade, None), "dinput8"));
+
+        std::fs::write(d.join("dgVoodoo.conf"), "[General]\n").unwrap();
+        std::fs::write(d.join("dinput8.dll"), b"MZ ... REFramework by praydog ...").unwrap();
+        let r = required(d, Engine::ReShade, None);
+        assert!(has(&r, "d3d9"), "{r:?}");
+        assert!(has(&r, "dinput8"), "{r:?}");
+        assert!(has(&r, "dxgi"));
+        // Listed once each, even on a second computation.
+        assert_eq!(r.overrides.iter().filter(|(k, _)| k == "d3d9").count(), 1);
     }
 
     #[test]
