@@ -110,7 +110,7 @@ fn bad(t: impl Into<String>) -> Finding {
 }
 
 fn read(dir: &Path, name: &str) -> Option<String> {
-    fs::read_to_string(dir.join(name)).ok()
+    fs::read_to_string(game::join_ci(dir, &[name])).ok()
 }
 
 /// The resolution the NR model was last running at, from OptiScaler.log's
@@ -140,6 +140,14 @@ fn reshade_host_exe(log: &str) -> Option<String> {
 
 /// Findings for a game folder, in reading order.
 pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
+    // A Linux build only ever looks at games running under Proton. A Windows
+    // build can still be reading a Wine session's logs, which give it away.
+    diagnose_with(st, cfg!(target_os = "linux"))
+}
+
+/// `diagnose`, told whether the game runs under Proton/Wine: the switch for
+/// advice that is right on Windows and wrong there. Tests pick either side.
+fn diagnose_with(st: &GameStatus, proton: bool) -> Vec<Finding> {
     let d = st.game_dir();
     let mut out = Vec::new();
     let consumer = st.consumer_dir();
@@ -150,14 +158,17 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
     let wine_hlsl = rs_log
         .as_deref()
         .is_some_and(|l| l.contains("not yet implemented feature"));
+    let wine = proton || wine_hlsl;
 
     // ── a game-shipped HLSL compiler shadowing the system one ──────
     // The add-on compiles its NR pass at cs_5_1. A d3dcompiler_47.dll that
     // ships with the game is loaded in preference to System32's, and an old
     // one does not know that target: "error X3506: unrecognized compiler
     // target" and no neural rendering, with everything else looking correct.
-    let compiler = d.join("d3dcompiler_47.dll");
-    if compiler.is_file() && !wine_hlsl {
+    // Not under Proton: there the game's own copy is Microsoft's compiler, the
+    // one that works, standing in for Wine's builtin one that does not.
+    let compiler = game::join_ci(d, &["d3dcompiler_47.dll"]);
+    if compiler.is_file() && !wine {
         let ver = crate::ngx::file_version(&compiler).unwrap_or_else(|| "unknown".into());
         out.push(warn(format!(
             "The game ships its own d3dcompiler_47.dll ({ver}), which Windows loads instead of \
@@ -174,7 +185,7 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
     // 4096 MB and no matching -availablevidmem it black-screens after load,
     // and with no conf at all it takes dgVoodoo's stock 256 MB and dies with
     // "TEXP60: Unable to create color render target" (#69).
-    let conf = d.join("dgVoodoo.conf");
+    let conf = game::join_ci(d, &["dgVoodoo.conf"]);
     if conf.is_file() {
         let vram = fs::read_to_string(&conf).ok().and_then(|t| {
             t.lines()
@@ -182,7 +193,7 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
                 .find(|(k, _)| k.trim().eq_ignore_ascii_case("VRAM"))
                 .and_then(|(_, v)| v.trim().trim_end_matches("MB").trim().parse::<u32>().ok())
         });
-        let cmdline = d.join("commandline.txt");
+        let cmdline = game::join_ci(d, &["commandline.txt"]);
         if let (Some(vram), true) = (vram, cmdline.is_file()) {
             let text = fs::read_to_string(&cmdline).unwrap_or_default();
             if !text.to_ascii_lowercase().contains("-availablevidmem") {
@@ -204,7 +215,10 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
     // Two builds of nvngx_dlssnr.dll are in circulation and only the version
     // resource separates them; every failing RTX 50 report so far carries the
     // .SF one, so the log has to name it.
-    for p in [d.join(game::DLSSNR_DLL), consumer.join(game::DLSSNR_DLL)] {
+    for p in [
+        game::join_ci(d, &[game::DLSSNR_DLL]),
+        game::join_ci(&consumer, &[game::DLSSNR_DLL]),
+    ] {
         if !p.is_file() {
             continue;
         }
@@ -241,7 +255,7 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
                 "The GPU crashed while DLSS 5 was running (VK_ERROR_DEVICE_LOST in OptiScaler.log; \
                  look for an Xid fault in `journalctl -k`). The neural runtime drives the GPU into \
                  a device-lost fault under Proton, worst at full resolution — the model was running \
-                 at {}. Cheapest first: lower the Model resolution (this tool's slider, or \
+                 at {}. Cheapest first: lower the Model resolution (the 50% button in this tool, or \
                  --model-res=50 — the model then runs at about a quarter of the pixels, a large drop \
                  in GPU load, often enough to stop the fault); lower the game's output resolution; \
                  try a different Proton; or Remove if it keeps faulting.",
@@ -274,7 +288,7 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
     // opens and which loads the feeder, and the 64-bit one in host64\ that hosts
     // the neural add-on. Reporting only the second leaves "Home does nothing"
     // unexplained, which is the first thing the player actually notices (#69).
-    if st.is32() && !game::is_reshade_dll(&d.join(game::RESHADE_PROXY)) {
+    if st.is32() && !game::is_reshade_dll(&game::join_ci(d, &[game::RESHADE_PROXY])) {
         out.push(bad(format!(
             "No ReShade beside the game exe: {} is missing or is not ReShade, so the Home key \
              opens nothing and the feeder never loads. That is upstream of anything in host64\\. \
@@ -412,21 +426,35 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
     // so DLSS5_Feed.fx and the Lumenite shaders never build — with the feed
     // add-on then reporting its technique missing, which reads like our bug
     // rather than a missing compiler (#70).
+    // The add-on's neural pass compiles through the same compiler. When that
+    // failed as well it is the same cause with the same fix, so one finding.
+    let nr_pass_failed = rs
+        .lines()
+        .find(|l| l.contains("proxy encode compilation failed") || l.contains("is not defined"))
+        .map(str::trim);
     if wine_hlsl {
         let line = rs
             .lines()
             .find(|l| l.contains("not yet implemented feature"))
             .unwrap_or("")
             .trim();
-        out.push(bad(format!(
+        let mut t = format!(
             "The effects failed to compile in Wine/Proton's own HLSL compiler: {line} \
              That message comes from vkd3d-shader, which Wine's d3dcompiler_47.dll uses; \
              ReShade emits attributes it has not implemented. Install Microsoft's real \
              d3dcompiler_47 into the prefix — protontricks <appid> d3dcompiler_47, or \
-             winetricks d3dcompiler_47 — and start the game again. If the game shipped its \
+             winetricks d3dcompiler_47 (Install does this itself for a Steam game when \
+             either is installed) — and start the game again. If the game shipped its \
              own d3dcompiler_47.dll, leave it in place: under Proton it may be the only \
              working compiler there is."
-        )));
+        );
+        if let Some(nr) = nr_pass_failed {
+            t.push_str(&format!(
+                " The add-on's neural-rendering pass failed in the same compiler ({nr}), so \
+                 the same step fixes it."
+            ));
+        }
+        out.push(bad(t));
     }
 
     // The compile failure itself, which is unambiguous when it appears.
@@ -437,8 +465,16 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
         out.push(bad(format!(
             "{} — the HLSL compiler in this process is too old for the DLSS 5 pass. That is \
              a d3dcompiler_47.dll shipped with the game, loaded in preference to System32's. \
-             Rename it (d3dcompiler_47.dll.bak) and start the game again.",
-            line.trim()
+             Rename it (d3dcompiler_47.dll.bak) and start the game again.{}",
+            line.trim(),
+            if wine {
+                " Under Proton, first make sure Microsoft's real d3dcompiler_47 is in the \
+                 prefix (protontricks <appid> d3dcompiler_47; Install does this for a Steam \
+                 game): with the game's copy gone Wine falls back to its own builtin one, \
+                 which cannot build the pass either."
+            } else {
+                ""
+            }
         )));
     }
     // The same failure under Proton wears a different face: the add-on compiles
@@ -448,10 +484,7 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
     // with E5005 and neural rendering never binds, though every other step reads
     // fine. Microsoft's real d3dcompiler_47 knows the intrinsic; put it in the
     // game's Proton prefix. (This tool installs it at setup from this version on.)
-    else if let Some(line) = rs
-        .lines()
-        .find(|l| l.contains("proxy encode compilation failed") || l.contains("is not defined"))
-    {
+    else if let Some(line) = nr_pass_failed.filter(|_| !wine_hlsl) {
         out.push(bad(format!(
             "{} — the add-on's neural-rendering shader could not be compiled by the HLSL \
              compiler in this process. Under Proton that is Wine's builtin d3dcompiler_47, \
@@ -604,7 +637,7 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
             if version_key(ver) < version_key(CURRENT_FEEDER) {
                 out.push(warn(format!(
                     "DLSS5-Feeder {ver} in the log is older than {CURRENT_FEEDER}; re-run Install \
-                     to refresh it (since 0.9.1 an existing Feeder is updated)."
+                     to refresh it (Install updates an existing Feeder)."
                 )));
             }
         }
@@ -640,8 +673,8 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
         {
             out.push(bad(format!(
                 "The two halves of the 32-bit install are from different releases: {} \
-                 Run Install again — since 0.13.4 both halves are taken from one download and \
-                 each records the release it came from, so this cannot happen silently.",
+                 Run Install again: both halves now come from one download and each records \
+                 the release it came from, so this cannot happen silently.",
                 line.trim()
             )));
         }
@@ -667,7 +700,7 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
                 // game-local DLL moved aside, the driver's own NGX answers
                 // 0xBAD00012 (NotImplemented) for SuperSampling and DLSS is not
                 // available at all, which is worse than the crash (#76).
-                if wine_hlsl || fd.contains("driver 999.99") {
+                if wine || fd.contains("driver 999.99") {
                     t.push_str(
                         " On Windows the usual next step is moving the game-local nvngx_dlss.dll \
                          aside, because two copies of the NGX module are loaded and the add-on \
@@ -1268,7 +1301,8 @@ mod tests {
              <anonymous>:118:13: E5017: Aborting due to not yet implemented feature: Unhandled attribute 'fastopt'.\n",
         )
         .unwrap();
-        let f = run(&exe).unwrap();
+        // A Windows build reading a Wine session's log: the log gives it away.
+        let f = diagnose_with(&game::inspect(&exe).unwrap(), false);
         assert!(
             f.iter()
                 .any(|x| x.level == Level::Bad && x.text.contains("vkd3d-shader")),
@@ -1351,7 +1385,8 @@ mod tests {
              [feed] two copies of the DLSS NGX module are loaded (the game-local nvngx_dlss.dll and the driver's _nvngx.dll)\n",
         )
         .unwrap();
-        let f = run(&exe).unwrap();
+        // On Windows the advice is to move the game-local copy aside.
+        let f = diagnose_with(&game::inspect(&exe).unwrap(), false);
         let hit = f
             .iter()
             .find(|x| x.text.contains("faulted inside the driver"))
@@ -1359,6 +1394,9 @@ mod tests {
         assert_eq!(hit.level, Level::Bad);
         assert!(hit.text.contains("d3d12core.dll"), "{}", hit.text);
         assert!(hit.text.contains("nvngx_dlss.dll.off"), "{}", hit.text);
+        // A Linux build knows it is looking at Proton, where that advice is wrong.
+        let f = diagnose_with(&game::inspect(&exe).unwrap(), true);
+        assert!(!f.iter().any(|x| x.text.contains("nvngx_dlss.dll.off")), "{f:?}");
     }
 
     /// GTA IV reads the adapter's VRAM and sizes its pools from it, so dgVoodoo
@@ -1393,6 +1431,44 @@ mod tests {
             !f.iter().any(|x| x.text.contains("-availablevidmem")),
             "{f:?}"
         );
+
+        // Found whatever its casing on disk (ext4 is case-sensitive).
+        fs::remove_file(t.path().join("commandline.txt")).unwrap();
+        fs::write(t.path().join("CommandLine.txt"), "-norestrictions\n").unwrap();
+        let f = run(&exe).unwrap();
+        assert!(f.iter().any(|x| x.text.contains("-availablevidmem")), "{f:?}");
+    }
+
+    /// A game's own d3dcompiler_47.dll is worth renaming on Windows when it is
+    /// too old, and exactly wrong to touch under Proton, where it is
+    /// Microsoft's compiler standing in for Wine's builtin one.
+    #[test]
+    fn a_game_compiler_is_left_alone_under_proton() {
+        let (t, exe) = setup(true);
+        fs::write(t.path().join("D3DCompiler_47.dll"), b"MZ").unwrap();
+        fs::write(t.path().join("ReShade.log"), "Initializing crosire's ReShade\n").unwrap();
+        let st = game::inspect(&exe).unwrap();
+        let rename = |f: &[Finding]| f.iter().any(|x| x.text.contains("d3dcompiler_47.dll.bak"));
+        assert!(rename(&diagnose_with(&st, false)), "found despite its casing");
+        assert!(!rename(&diagnose_with(&st, true)));
+    }
+
+    /// Wine's compiler failing both the effects and the add-on's neural pass is
+    /// one cause with one fix, so it is one finding that names both.
+    #[test]
+    fn wine_compiler_failures_are_one_finding() {
+        let (t, exe) = setup(true);
+        fs::write(
+            t.path().join("ReShade.log"),
+            "Initializing crosire's ReShade\n\
+             <anonymous>:118:13: E5017: Aborting due to not yet implemented feature: Unhandled attribute 'fastopt'.\n\
+             renodx-dlss5: proxy encode compilation failed: E5005: Function \"isnan\" is not defined.\n",
+        )
+        .unwrap();
+        let f = diagnose_with(&game::inspect(&exe).unwrap(), true);
+        let hits: Vec<_> = f.iter().filter(|x| x.text.contains("d3dcompiler_47")).collect();
+        assert_eq!(hits.len(), 1, "{f:?}");
+        assert!(hits[0].text.contains("isnan"), "{}", hits[0].text);
     }
 
     /// Moving the game-local nvngx_dlss.dll aside is the right advice on
@@ -1412,7 +1488,7 @@ mod tests {
 
         // Windows: the advice stands.
         fs::write(t.path().join("dlss5-feed.log"), crash).unwrap();
-        let f = run(&exe).unwrap();
+        let f = diagnose_with(&game::inspect(&exe).unwrap(), false);
         assert!(
             f.iter().any(|x| x.text.contains("nvngx_dlss.dll.off")),
             "{f:?}"
@@ -1424,7 +1500,7 @@ mod tests {
             format!("[feed] adapter: NVIDIA GeForce RTX 4070 SUPER driver 999.99\n{crash}"),
         )
         .unwrap();
-        let f = run(&exe).unwrap();
+        let f = diagnose_with(&game::inspect(&exe).unwrap(), false);
         assert!(
             !f.iter().any(|x| x.text.contains("nvngx_dlss.dll.off")),
             "{f:?}"
@@ -1433,6 +1509,12 @@ mod tests {
             f.iter().any(|x| x.text.contains("Do NOT do that here")),
             "{f:?}"
         );
+
+        // A Linux build needs no clue in the log: every game it sees is Proton.
+        fs::write(t.path().join("dlss5-feed.log"), crash).unwrap();
+        let f = diagnose_with(&game::inspect(&exe).unwrap(), true);
+        assert!(!f.iter().any(|x| x.text.contains("nvngx_dlss.dll.off")), "{f:?}");
+        assert!(f.iter().any(|x| x.text.contains("Do NOT do that here")), "{f:?}");
     }
 
     #[test]
