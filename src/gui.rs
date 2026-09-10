@@ -395,14 +395,11 @@ impl App {
             self.renodx_on = false;
             self.mfg_on = false;
             self.fg_on = false;
-            // The dial opens on what this game's OptiScaler.ini already says,
-            // so a reinstall keeps hand tuning instead of resetting it to 100%.
-            self.working_scale = self
-                .resolved_exe
-                .as_deref()
-                .and_then(Path::parent)
-                .and_then(installer::opti_working_scale)
-                .unwrap_or(1.0);
+            // The dial and the OptiScaler build open on what this game already
+            // has, so a reinstall keeps hand tuning and the fork it runs.
+            let dir = self.resolved_exe.as_deref().and_then(Path::parent);
+            self.working_scale = dir.and_then(installer::opti_working_scale).unwrap_or(1.0);
+            self.opti_presr = dir.is_some_and(installer::installed_opti_presr);
             self.remix_swap_on = false;
             self.start_renodx_lookup();
         }
@@ -805,6 +802,10 @@ impl App {
             } else {
                 Engine::ReShade
             };
+            // An update refreshes the build the game has; it never swaps forks.
+            if st.opti {
+                self.opti_presr = installer::installed_opti_presr(st.game_dir());
+            }
             self.updating = Some(index);
             self.start(None);
         } else {

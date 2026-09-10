@@ -305,6 +305,8 @@ pub struct Latest {
     pub reshade: Option<String>,
     pub feeder: Option<String>,
     pub opti: Option<String>,
+    /// wilsjo2's pre-SR multipass fork, which numbers its releases on its own.
+    pub opti_presr: Option<String>,
     pub dlss: Option<String>,
     pub dlssnr: Option<String>,
 }
@@ -315,6 +317,7 @@ impl Latest {
             reshade: resolve_reshade_setup(client).ok().map(|(v, _)| v),
             feeder: net::latest_tag(client, FEEDER_REPO).ok(),
             opti: net::latest_tag(client, OPTI_REPO).ok(),
+            opti_presr: net::latest_tag(client, OPTI_PRESR_REPO).ok(),
             dlss: rhi_latest(client, "dlss-").ok().map(|(t, _)| t),
             dlssnr: rhi_latest(client, "dlssnr-").ok().map(|(t, _)| t),
         }
@@ -423,7 +426,15 @@ pub fn stale_components(dir: &Path, latest: &Latest) -> Vec<String> {
         &latest.dlssnr,
     );
     if let Ok(m) = fs::read_to_string(dir.join(game::OPTI_MANIFEST)) {
-        match (manifest_tag(&m), &latest.opti) {
+        // Measured against the newest build of the fork it came from: a pre-SR
+        // multipass install is not out of date because Dagherbou's build is
+        // numbered differently.
+        let want = if manifest_repo(&m) == OPTI_PRESR_REPO {
+            &latest.opti_presr
+        } else {
+            &latest.opti
+        };
+        match (manifest_tag(&m), want) {
             (Some(have), Some(want)) if have.trim() != want.trim() => {
                 out.push(format!("OptiScaler {} → {want}", have.trim()))
             }
@@ -441,6 +452,24 @@ fn manifest_tag(manifest: &str) -> Option<String> {
         .lines()
         .find_map(|l| l.strip_prefix("# tag "))
         .map(|t| t.trim().to_owned())
+}
+
+/// The repository an OptiScaler manifest's build came from, from its `# repo`
+/// header. A manifest without one reads as Dagherbou's, the default build (a
+/// pre-SR install made before the header existed cannot be told apart).
+fn manifest_repo(manifest: &str) -> &str {
+    manifest
+        .lines()
+        .find_map(|l| l.strip_prefix("# repo "))
+        .map(str::trim)
+        .unwrap_or(OPTI_REPO)
+}
+
+/// True when the OptiScaler this tool placed in `dir` is the pre-SR fork, so
+/// the GUI opens on the build a game already has and an update keeps it.
+pub fn installed_opti_presr(dir: &Path) -> bool {
+    fs::read_to_string(game::join_ci(dir, &[game::OPTI_MANIFEST]))
+        .is_ok_and(|m| manifest_repo(&m) == OPTI_PRESR_REPO)
 }
 
 /// The first stable release carrying a `.zip`. Both forks also publish rolling
@@ -489,7 +518,11 @@ fn step_opti(
                 "OptiScaler present (not placed by this tool, left as is)".to_owned(),
             ]);
         };
+        // A build from the other fork is replaced whatever its tag: the two
+        // number their releases independently.
+        let same_fork = manifest_repo(&manifest) == repo;
         match (manifest_tag(&manifest), &latest) {
+            _ if !same_fork => progress(0, &format!("Switching OptiScaler to {repo}")),
             (Some(a), Some(b)) if &a == b => {
                 return Ok(vec![format!("OptiScaler already current ({a})")]);
             }
@@ -605,7 +638,7 @@ fn step_opti(
         .unwrap_or_default();
     fs::write(
         d.join(game::OPTI_MANIFEST),
-        format!("{header}{}", installed.join("\n")),
+        format!("# repo {repo}\n{header}{}", installed.join("\n")),
     )?;
     installed.push(game::OPTI_MANIFEST.into());
     Ok(installed)
@@ -4346,6 +4379,7 @@ RestoreComputeSignature=true
             reshade: Some("6.8.0".into()),
             feeder: Some("v0.13.1-beta.1".into()),
             opti: Some("v0.2.0-dlssnr".into()),
+            opti_presr: Some("v1.1.0".into()),
             dlss: Some("dlss-310.9.0".into()),
             dlssnr: Some("dlssnr-310.8.SF-v2".into()),
         };
@@ -4373,6 +4407,27 @@ RestoreComputeSignature=true
         assert!(stale_components(d, &latest)
             .iter()
             .any(|s| s == "OptiScaler unknown version → v0.2.0-dlssnr"));
+        assert!(!installed_opti_presr(d));
+
+        // A pre-SR multipass install is measured against its own fork's newest
+        // build, never Dagherbou's differently numbered one.
+        fs::write(
+            d.join(game::OPTI_MANIFEST),
+            format!("# repo {OPTI_PRESR_REPO}\n# tag v1.1.0\ndxgi.dll\n"),
+        )
+        .unwrap();
+        assert!(!stale_components(d, &latest)
+            .iter()
+            .any(|s| s.starts_with("OptiScaler")));
+        fs::write(
+            d.join(game::OPTI_MANIFEST),
+            format!("# repo {OPTI_PRESR_REPO}\n# tag v1.0.0\ndxgi.dll\n"),
+        )
+        .unwrap();
+        assert!(stale_components(d, &latest)
+            .iter()
+            .any(|s| s == "OptiScaler v1.0.0 → v1.1.0"));
+        assert!(installed_opti_presr(d));
     }
 
     /// The manifest carries the tag on a comment line, and older manifests
@@ -4382,6 +4437,12 @@ RestoreComputeSignature=true
         let m = "# tag v0.2.0-dlssnr\nOptiScaler.dll\ndxgi.dll\n";
         assert_eq!(manifest_tag(m).as_deref(), Some("v0.2.0-dlssnr"));
         assert_eq!(manifest_tag("OptiScaler.dll\ndxgi.dll\n"), None);
+        // The fork rides alongside; a manifest from before it was recorded
+        // reads as Dagherbou's build, the default.
+        assert_eq!(manifest_repo(m), OPTI_REPO);
+        let presr = format!("# repo {OPTI_PRESR_REPO}\n{m}");
+        assert_eq!(manifest_repo(&presr), OPTI_PRESR_REPO);
+        assert_eq!(manifest_tag(&presr).as_deref(), Some("v0.2.0-dlssnr"));
     }
 
     #[test]
