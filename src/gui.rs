@@ -94,6 +94,8 @@ pub struct App {
     /// ReShade route: pin the classic DLSS 5 add-on build, which the Feeder's
     /// host measured to work on NVIDIA 616.64 where the current one faults (#69).
     renodx_classic: bool,
+    /// OptiScaler route, RTX 40 only: the fork's built-in MFG unlock (#83).
+    ada_mfg: bool,
     renodx: RenodxLookup,
     renodx_rx: Option<Receiver<RenodxLookup>>,
     /// Exe the current lookup belongs to, so a refresh does not re-fetch.
@@ -243,6 +245,7 @@ impl App {
             upstream_preset: 3,
             opti_presr: false,
             renodx_classic: false,
+            ada_mfg: false,
             renodx: RenodxLookup::Idle,
             renodx_rx: None,
             renodx_for: None,
@@ -433,6 +436,11 @@ impl App {
             std::env::set_var(installer::RENODX_TAG_ENV, installer::RENODX_CLASSIC_TAG);
         } else {
             std::env::remove_var(installer::RENODX_TAG_ENV);
+        }
+        if self.ada_mfg {
+            std::env::set_var(installer::ADA_MFG_ENV, "1");
+        } else {
+            std::env::remove_var(installer::ADA_MFG_ENV);
         }
         std::env::set_var(
             installer::UPSTREAM_PRESET_ENV,
@@ -2916,6 +2924,29 @@ impl eframe::App for App {
                         .font(t::plex(11.0))
                         .color(t::TEXT_DIM),
                     );
+                    // RTX 40 only: the 50 series has multi-frame generation of
+                    // its own, and the Ampere/Turing unlock in the same ini
+                    // needs a DLL nobody publishes, so it is not offered (#83).
+                    if self.opti_presr
+                        && ok_status
+                            .as_ref()
+                            .and_then(|s| s.gpu.as_ref())
+                            .is_some_and(|(_, t)| *t == crate::gpu::Tier::Rtx40)
+                    {
+                        ui.add_space(6.0);
+                        let mut on = self.ada_mfg;
+                        let cb = egui::Checkbox::new(
+                            &mut on,
+                            RichText::new(
+                                "RTX 40 multi-frame generation \u{2014} built into this build, no extra files. The game must have frame generation of its own.",
+                            )
+                            .font(t::plex(11.5))
+                            .color(t::TEXT_SOFT),
+                        );
+                        if ui.add_enabled(!self.running, cb).changed() {
+                            self.ada_mfg = on;
+                        }
+                    }
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;

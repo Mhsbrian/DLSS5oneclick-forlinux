@@ -565,6 +565,14 @@ fn step_opti(
         if let Some(patched) = set_ini_key(&cur, "DlssNr", "WorkingScale", &working_scale()) {
             cur = patched;
         }
+        // RTX 40 multi-frame generation. This one is built into the fork and
+        // memory-only — no file to fetch, nothing to sideload — so it is a
+        // setting we can honestly turn on for someone. The Ampere/Turing
+        // equivalent in the same ini sideloads a DLL that has no published
+        // release, so it is deliberately not offered (#83).
+        if let Some(patched) = set_ini_key(&cur, "FrameGen", "AdaMfgUnlock", ada_mfg()) {
+            cur = patched;
+        }
         // RE Engine trips its own scheduler assertion unless the compute root
         // signature is put back, and fights REFramework over WndProc unless
         // input is polled. The graphics-side restores must stay off there: they
@@ -1993,6 +2001,23 @@ fn step_upstream(
     Ok(done)
 }
 
+/// RTX 40 multi-frame generation on the OptiScaler route; unset means off.
+pub const ADA_MFG_ENV: &str = "DLSS5ONECLICK_ADA_MFG";
+
+/// `"true"` when the RTX 40 MFG unlock was asked for, else `"false"`.
+///
+/// The fork's own note: "Optional built-in y4my4my4m RTX 40 MFG unlock.
+/// Memory-only, supported runtimes only." Memory-only is what makes it
+/// offerable here — there is no second download and nothing for the user to
+/// place by hand.
+fn ada_mfg() -> &'static str {
+    if std::env::var_os(ADA_MFG_ENV).is_some() {
+        "true"
+    } else {
+        "false"
+    }
+}
+
 /// Which neural-upstream strength preset to seed; 0 leaves the overlay's own.
 pub const UPSTREAM_PRESET_ENV: &str = "DLSS5ONECLICK_UPSTREAM_PRESET";
 
@@ -2851,6 +2876,25 @@ mod tests {
             !agree("v0.16.0"),
             "a half-updated pair must not look current"
         );
+    }
+
+    /// RTX 40 MFG is one ini key and no extra files, so it can be offered as
+    /// part of an install. The Ampere/Turing key in the same section sideloads
+    /// a DLL with no published release and is deliberately never written (#83).
+    #[test]
+    fn ada_mfg_is_written_and_ampere_is_left_alone() {
+        std::env::remove_var(ADA_MFG_ENV);
+        assert_eq!(ada_mfg(), "false");
+        std::env::set_var(ADA_MFG_ENV, "1");
+        assert_eq!(ada_mfg(), "true");
+        std::env::remove_var(ADA_MFG_ENV);
+
+        let ini = "[FrameGen]\nAdaMfgUnlock=false\nAmpereMfgUnlock=false\n";
+        let out = set_ini_key(ini, "FrameGen", "AdaMfgUnlock", "true").unwrap();
+        assert!(out.contains("AdaMfgUnlock=true"), "{out}");
+        // The two are mutually exclusive upstream: "Never combine with
+        // AdaMfgUnlock or an external MFG unlocker."
+        assert!(out.contains("AmpereMfgUnlock=false"), "{out}");
     }
 
     #[test]
