@@ -522,10 +522,10 @@ pub fn detect_api(exe: &Path) -> Api {
 /// dgVoodoo2 next to the exe: its own config/control panel, or its name inside
 /// the wrapper DLL. It translates D3D9 to D3D11, which the Feeder supports.
 pub fn is_dgvoodoo(game_dir: &Path) -> bool {
-    if game_dir.join("dgVoodoo.conf").is_file() || game_dir.join("dgVoodooCpl.exe").is_file() {
+    if file_ci(game_dir, "dgVoodoo.conf") || file_ci(game_dir, "dgVoodooCpl.exe") {
         return true;
     }
-    let dll = game_dir.join("d3d9.dll");
+    let dll = join_ci(game_dir, &["d3d9.dll"]);
     match fs::read(&dll) {
         Ok(b) => dll_mentions_dgvoodoo(&b),
         Err(_) => false,
@@ -736,10 +736,10 @@ pub fn game_ships_dlss(game_dir: &Path) -> bool {
         .and_then(Path::parent);
     match unreal_root {
         Some(proj) => {
-            walk(&proj.join("Plugins"), 7)
+            walk(&join_ci(proj, &["Plugins"]), 7)
                 || proj
                     .parent()
-                    .is_some_and(|root| walk(&root.join("Engine").join("Plugins"), 7))
+                    .is_some_and(|root| walk(&join_ci(root, &["Engine", "Plugins"]), 7))
         }
         None => false,
     }
@@ -770,7 +770,7 @@ pub fn unreal_likely(exe: &Path, game_dir: &Path) -> bool {
         })
         .and_then(|b| b.parent());
     if let Some(proj) = proj {
-        if proj.join("Plugins").is_dir() || proj.join("Content").is_dir() {
+        if join_ci(proj, &["Plugins"]).is_dir() || join_ci(proj, &["Content"]).is_dir() {
             return true;
         }
     }
@@ -779,10 +779,10 @@ pub fn unreal_likely(exe: &Path, game_dir: &Path) -> bool {
 
 /// UnityPlayer.dll beside the exe (or one folder up for some layouts).
 pub fn unity_likely(game_dir: &Path) -> bool {
-    game_dir.join("UnityPlayer.dll").is_file()
+    file_ci(game_dir, "UnityPlayer.dll")
         || game_dir
             .parent()
-            .is_some_and(|p| p.join("UnityPlayer.dll").is_file())
+            .is_some_and(|p| file_ci(p, "UnityPlayer.dll"))
 }
 
 /// Lightweight install-time RT / ray-reconstruction hints (not a DXR hook).
@@ -824,12 +824,16 @@ pub fn rt_likely(game_dir: &Path) -> bool {
         false
     }
     fn file_mentions_rt(p: &Path) -> bool {
-        let Ok(s) = fs::read_to_string(p) else {
+        // Only the first 64 KiB is looked at, so only that much is read: a
+        // game folder can hold multi-megabyte text logs and data files.
+        let Ok(f) = fs::File::open(p) else {
             return false;
         };
-        // Cap read cost: only scan first ~64 KiB worth of UTF-8 lossy via take on chars.
-        let head: String = s.chars().take(64 * 1024).collect();
-        let l = head.to_ascii_lowercase();
+        let mut head = Vec::with_capacity(64 * 1024);
+        if f.take(64 * 1024).read_to_end(&mut head).is_err() {
+            return false;
+        }
+        let l = String::from_utf8_lossy(&head).to_ascii_lowercase();
         l.contains("hardwareraytracing")
             || l.contains("r.raytracing")
             || l.contains("raytracing=")
@@ -849,7 +853,7 @@ pub fn rt_likely(game_dir: &Path) -> bool {
         })
         .and_then(Path::parent)
     {
-        if walk_names(&proj.join("Plugins"), 5) {
+        if walk_names(&join_ci(proj, &["Plugins"]), 5) {
             return true;
         }
     }
@@ -1465,7 +1469,7 @@ pub fn resolve_target(input: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
 /// Shipping exe's directory has neither — classic wrong-folder Install.
 pub fn install_folder_mismatch(preferred_exe: &Path) -> Option<String> {
     let ship_dir = preferred_exe.parent()?;
-    let ship_ok = ship_dir.join(RESHADE_PROXY).is_file() || ship_dir.join(FEEDER_ADDON).is_file();
+    let ship_ok = file_ci(ship_dir, RESHADE_PROXY) || file_ci(ship_dir, FEEDER_ADDON);
     if ship_ok {
         return None;
     }
@@ -1473,7 +1477,7 @@ pub fn install_folder_mismatch(preferred_exe: &Path) -> Option<String> {
     let mut cur = ship_dir.parent();
     for _ in 0..4 {
         let Some(d) = cur else { break };
-        if (d.join(RESHADE_PROXY).is_file() || d.join(FEEDER_MARKER).is_file()) && d != ship_dir {
+        if (file_ci(d, RESHADE_PROXY) || file_ci(d, FEEDER_MARKER)) && d != ship_dir {
             return Some(format!(
                 "ReShade/Feeder found in {} but not next to {} — Install on the Shipping exe",
                 d.display(),
@@ -1490,9 +1494,9 @@ pub fn install_folder_mismatch(preferred_exe: &Path) -> Option<String> {
 
 /// True when EffectSearchPaths point at a missing/empty Shaders folder.
 pub fn shaders_missing(game_dir: &Path) -> bool {
-    let sh = game_dir.join("reshade-shaders").join("Shaders");
+    let sh = join_ci(game_dir, &["reshade-shaders", "Shaders"]);
     if !sh.is_dir() {
-        return game_dir.join(RESHADE_PROXY).is_file();
+        return file_ci(game_dir, RESHADE_PROXY);
     }
     fs::read_dir(&sh)
         .ok()
@@ -1504,7 +1508,7 @@ pub fn shaders_missing(game_dir: &Path) -> bool {
             })
         })
         .unwrap_or(true)
-        && game_dir.join(RESHADE_PROXY).is_file()
+        && file_ci(game_dir, RESHADE_PROXY)
 }
 
 /// Sidecar markers this tool leaves so Install / Update / Remove know the folder.
@@ -2450,6 +2454,23 @@ mod tests {
         assert!(std::env::var_os(env).is_none(), "and the environment was never written");
         // The real switch reads the real variable.
         assert_eq!(SKIP_GPU_CHECK.env, SKIP_GPU_CHECK_ENV);
+    }
+
+    /// ext4 is case-sensitive, and neither dgVoodoo's files nor a Unity player
+    /// nor a ReShade layout is guaranteed the casing these checks look for.
+    #[test]
+    fn layout_checks_ignore_filename_case() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        fs::write(d.join("DGVOODOO.CONF"), "[General]\n").unwrap();
+        assert!(is_dgvoodoo(d));
+        fs::write(d.join("unityplayer.dll"), b"MZ").unwrap();
+        assert!(unity_likely(d));
+        fs::write(d.join("DXGI.dll"), b"MZ").unwrap();
+        fs::create_dir_all(d.join("ReShade-Shaders").join("shaders")).unwrap();
+        assert!(shaders_missing(d), "an empty Shaders folder under another casing");
+        fs::write(d.join("ReShade-Shaders").join("shaders").join("x.fx"), "").unwrap();
+        assert!(!shaders_missing(d));
     }
 
     #[test]

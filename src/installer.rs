@@ -1718,7 +1718,7 @@ fn assert_dgvoodoo_conf_healthy(text: &str) -> Result<()> {
 /// Smart-merge (or create) `dgVoodoo.conf`: force OutputAPI, floor VRAM, preserve the rest.
 /// Writes `dgVoodoo.conf.bak` once before the first edit of an existing file.
 pub fn write_dgvoodoo_conf(game_dir: &Path) -> Result<()> {
-    let conf = game_dir.join("dgVoodoo.conf");
+    let conf = game::join_ci(game_dir, &["dgVoodoo.conf"]);
     let bak = game_dir.join("dgVoodoo.conf.bak");
     let text = if conf.is_file() {
         let existing =
@@ -1765,7 +1765,7 @@ pub fn install_dgvoodoo_from_zip(
         .ok_or_else(|| {
             anyhow!("dgVoodoo zip does not contain {want} — unexpected release layout")
         })?;
-    let dest = game_dir.join("d3d9.dll");
+    let dest = game::join_ci(game_dir, &["d3d9.dll"]);
     // Refuse to clobber a foreign wrapper; callers should have blocked Install already.
     if dest.is_file() && !game::is_dgvoodoo(game_dir) {
         bail!(
@@ -1793,7 +1793,7 @@ fn step_dgvoodoo(
         progress(50, "dgVoodoo DLL present — merging conf");
     } else {
         // Do not treat d3d9.dll.off (old ReShade) as dgVoodoo — download the real DLL.
-        if d.join("d3d9.dll").is_file() {
+        if game::join_ci(d, &["d3d9.dll"]).is_file() {
             bail!(
                 "a d3d9.dll that is not dgVoodoo is already present; remove or replace it with \
                  dgVoodoo 2.87.3 ({member}), then Install again"
