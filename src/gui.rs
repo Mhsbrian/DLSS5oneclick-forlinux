@@ -2,13 +2,17 @@
 //! tiles, one Install button, progress, log.
 
 use crate::diagnose;
+use crate::feeder_cfg::{self, FeederKnobs};
 use crate::game::{self, GameStatus};
 use crate::installer::{self, Engine, StepState};
 use crate::library::{self, Game, Store};
 use crate::logo;
 use crate::net;
 use crate::platform;
+use crate::quality_preset::QualityChoice;
 use crate::renodx;
+use crate::reshade_ini;
+use crate::settings::Settings;
 use crate::text;
 use crate::theme::{self as t};
 use crate::update;
@@ -139,6 +143,19 @@ pub struct App {
     opti_scale_pct: u32,
     /// Remix route: replace a runtime that has no neural pass.
     remix_swap_on: bool,
+    /// OptiScaler route: fraction of the frame the DLSS 5 model works at.
+    /// Its cost falls with the square of this, so it is the biggest fps lever
+    /// on that route. 1.0 = full size.
+    working_scale: f32,
+    /// neural-upstream strength preset to write into ReShade.ini before the
+    /// game starts (#68). 3 = Reference, the add-on's own default.
+    upstream_preset: u8,
+    /// OptiScaler route: install wilsjo2's pre-SR multipass fork instead of
+    /// Dagherbou's build (#72).
+    opti_presr: bool,
+    /// ReShade route: pin the classic DLSS 5 add-on build, which the Feeder's
+    /// host measured to work on NVIDIA 616.64 where the current one faults (#69).
+    renodx_classic: bool,
     renodx: RenodxLookup,
     renodx_rx: Option<Receiver<RenodxLookup>>,
     /// Exe the current lookup belongs to, so a refresh does not re-fetch.
@@ -156,6 +173,16 @@ pub struct App {
     /// Official store marks (Simple Icons, CC0), white on transparent, tinted at paint time.
     store_icons: HashMap<Store, egui::TextureHandle>,
     kofi_icon: Option<egui::TextureHandle>,
+    /// Global defaults from settings.json.
+    settings: Settings,
+    /// Offline Feeder knobs for the selected game (None = not loaded / not installed).
+    knobs: Option<FeederKnobs>,
+    knobs_err: Option<String>,
+    knobs_dirty: bool,
+    /// Collapsed install log shows a one-line summary.
+    log_expanded: bool,
+    /// First-run tip dismissed (also persisted in eframe storage / settings).
+    tip_dismissed: bool,
 }
 
 pub const KOFI_URL: &str = "https://ko-fi.com/kindiboy";
@@ -166,6 +193,7 @@ const KOFI_RED: Color32 = Color32::from_rgb(0xff, 0x5e, 0x5b);
 enum Page {
     Games,
     Setup,
+    Settings,
     About,
 }
 
@@ -176,8 +204,7 @@ enum CardAction {
     None,
     /// Left click: open the game on the Setup page.
     Open,
-    /// Right click ▸ Update: install straight away, with the engine the game
-    /// already has, and show the Setup page so the progress is visible.
+    /// Install / Update / Re-install from the card (or context menu).
     Update,
     /// Right click ▸ Forget: drop a hand-added game from the list.
     Forget,
@@ -187,14 +214,57 @@ enum CardAction {
 #[derive(Debug, Clone)]
 struct GameMeta {
     api: &'static str,
+    /// Game ships its own DLSS (Mode::Native).
     has_dlss: bool,
+    /// Feeder / Native / Opti path label.
+    engine_path: &'static str,
     addon: bool,
     ready: bool,
-    /// This tool installed into that folder: the game is listed in its own
-    /// section at the top rather than under its store.
+    /// This tool installed into that folder.
     installed: bool,
     /// Components this tool placed that upstream has since moved past.
     stale: Vec<String>,
+    rt_likely: bool,
+    unreal_likely: bool,
+    unity_likely: bool,
+    re_engine: bool,
+    shaders_missing: bool,
+    wrong_folder: Option<String>,
+    /// Canonical Shipping (or best) exe.
+    exe: PathBuf,
+}
+
+fn meta_from_status(st: &GameStatus, latest: &installer::Latest) -> GameMeta {
+    let dir = st.game_dir();
+    GameMeta {
+        api: match st.api {
+            game::Api::Vulkan => "Vulkan",
+            game::Api::Dx9 => "DirectX 9",
+            game::Api::Dx10 => "DirectX 10",
+            game::Api::Dx11 => "DirectX 11",
+            game::Api::Dx12 => "DirectX 12",
+            game::Api::Unknown => "DirectX 12?",
+        },
+        has_dlss: st.mode == game::Mode::Native,
+        engine_path: if st.opti {
+            "Opti"
+        } else if st.mode == game::Mode::Native {
+            "Native"
+        } else {
+            "Feeder"
+        },
+        addon: st.dlss5_addon || st.opti,
+        ready: st.complete(),
+        installed: game::installed_by_tool(dir),
+        stale: installer::stale_components(dir, latest),
+        rt_likely: st.rt_likely,
+        unreal_likely: st.unreal_likely,
+        unity_likely: st.unity_likely,
+        re_engine: st.re_engine,
+        shaders_missing: game::shaders_missing(dir),
+        wrong_folder: game::install_folder_mismatch(&st.exe),
+        exe: st.exe.clone(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -238,6 +308,10 @@ impl App {
             fg_on: false,
             opti_scale_pct: 100,
             remix_swap_on: false,
+            working_scale: 1.0,
+            upstream_preset: 3,
+            opti_presr: false,
+            renodx_classic: false,
             renodx: RenodxLookup::Idle,
             renodx_rx: None,
             renodx_for: None,
@@ -261,6 +335,16 @@ impl App {
                 .storage
                 .and_then(|s| s.get_string("skip_version"))
                 .unwrap_or_default(),
+            settings: Settings::load(),
+            knobs: None,
+            knobs_err: None,
+            knobs_dirty: false,
+            log_expanded: true,
+            tip_dismissed: cc
+                .storage
+                .and_then(|s| s.get_string("tip_dismissed"))
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         };
         app.refresh();
         if app.resolved_exe.is_some() {
@@ -317,6 +401,64 @@ impl App {
             self.opti_scale_pct = 100;
             self.remix_swap_on = false;
             self.start_renodx_lookup();
+        }
+        self.reload_knobs_and_perf();
+    }
+
+    fn reload_knobs_and_perf(&mut self) {
+        self.knobs = None;
+        self.knobs_err = None;
+        self.knobs_dirty = false;
+        let Some(exe) = self.resolved_exe.clone() else {
+            return;
+        };
+        let Some(dir) = exe.parent().map(|p| p.to_path_buf()) else {
+            return;
+        };
+        match feeder_cfg::load(&dir) {
+            Ok(k) => {
+                self.knobs = Some(k);
+            }
+            Err(e) => self.knobs_err = Some(format!("{e:#}")),
+        }
+    }
+
+    fn apply_settings_to_game(&mut self) {
+        let Some(exe) = self.exe() else { return };
+        let Some(dir) = exe.parent().map(|p| p.to_path_buf()) else {
+            return;
+        };
+        let s = &self.settings;
+        let mut k = self.knobs.clone().unwrap_or_default();
+        if let Some(v) = s.knobs.work_resolution {
+            k.work_resolution = v;
+        }
+        if let Some(v) = s.knobs.ofa_enabled {
+            k.ofa_enabled = v;
+        }
+        if let Some(v) = s.knobs.ofa_grid {
+            k.ofa_grid = v;
+        }
+        if let Some(v) = s.knobs.reset_mode {
+            k.reset_mode = v;
+        }
+        if let Some(v) = s.knobs.light_stab {
+            k.light_stab = v;
+        }
+        if let Some(v) = s.knobs.engine_velocity {
+            k.engine_velocity = v;
+        }
+        k.evaluate_stride = s.overlay.evaluate_stride;
+        k.log_detail = s.overlay.log_detail;
+        match feeder_cfg::save(&dir, &k) {
+            Ok(()) => {
+                self.knobs = Some(k);
+                self.knobs_err = None;
+                self.knobs_dirty = false;
+                self.log
+                    .push(LogLine::Ok("Applied Settings defaults to this game".into()));
+            }
+            Err(e) => self.knobs_err = Some(format!("{e:#}")),
         }
     }
 
@@ -406,6 +548,28 @@ impl App {
         self.launch_panel = None;
         let engine = self.engine;
         let extras = self.extras();
+        std::env::set_var(
+            installer::WORKING_SCALE_ENV,
+            format!("{:.2}", self.working_scale),
+        );
+        if self.opti_presr {
+            std::env::set_var(installer::OPTI_SOURCE_ENV, "presr");
+        } else {
+            std::env::remove_var(installer::OPTI_SOURCE_ENV);
+        }
+        if self.renodx_classic {
+            std::env::set_var(installer::RENODX_TAG_ENV, installer::RENODX_CLASSIC_TAG);
+        } else {
+            std::env::remove_var(installer::RENODX_TAG_ENV);
+        }
+        std::env::set_var(
+            installer::UPSTREAM_PRESET_ENV,
+            if extras.upstream {
+                self.upstream_preset.to_string()
+            } else {
+                "0".to_owned()
+            },
+        );
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
         self.rx = Some(rx);
         self.running = true;
@@ -437,7 +601,7 @@ impl App {
             } else {
                 let p_tx = tx.clone();
                 let s_tx = tx.clone();
-                match installer::run_all_with(
+                match installer::run_all(
                     &exe,
                     engine,
                     extras,
@@ -549,21 +713,7 @@ impl App {
                 let meta = game::resolve_target(&g.dir)
                     .and_then(|(exe, _)| game::inspect(&exe))
                     .ok()
-                    .map(|st| GameMeta {
-                        api: match st.api {
-                            game::Api::Vulkan => "Vulkan",
-                            game::Api::Dx10 => "DirectX 10",
-                            game::Api::Dx11 => "DirectX 11",
-                            game::Api::Dx12 => "DirectX 12",
-                            game::Api::Dx9 => "DirectX 9",
-                            game::Api::Unknown => "Unknown",
-                        },
-                        has_dlss: st.mode == game::Mode::Native,
-                        addon: st.dlss5_addon || st.opti,
-                        ready: st.complete(),
-                        installed: game::installed_by_tool(st.game_dir()),
-                        stale: installer::stale_components(st.game_dir(), &latest),
-                    });
+                    .map(|st| meta_from_status(&st, &latest));
                 if let Some(m) = meta {
                     let _ = mtx.send((i, m));
                 }
@@ -650,15 +800,15 @@ impl App {
         self.open_game(path);
     }
 
-    /// Right click ▸ Update: install with the engine the game already carries,
-    /// without leaving the Games page -- the card itself shows the progress.
+    /// Install / Update from a Games card: resolve Shipping exe, keep progress on the card.
     fn update_game(&mut self, path: PathBuf, index: usize) {
-        self.exe_text = path.to_string_lossy().into_owned();
+        // Prefer the canonical Shipping exe from meta when we already inspected it.
+        let target = self.meta.get(&index).map(|m| m.exe.clone()).unwrap_or(path);
+        self.exe_text = target.to_string_lossy().into_owned();
         self.refresh();
         if let Some(Ok(st)) = &self.status {
-            // Whatever stops the Install button stops this too (anti-cheat, a
-            // foreign dxgi.dll): the Setup page is now open and says why.
             if !st.problems.is_empty() {
+                self.page = Page::Setup;
                 return;
             }
             self.engine = if st.opti {
@@ -666,14 +816,9 @@ impl App {
             } else {
                 Engine::ReShade
             };
-            // A RenoDX mod that is already installed stays installed: the
-            // step is only added when the lookup has found one, and Install
-            // refreshes what is there either way.
             self.updating = Some(index);
             self.start(None);
         } else {
-            // Could not even inspect it: the Setup page is the only place
-            // that can explain why.
             self.page = Page::Setup;
         }
     }
@@ -694,21 +839,7 @@ impl App {
             if let Some(m) = game::resolve_target(&g.dir)
                 .and_then(|(exe, _)| game::inspect(&exe))
                 .ok()
-                .map(|st| GameMeta {
-                    api: match st.api {
-                        game::Api::Vulkan => "Vulkan",
-                        game::Api::Dx10 => "DirectX 10",
-                        game::Api::Dx11 => "DirectX 11",
-                        game::Api::Dx12 => "DirectX 12",
-                        game::Api::Dx9 => "DirectX 9",
-                        game::Api::Unknown => "Unknown",
-                    },
-                    has_dlss: st.mode == game::Mode::Native,
-                    addon: st.dlss5_addon || st.opti,
-                    ready: st.complete(),
-                    installed: game::installed_by_tool(st.game_dir()),
-                    stale: installer::stale_components(st.game_dir(), &latest),
-                })
+                .map(|st| meta_from_status(&st, &latest))
             {
                 let _ = tx.send((index, m));
             }
@@ -1070,10 +1201,28 @@ const TILES_FEEDER: [Tile; 6] = [
     },
 ];
 
+/// Same Feeder row as above, but the in-game half is addon32 on 32-bit titles.
+const TILE_FEEDER32: Tile = Tile {
+    title: "DLSS5-Feeder",
+    detail: "dlss5-feed.addon32 · DLSS5_Feed.fx (detail residual + Optical Flow)",
+    ok: |s| s.feeder,
+    optional: false,
+};
+
 const TILE_OPTI: Tile = Tile {
     title: "OptiScaler + NR pass",
     detail: "Dagherbou fork as dxgi.dll · Insert opens its overlay",
     ok: |s| s.opti,
+    optional: false,
+};
+
+/// The OptiScaler route's neural consumer is built into OptiScaler itself, so
+/// it needs the model and nothing else. Showing the ReShade route's add-on row
+/// here left a finished install reporting "missing" (#66).
+const TILE_OPTI_MODEL: Tile = Tile {
+    title: "DLSS 5 model \u{00b7} leaked",
+    detail: "nvngx_dlssnr.dll \u{00b7} OptiScaler's own NR pass consumes it",
+    ok: |s| s.dlssnr,
     optional: false,
 };
 
@@ -1156,12 +1305,36 @@ const TILE_REFRAMEWORK: Tile = Tile {
     optional: false,
 };
 
+/// Shortens `text` until it measures within `max_w`, ending in an ellipsis.
+///
+/// egui will happily wrap a long title onto a second line that the caption has
+/// no room for, and the clip rect then cuts that line through the middle of the
+/// letters. One line that says it was shortened is honest; half a line is not.
+fn truncate_to_fit(text: &str, max_w: f32, measure: impl Fn(&str) -> f32) -> String {
+    if measure(text) <= max_w {
+        return text.to_owned();
+    }
+    let mut end = text.len();
+    while end > 0 {
+        // Step back to a character boundary, never into the middle of one.
+        end -= 1;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let candidate = format!("{}\u{2026}", text[..end].trim_end());
+        if measure(&candidate) <= max_w {
+            return candidate;
+        }
+    }
+    String::new()
+}
+
 fn tiles_for(
     st: Option<&GameStatus>,
     engine: Engine,
     renodx_on: bool,
-    mfg_on: bool,
     upstream_on: bool,
+    mfg_on: bool,
 ) -> Vec<&'static Tile> {
     let mut v = base_tiles(st, engine, upstream_on);
     // A Remix game's status is only the two Remix tiles.
@@ -1189,7 +1362,7 @@ fn base_tiles(st: Option<&GameStatus>, engine: Engine, upstream_on: bool) -> Vec
     }
     match st.map(|s| s.mode) {
         Some(game::Mode::Native) if engine == Engine::Opti || st.is_some_and(|s| s.opti) => {
-            vec![&TILES_NATIVE[0], &TILE_OPTI, &TILES_NATIVE[2]]
+            vec![&TILES_NATIVE[0], &TILE_OPTI, &TILE_OPTI_MODEL]
         }
         Some(game::Mode::Native) => {
             let needs_bridge = st.is_some_and(|s| s.needs_bridge());
@@ -1206,7 +1379,16 @@ fn base_tiles(st: Option<&GameStatus>, engine: Engine, upstream_on: bool) -> Vec
                 })
                 .collect()
         }
-        _ => TILES_FEEDER.iter().collect(),
+        _ => TILES_FEEDER
+            .iter()
+            .map(|t| {
+                if t.title == "DLSS5-Feeder" && st.is_some_and(|s| s.is32()) {
+                    &TILE_FEEDER32
+                } else {
+                    t
+                }
+            })
+            .collect(),
     }
 }
 
@@ -1753,11 +1935,37 @@ impl App {
             );
             p.rect_filled(band, CornerRadius::ZERO, Color32::from_black_alpha(170));
             let mut x = band.left() + 10.0;
+            let dlss_label = if m.has_dlss { "DLSS own" } else { "no DLSS" };
+            // A game nothing has been done to has no third state to report, and
+            // an em dash on its own read as a rendering fault rather than as
+            // "not installed" (#77).
+            let ready_label = if !m.stale.is_empty() {
+                Some("stale")
+            } else if m.ready {
+                Some("ready")
+            } else if m.installed {
+                Some("partial")
+            } else {
+                None
+            };
             for (on, label) in [
-                (m.has_dlss, if m.has_dlss { "DLSS" } else { "no DLSS" }),
-                (m.addon, if m.addon { "add-on" } else { "no add-on" }),
+                (m.has_dlss, Some(dlss_label)),
+                (m.addon || m.installed, Some(m.engine_path)),
+                (m.ready && m.stale.is_empty(), ready_label),
             ] {
+                let Some(label) = label else { continue };
                 let cy = band.center().y;
+                // Three labels do not always fit the poster's width, and the
+                // last one ran out past the card's border rather than being
+                // dropped (#77). The dots are a summary; a summary that
+                // overflows is worse than a shorter one.
+                let w = p
+                    .layout_no_wrap(label.to_owned(), t::plex_medium(10.5), t::TEXT_SOFT)
+                    .size()
+                    .x;
+                if x + 11.0 + w > band.right() - 6.0 {
+                    break;
+                }
                 p.circle_filled(
                     egui::pos2(x + 3.0, cy),
                     3.0,
@@ -1769,7 +1977,17 @@ impl App {
                     galley.clone(),
                     t::TEXT_SOFT,
                 );
-                x += 11.0 + galley.size().x + 12.0;
+                x += 11.0 + galley.size().x + 10.0;
+            }
+            // Caps + warnings as tiny chips under the band (hover text carries detail).
+            if m.shaders_missing || m.wrong_folder.is_some() {
+                let warn = p.layout_no_wrap("!".to_owned(), t::plex_semibold(10.0), t::BG);
+                let badge = egui::Rect::from_min_size(
+                    egui::pos2(poster.right() - 22.0, poster.bottom() - 48.0),
+                    warn.size() + Vec2::new(10.0, 4.0),
+                );
+                p.rect_filled(badge, CornerRadius::same(6), t::WARN);
+                p.galley(badge.min + Vec2::new(5.0, 2.0), warn, t::BG);
             }
         }
         // Caption: store mark on the left, title beside it.
@@ -1780,11 +1998,19 @@ impl App {
         );
         store_mark(ui, &self.store_icons, mark, g.store, t::TEXT_OFF);
         let title_x = mark.right() + 7.0;
-        let title = p.layout(
-            g.title.clone(),
+        // The title used to wrap to two lines and then have the second line
+        // sliced in half by the caption's clip rect, which reads as the text
+        // being cut off mid-word — because it is (#77). One line, ellipsis.
+        let avail = cap.right() - title_x - 8.0;
+        let measure = |t: &str| {
+            p.layout_no_wrap(t.to_owned(), t::plex_medium(12.0), t::TEXT)
+                .size()
+                .x
+        };
+        let title = p.layout_no_wrap(
+            truncate_to_fit(&g.title, avail, measure),
             t::plex_medium(12.0),
             t::TEXT,
-            cap.right() - title_x - 8.0,
         );
         let clip = egui::Rect::from_min_max(cap.min, egui::pos2(cap.right(), cap.bottom() - 4.0));
         ui.painter().with_clip_rect(clip).galley(
@@ -1799,14 +2025,42 @@ impl App {
             StrokeKind::Inside,
         );
         if hovered {
-            let stale = self
-                .meta
-                .get(&i)
+            let m = self.meta.get(&i);
+            let stale = m
                 .filter(|m| !m.stale.is_empty())
                 .map(|m| format!("\n\nOut of date:\n  {}", m.stale.join("\n  ")))
                 .unwrap_or_default();
-            resp.clone()
-                .on_hover_text(format!("{}\n{}{stale}", g.title, g.dir.display()));
+            let mut caps = String::new();
+            if let Some(m) = m {
+                let mut bits = Vec::new();
+                if m.rt_likely {
+                    bits.push("RT-likely");
+                }
+                if m.unreal_likely {
+                    bits.push("Unreal");
+                }
+                if m.unity_likely {
+                    bits.push("Unity");
+                }
+                if m.re_engine {
+                    bits.push("RE Engine");
+                }
+                if !bits.is_empty() {
+                    caps = format!("\nCaps: {}", bits.join(", "));
+                }
+                if m.shaders_missing {
+                    caps.push_str("\nWarning: shaders missing");
+                }
+                if let Some(w) = &m.wrong_folder {
+                    caps.push_str(&format!("\nWarning: {w}"));
+                }
+            }
+            resp.clone().on_hover_text(format!(
+                "{}{}\n{}{stale}{caps}",
+                g.title,
+                caps,
+                g.dir.display()
+            ));
         }
         // Being installed right now: dim the poster, say so, and show how far
         // along it is, right where the user asked for it.
@@ -1863,6 +2117,52 @@ impl App {
         };
         let installed = self.meta.get(&i).is_some_and(|m| m.installed);
         let stale = self.meta.get(&i).is_some_and(|m| !m.stale.is_empty());
+        let meta_ready = self.meta.contains_key(&i);
+        // Primary Install / Update on the card (not only the context menu).
+        if meta_ready && self.updating != Some(i) && !self.running {
+            let label = if !installed {
+                "Install"
+            } else if stale {
+                "Update"
+            } else {
+                "Re-install"
+            };
+            let btn_h = 28.0;
+            let btn = egui::Rect::from_min_size(
+                egui::pos2(poster.left() + 10.0, poster.bottom() - btn_h - 30.0),
+                Vec2::new(poster.width() - 20.0, btn_h),
+            );
+            let btn_resp =
+                ui.interact(btn, ui.id().with(("card_install", i)), egui::Sense::click());
+            let fill = if btn_resp.hovered() {
+                t::ACCENT
+            } else {
+                Color32::from_black_alpha(200)
+            };
+            ui.painter().rect_filled(btn, CornerRadius::same(7), fill);
+            ui.painter().rect_stroke(
+                btn,
+                CornerRadius::same(7),
+                Stroke::new(1.0, t::BORDER_STRONG),
+                StrokeKind::Inside,
+            );
+            let galley = ui.painter().layout_no_wrap(
+                label.to_owned(),
+                t::plex_semibold(12.0),
+                if btn_resp.hovered() { t::BG } else { t::TEXT },
+            );
+            ui.painter().galley(
+                egui::pos2(
+                    btn.center().x - galley.size().x / 2.0,
+                    btn.center().y - galley.size().y / 2.0,
+                ),
+                galley,
+                t::TEXT,
+            );
+            if btn_resp.clicked() {
+                action = CardAction::Update;
+            }
+        }
         if installed || g.store == Store::Manual {
             resp.context_menu(|ui| {
                 if installed {
@@ -1882,6 +2182,249 @@ impl App {
             });
         }
         action
+    }
+
+    fn settings_page(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Settings").font(t::sora(16.0)).color(t::TEXT));
+        ui.label(
+            RichText::new(
+                "User install defaults — saved to settings.json and applied on new Install \
+                 (optional: Apply to the game open on Setup). Separate from Feeder built-in \
+                 defaults (what the add-on writes when no dlss5-feed.cfg exists).",
+            )
+            .font(t::plex(12.0))
+            .color(t::TEXT_MUTED),
+        );
+        ui.add_space(10.0);
+
+        ui.label(
+            RichText::new("Quality seed (user install)")
+                .font(t::plex_semibold(13.0))
+                .color(t::TEXT),
+        );
+        ui.horizontal(|ui| {
+            for c in [
+                QualityChoice::Auto,
+                QualityChoice::Low,
+                QualityChoice::Medium,
+                QualityChoice::High,
+            ] {
+                let on = self.settings.quality_choice() == c;
+                if ui.selectable_label(on, c.label()).clicked() {
+                    self.settings.set_quality_choice(c);
+                }
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("Feeder knobs (user install overrides)")
+                .font(t::plex_semibold(13.0))
+                .color(t::TEXT),
+        );
+        ui.label(
+            RichText::new(
+                "Unset sliders follow the quality seed. Explicit values override on Install.",
+            )
+            .font(t::plex(11.0))
+            .color(t::TEXT_DIM),
+        );
+        {
+            let k = &mut self.settings.knobs;
+            let mut work = k.work_resolution.unwrap_or(100);
+            if ui
+                .add(egui::Slider::new(&mut work, 50..=100).text("work_resolution %"))
+                .changed()
+            {
+                k.work_resolution = Some(work);
+            }
+            let mut ofa = k.ofa_enabled.unwrap_or(false);
+            if ui.checkbox(&mut ofa, "ofa_enabled").changed() {
+                k.ofa_enabled = Some(ofa);
+            }
+            let mut reset = k.reset_mode.unwrap_or(2);
+            if ui
+                .add(
+                    egui::Slider::new(&mut reset, 0..=2)
+                        .text("reset_mode (0 off / 1 every / 2 adaptive)"),
+                )
+                .changed()
+            {
+                k.reset_mode = Some(reset);
+            }
+            let mut ls = k.light_stab.unwrap_or(false);
+            if ui.checkbox(&mut ls, "light_stab").changed() {
+                k.light_stab = Some(ls);
+            }
+            let mut ev = k.engine_velocity.unwrap_or(true);
+            if ui.checkbox(&mut ev, "engine_velocity").changed() {
+                k.engine_velocity = Some(ev);
+            }
+        }
+
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("Overlay UX (user install)")
+                .font(t::plex_semibold(13.0))
+                .color(t::TEXT),
+        );
+        ui.add(egui::Slider::new(&mut self.settings.overlay.log_detail, 0..=2).text("log_detail"));
+        ui.add(
+            egui::Slider::new(&mut self.settings.overlay.evaluate_stride, 1..=4)
+                .text("evaluate_stride"),
+        );
+        ui.add(egui::Slider::new(&mut self.settings.overlay.log_frames, 0..=20).text("log_frames"));
+
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if ui.button("Save settings.json").clicked() {
+                if let Err(e) = self.settings.save() {
+                    self.last_error = Some(format!("{e:#}"));
+                }
+            }
+            if ui
+                .add_enabled(
+                    self.resolved_exe.is_some(),
+                    egui::Button::new("Apply defaults to this game"),
+                )
+                .clicked()
+            {
+                let _ = self.settings.save();
+                self.apply_settings_to_game();
+            }
+            if ui
+                .button("Reset to Feeder defaults")
+                .on_hover_text(
+                    "Restore form to Feeder stock: work_resolution=100, ofa off (grid 2 / perf 10), \
+                     reset_mode=2 adaptive, light_stab off, engine_velocity on, overlay log_detail=1 / \
+                     evaluate_stride=1 / log_frames=3, quality Auto.",
+                )
+                .clicked()
+            {
+                self.settings.reset_to_feeder_defaults();
+            }
+        });
+        ui.label(
+            RichText::new(
+                "Feeder built-in defaults = stock add-on cfg (not your settings.json). \
+                 Reset above copies those into this form; Save to persist.",
+            )
+            .font(t::plex(11.0))
+            .color(t::TEXT_DIM),
+        );
+        ui.label(
+            RichText::new(format!("File: {}", Settings::path().display()))
+                .font(t::mono(11.0))
+                .color(t::TEXT_DIM),
+        );
+    }
+
+    fn knobs_panel(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        ui.separator();
+        ui.label(
+            RichText::new("Feeder knobs (offline)")
+                .font(t::plex_semibold(13.0))
+                .color(t::TEXT),
+        );
+        if self.knobs.is_none() {
+            if let Some(err) = &self.knobs_err {
+                ui.label(
+                    RichText::new(err.clone())
+                        .font(t::plex(12.0))
+                        .color(t::TEXT_MUTED),
+                );
+                if ui.button("Install DLSS 5").clicked() {
+                    self.start(None);
+                }
+            } else {
+                ui.label(
+                    RichText::new("Select a game first.")
+                        .font(t::plex(12.0))
+                        .color(t::TEXT_DIM),
+                );
+            }
+            return;
+        }
+
+        let mut changed = false;
+        {
+            let k = self.knobs.as_mut().unwrap();
+            let wr = ui
+                .add(egui::Slider::new(&mut k.work_resolution, 50..=100).text("work_resolution %"))
+                .changed();
+            changed |= wr;
+            let sharp = ui
+                .add(egui::Slider::new(&mut k.work_sharpness, 0.0..=1.0).text("work_sharpness"))
+                .changed();
+            changed |= sharp;
+            changed |= ui
+                .checkbox(&mut k.ofa_enabled, "Optical Flow (ofa)")
+                .changed();
+            if k.ofa_enabled {
+                changed |= ui
+                    .add(egui::Slider::new(&mut k.ofa_grid, 0..=4).text("ofa_grid"))
+                    .changed();
+            }
+            let reset = ui
+                .add(egui::Slider::new(&mut k.reset_mode, 0..=2).text("reset_mode"))
+                .changed();
+            changed |= reset;
+            changed |= ui.checkbox(&mut k.light_stab, "light_stab").changed();
+            changed |= ui
+                .checkbox(&mut k.engine_velocity, "engine_velocity")
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut k.evaluate_stride, 1..=4).text("evaluate_stride"))
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut k.appearance_threshold, 0.01..=0.12)
+                        .text("appearance_threshold"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut k.lighting_threshold, 0.01..=0.12)
+                        .text("lighting_threshold"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut k.detail_threshold, 0.005..=0.08)
+                        .text("detail_threshold"),
+                )
+                .changed();
+        }
+        if changed {
+            self.knobs_dirty = true;
+        }
+        ui.horizontal(|ui| {
+            let write = egui::Button::new(if self.knobs_dirty {
+                "Write cfg *"
+            } else {
+                "Write cfg"
+            });
+            if ui.add_enabled(self.knobs.is_some(), write).clicked() {
+                if let (Some(exe), Some(k)) = (self.exe(), self.knobs.clone()) {
+                    if let Some(dir) = exe.parent() {
+                        match feeder_cfg::save(dir, &k) {
+                            Ok(()) => {
+                                self.knobs_dirty = false;
+                                self.log.push(LogLine::Ok(
+                                    "Wrote dlss5-feed.cfg + FX uniforms (Feeder reloads ~60 frames / next launch)"
+                                        .into(),
+                                ));
+                            }
+                            Err(e) => self.log.push(LogLine::Fail(format!("{e:#}"))),
+                        }
+                    }
+                }
+            }
+            if ui.button("Reload from disk").clicked() {
+                self.reload_knobs_and_perf();
+            }
+        });
     }
 }
 
@@ -1987,6 +2530,10 @@ impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string("exe", self.exe_text.clone());
         storage.set_string("skip_version", self.skipped_version.clone());
+        storage.set_string(
+            "tip_dismissed",
+            if self.tip_dismissed { "1" } else { "0" }.into(),
+        );
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -2060,6 +2607,7 @@ impl eframe::App for App {
                     for (page, label, enabled) in [
                         (Page::Games, "Games", true),
                         (Page::Setup, "Setup", setup_enabled),
+                        (Page::Settings, "Settings", true),
                         (Page::About, "About", true),
                     ] {
                         let active = self.page == page;
@@ -2157,27 +2705,36 @@ impl eframe::App for App {
                         {
                             ui.ctx().open_url(egui::OpenUrl::new_tab(KOFI_URL));
                         }
-                        chip(
-                            ui,
-                            concat!("v", env!("CARGO_PKG_VERSION")),
-                            t::TEXT_DIM,
-                            false,
-                        );
-                        chip(ui, "LEAKED BUILD", t::ACCENT, true);
-                        let (r, _) =
-                            ui.allocate_exact_size(Vec2::new(64.0, 20.0), egui::Sense::hover());
-                        ui.painter().circle_filled(
-                            r.left_center() + Vec2::new(5.0, 0.0),
-                            3.5,
-                            t::ACCENT,
-                        );
-                        ui.painter().text(
-                            r.left_center() + Vec2::new(14.0, 0.0),
-                            egui::Align2::LEFT_CENTER,
-                            "Ready",
-                            t::plex_semibold(12.0),
-                            t::TEXT,
-                        );
+                        // In a narrow window these used to be drawn over the
+                        // page tabs — "About" and "Ready" on the same pixels.
+                        // Decoration goes first, the tabs stay reachable (#64).
+                        if ui.available_width() > 90.0 {
+                            chip(
+                                ui,
+                                concat!("v", env!("CARGO_PKG_VERSION")),
+                                t::TEXT_DIM,
+                                false,
+                            );
+                        }
+                        if ui.available_width() > 130.0 {
+                            chip(ui, "LEAKED BUILD", t::ACCENT, true);
+                        }
+                        if ui.available_width() > 64.0 {
+                            let (r, _) =
+                                ui.allocate_exact_size(Vec2::new(64.0, 20.0), egui::Sense::hover());
+                            ui.painter().circle_filled(
+                                r.left_center() + Vec2::new(5.0, 0.0),
+                                3.5,
+                                t::ACCENT,
+                            );
+                            ui.painter().text(
+                                r.left_center() + Vec2::new(14.0, 0.0),
+                                egui::Align2::LEFT_CENTER,
+                                "Ready",
+                                t::plex_semibold(12.0),
+                                t::TEXT,
+                            );
+                        }
                     });
                 });
             });
@@ -2313,6 +2870,51 @@ impl eframe::App for App {
             }
         }
 
+        if !self.tip_dismissed {
+            egui::Panel::top("first_run_tip")
+                .frame(
+                    Frame::new()
+                        .fill(t::TILE)
+                        .inner_margin(Margin {
+                            left: 18,
+                            right: 18,
+                            top: 10,
+                            bottom: 10,
+                        })
+                        .stroke(Stroke::new(1.0, t::BORDER)),
+                )
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        // The button is drawn after the text but sits on top of
+                        // it: reserve its width first, or the wrapped last line
+                        // runs underneath it (#77).
+                        let tip_w = (ui.available_width() - 92.0).max(120.0);
+                        ui.vertical(|ui| {
+                            ui.set_max_width(tip_w);
+                            ui.label(
+                                RichText::new("Quick tip")
+                                    .font(t::plex_semibold(13.0))
+                                    .color(t::TEXT),
+                            );
+                            ui.label(
+                                RichText::new(
+                                    "This tool installs ReShade + DLSS5-Feeder + neural DLSS for games that ship without DLSS. \
+                                     After Install: in-game press Home → Add-ons tab → enable DLSS 5 Neural Rendering. \
+                                     Use Settings to seed Feeder defaults on the next Install.",
+                                )
+                                .font(t::plex(12.0))
+                                .color(t::TEXT_SOFT),
+                            );
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                            if ui.button("Got it").clicked() {
+                                self.tip_dismissed = true;
+                            }
+                        });
+                    });
+                });
+        }
+
         egui::CentralPanel::default()
             .frame(Frame::new().fill(t::PANEL).inner_margin(Margin {
                 left: 24,
@@ -2325,6 +2927,15 @@ impl eframe::App for App {
                 match self.page {
                     Page::Games => {
                         self.games_page(ui);
+                        return;
+                    }
+                    Page::Settings => {
+                        // Same fix Setup got: on a 768 px screen the Save /
+                        // Apply / Reset row is below the edge, and there was no
+                        // way to reach it (#64).
+                        egui::ScrollArea::both()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| self.settings_page(ui));
                         return;
                     }
                     Page::About => {
@@ -2366,8 +2977,17 @@ impl eframe::App for App {
                     }
                     Page::Setup => {}
                 }
-                // The setup panel was designed at 720 px; keep it from stretching.
+                // Everything below scrolls: on a 768 px-tall screen the button row
+                // and the log fell off the bottom with no way to reach them (#64).
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 12.0;
+                // The setup panel was designed at 720 px; keep it from stretching,
+                // and give it that width to lay out in even when the window is
+                // narrower — the scroll area is what makes the rest reachable (#64).
                 ui.set_max_width(860.0);
+                ui.set_min_width(720.0);
                 self.launch_options_panel(ui);
 
                 // ── path row ──────────────────────────────────────
@@ -2459,11 +3079,15 @@ impl eframe::App for App {
                             let mut choice = game::mode_override();
                             let name = |m: Option<game::Mode>| match m {
                                 None => match s.mode_detected {
-                                    game::Mode::Native => "Auto: native DLSS · add-on hooks the game",
-                                    game::Mode::Feeder => "Auto: no DLSS · Feeder path",
+                                    game::Mode::Native => {
+                                        "Auto: native DLSS · renodx hooks game (Feeder Optimize N/A)"
+                                    }
+                                    game::Mode::Feeder => "Auto: no DLSS · Feeder path + Optimize",
                                 },
-                                Some(game::Mode::Native) => "Force native DLSS",
-                                Some(game::Mode::Feeder) => "Force no-DLSS (Feeder)",
+                                Some(game::Mode::Native) => {
+                                    "Force native DLSS (Feeder Optimize N/A)"
+                                }
+                                Some(game::Mode::Feeder) => "Force no-DLSS (Feeder + Optimize)",
                             };
                             let before = choice;
                             egui::ComboBox::from_id_salt("mode_pick")
@@ -2486,6 +3110,89 @@ impl eframe::App for App {
                             .font(t::plex(12.0))
                             .color(t::DANGER),
                     );
+                }
+                if ok_status
+                    .as_ref()
+                    .is_some_and(|s| s.needs_dgvoodoo() && problems.is_empty())
+                {
+                    ui.label(
+                        RichText::new(
+                            "DirectX 9: Install will download dgVoodoo 2.87.3 into the game folder \
+                             first (official GitHub release → d3d9.dll + dgVoodoo.conf), then continue \
+                             with ReShade / Feeder. / DirectX 9: Install сначала скачает dgVoodoo 2.87.3 \
+                             в папку игры, затем продолжит установку.",
+                        )
+                        .font(t::plex(12.0))
+                        .color(t::TEXT_SOFT),
+                    );
+                }
+                if let Some(s) = &ok_status {
+                    let mut caps: Vec<&str> = Vec::new();
+                    if s.mode == game::Mode::Native {
+                        caps.push("Native DLSS (Feeder Optimize N/A)");
+                    }
+                    if s.rt_likely {
+                        caps.push("RT-likely");
+                    }
+                    if s.re_engine {
+                        caps.push("RE Engine");
+                    }
+                    if s.unreal_likely {
+                        caps.push("Unreal-likely");
+                    }
+                    if s.unity_likely {
+                        caps.push("Unity-likely");
+                    }
+                    if s.api == game::Api::Dx12 && s.mode == game::Mode::Feeder {
+                        caps.push("DX12 Feeder (Optimize, no OFA)");
+                    }
+                    if !caps.is_empty() {
+                        ui.label(
+                            RichText::new(format!("Caps: {}", caps.join(" · ")))
+                                .font(t::plex(11.5))
+                                .color(t::TEXT_MUTED),
+                        );
+                    }
+                }
+                // Remote Desktop hands the session a virtual display adapter, so the
+                // real card is invisible and the check refuses a machine that would
+                // work locally (#3). Same shape of escape hatch as the anti-cheat one.
+                if self
+                    .status
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .is_some_and(|s| s.problems.iter().any(|p| p.starts_with("GPU is ")))
+                    || game::skip_gpu_check()
+                {
+                    let mut on = game::skip_gpu_check();
+                    let cb = egui::Checkbox::new(
+                        &mut on,
+                        RichText::new(
+                            "That is not the card I game on \u{2014} Remote Desktop, a virtual display, or a misread. Check anyway, at my own risk",
+                        )
+                        .font(t::plex(11.5))
+                        .color(t::TEXT_SOFT),
+                    );
+                    if ui.add_enabled(!self.running, cb).changed() {
+                        game::set_skip_gpu_check(on);
+                        self.inspect_resolved();
+                    }
+                }
+                // Driver 616.64 faults inside NGX with the current add-on build;
+                // the classic one is the way through until that is fixed (#69).
+                if self.engine == Engine::ReShade {
+                    let mut on = self.renodx_classic;
+                    let cb = egui::Checkbox::new(
+                        &mut on,
+                        RichText::new(
+                            "Black screen, crash or driver reset with DLSS 5 on? Install the classic add-on build (4.55)",
+                        )
+                        .font(t::plex(11.5))
+                        .color(t::TEXT_SOFT),
+                    );
+                    if ui.add_enabled(!self.running, cb).changed() {
+                        self.renodx_classic = on;
+                    }
                 }
                 if let Some(ac) = ok_status.as_ref().and_then(|s| s.anticheat) {
                     let mut on = game::ignore_anticheat();
@@ -2605,6 +3312,97 @@ impl eframe::App for App {
                         self.engine = Engine::Opti;
                     }
                 }
+                if self.engine == Engine::Opti {
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(
+                            RichText::new("OPTISCALER BUILD")
+                                .font(t::plex_semibold(11.0))
+                                .color(t::TEXT_MUTED),
+                        );
+                        for (presr, label) in
+                            [(false, "Stable"), (true, "Pre-SR multipass \u{00b7} experimental")]
+                        {
+                            let on = self.opti_presr == presr;
+                            let btn = egui::Button::new(
+                                RichText::new(label)
+                                    .font(t::plex_medium(12.0))
+                                    .color(if on { t::BG } else { t::TEXT_SOFT }),
+                            )
+                            .fill(if on { t::ACCENT } else { Color32::TRANSPARENT })
+                            .stroke(Stroke::new(
+                                1.0,
+                                if on { t::ACCENT } else { t::BORDER_STRONG },
+                            ))
+                            .corner_radius(CornerRadius::same(8))
+                            .min_size(Vec2::new(if presr { 200.0 } else { 90.0 }, 30.0));
+                            if ui.add(btn).clicked() {
+                                self.opti_presr = presr;
+                            }
+                        }
+                    });
+                    ui.label(
+                        RichText::new(if self.opti_presr {
+                            "wilsjo2's fork: the network runs BEFORE super resolution, on the \
+                             smaller image, in 1-3 passes. Bigger download (about 160 MB) and \
+                             barely tested here \u{2014} report what you see."
+                        } else {
+                            "Dagherbou's build: the network runs after super resolution. \
+                             The one most people are running."
+                        })
+                        .font(t::plex(11.0))
+                        .color(t::TEXT_DIM),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(
+                            RichText::new("MODEL RESOLUTION")
+                                .font(t::plex_semibold(11.0))
+                                .color(t::TEXT_MUTED),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "\u{2014} the frame stays full size; only the model's own work is done smaller",
+                            )
+                            .font(t::plex(11.0))
+                            .color(t::TEXT_DIM),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        // Cost falls with the square, so the saving is worth naming.
+                        for (scale, label, note) in [
+                            (1.0_f32, "100%", "full cost"),
+                            (0.75, "75%", "about half the cost"),
+                            (0.5, "50%", "about a quarter"),
+                        ] {
+                            let on = (self.working_scale - scale).abs() < 0.01;
+                            let btn = egui::Button::new(
+                                RichText::new(label)
+                                    .font(t::plex_medium(12.0))
+                                    .color(if on { t::BG } else { t::TEXT_SOFT }),
+                            )
+                            .fill(if on { t::ACCENT } else { Color32::TRANSPARENT })
+                            .stroke(Stroke::new(1.0, if on { t::ACCENT } else { t::BORDER_STRONG }))
+                            .corner_radius(CornerRadius::same(8))
+                            .min_size(Vec2::new(72.0, 30.0));
+                            if ui.add(btn).on_hover_text(note).clicked() {
+                                self.working_scale = scale;
+                            }
+                        }
+                        ui.label(
+                            RichText::new(match self.working_scale {
+                                s if s >= 0.99 => "The model runs at full output resolution.",
+                                s if s >= 0.74 => "Costs about half as much; the biggest single fps lever here.",
+                                _ => "Costs about a quarter; the model's contribution is softer.",
+                            })
+                            .font(t::plex(11.0))
+                            .color(t::TEXT_DIM),
+                        );
+                    });
+                }
                 if self.engine == Engine::ReShade {
                     ui.add_space(6.0);
                     if !native {
@@ -2672,6 +3470,46 @@ impl eframe::App for App {
                     }
                     if self.upstream_on {
                         ui.add_space(6.0);
+                        // The add-on reads these from ReShade.ini at startup, so
+                        // the choice can be made here rather than only in the
+                        // in-game overlay (#68).
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            ui.label(
+                                RichText::new("HOW TRANSFORMATIVE")
+                                    .font(t::plex_semibold(11.0))
+                                    .color(t::TEXT_MUTED),
+                            );
+                            let current = reshade_ini::UPSTREAM_PRESETS
+                                .iter()
+                                .find(|(_, id, _)| *id == self.upstream_preset)
+                                .map(|(n, ..)| *n)
+                                .unwrap_or("Reference");
+                            egui::ComboBox::from_id_salt("upstream_preset")
+                                .selected_text(RichText::new(current).font(t::plex(12.0)))
+                                .width(150.0)
+                                .show_ui(ui, |ui| {
+                                    for (name, id, _) in reshade_ini::UPSTREAM_PRESETS {
+                                        ui.selectable_value(
+                                            &mut self.upstream_preset,
+                                            id,
+                                            RichText::new(name).font(t::plex(12.0)),
+                                        );
+                                    }
+                                });
+                            ui.label(
+                                RichText::new(match self.upstream_preset {
+                                    1 => "Keeps the lighting work, holds back invented detail.",
+                                    2 => "Half way: detail is enhanced but not rebuilt.",
+                                    4 => "Past what the network intends \u{2014} detail starts looking drawn.",
+                                    5 => "Deliberately overcooked: waxy skin, invented surfaces.",
+                                    _ => "Everything the network wants to do. Its own default.",
+                                })
+                                .font(t::plex(11.0))
+                                .color(t::TEXT_DIM),
+                            );
+                        });
+                        ui.add_space(6.0);
                         let warn = "EXPERIMENTAL. Using DLSS Frame Generation? Set this add-on to \
                                     Quality in the ReShade overlay, so the network runs on every \
                                     frame. At any lower setting it runs on one frame in two or \
@@ -2698,7 +3536,9 @@ impl eframe::App for App {
                             });
                     }
                 }
-                ui.add_space(2.0);
+                // The engine card's own border ended flush against this
+                // heading, which read as the two touching (#77).
+                ui.add_space(12.0);
 
                 // ── component list (status, not controls) ────────
                 ui.label(
@@ -2714,8 +3554,8 @@ impl eframe::App for App {
                     ok_status.as_ref(),
                     self.engine,
                     self.renodx_on,
-                    self.mfg_on,
                     self.upstream_on,
+                    self.mfg_on,
                 );
                 for row in tiles.chunks(2) {
                     let (row_rect, _) =
@@ -2979,18 +3819,85 @@ impl eframe::App for App {
                             }
                         }
                     }
+                    let vulkan = ok_status
+                        .as_ref()
+                        .is_some_and(|s| s.api == game::Api::Vulkan);
+                    if vulkan {
+                        let vk_btn = egui::Button::new(
+                            RichText::new("Copy Vulkan Feeder kit")
+                                .font(t::plex_medium(13.0))
+                                .color(t::TEXT_OFF),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::new(1.0, t::BORDER_STRONG))
+                        .corner_radius(CornerRadius::same(8))
+                        .min_size(Vec2::new(170.0, 42.0));
+                        if ui
+                            .add_enabled(!self.running, vk_btn)
+                            .on_hover_text(
+                                "Copies dlss5-feed.addon64 + DLSS5_Feed.fx + VULKAN-SETUP.txt. \
+                                 Does not register a Vulkan layer — finish with ReShade Setup.",
+                            )
+                            .clicked()
+                        {
+                            if let Some(exe) = self.exe() {
+                                let dir = exe.parent().unwrap().to_path_buf();
+                                match installer::copy_vulkan_feeder_kit(&dir) {
+                                    Ok(files) => {
+                                        self.log.push(LogLine::Ok(format!(
+                                            "Vulkan kit: {}",
+                                            files.join(", ")
+                                        )));
+                                        self.inspect_resolved();
+                                    }
+                                    Err(e) => {
+                                        self.log.push(LogLine::Fail(format!("{e:#}")));
+                                        self.last_error = Some(format!("{e:#}"));
+                                    }
+                                }
+                            }
+                        }
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let missing = ok_status
+                            .as_ref()
+                            .map(installer::missing_install_files)
+                            .unwrap_or_default();
+                        let stale = self
+                            .exe()
+                            .and_then(|e| {
+                                self.meta
+                                    .values()
+                                    .find(|m| m.exe == e)
+                                    .map(|m| m.stale.clone())
+                            })
+                            .unwrap_or_default();
                         let msg = if self.running || !self.progress_msg.is_empty() {
                             self.progress_msg.clone()
+                        } else if !missing.is_empty() {
+                            format!("Incomplete: missing {}", missing.join(", "))
+                        } else if !stale.is_empty() {
+                            format!("Update available: {}", stale.join("; "))
                         } else if complete {
                             "Everything is in place.".to_owned()
                         } else {
                             String::new()
                         };
-                        let color = if msg.starts_with("Failed") { t::DANGER } else { t::ACCENT };
+                        let color = if msg.starts_with("Failed")
+                            || msg.starts_with("Incomplete")
+                        {
+                            t::DANGER
+                        } else if msg.starts_with("Update available") {
+                            t::WARN
+                        } else {
+                            t::ACCENT
+                        };
                         ui.label(RichText::new(msg).font(t::plex_medium(12.0)).color(color));
                     });
                 });
+
+                // Offline knobs / expected FPS from Feeder perf log.
+                self.knobs_panel(ui);
 
                 // ── progress ──────────────────────────────────────
                 let (bar, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 4.0), egui::Sense::hover());
@@ -3004,40 +3911,100 @@ impl eframe::App for App {
 
                 // ── log ───────────────────────────────────────────
                 let hint_h = 34.0;
-                let log_h = (ui.available_height() - hint_h - 12.0).max(80.0);
-                Frame::new()
-                    .fill(t::BG)
-                    .stroke(Stroke::new(1.0, t::BORDER))
-                    .corner_radius(CornerRadius::same(8))
-                    .inner_margin(Margin::symmetric(12, 10))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.set_height(log_h - 20.0);
-                        egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
-                            ui.spacing_mut().item_spacing.y = 2.0;
+                let fails: Vec<&LogLine> = self
+                    .log
+                    .iter()
+                    .filter(|l| matches!(l, LogLine::Fail(_)))
+                    .collect();
+                let oks = self
+                    .log
+                    .iter()
+                    .filter(|l| matches!(l, LogLine::Ok(_) | LogLine::Step(_)))
+                    .count();
+                let summary = if self.log.is_empty() {
+                    "Install log — empty".to_owned()
+                } else if !fails.is_empty() {
+                    format!(
+                        "Install log — {} error(s), {} step(s)",
+                        fails.len(),
+                        oks
+                    )
+                } else {
+                    format!("Install log — {} line(s)", self.log.len())
+                };
+                ui.horizontal(|ui| {
+                    let arrow = if self.log_expanded { "▾" } else { "▸" };
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(format!("{arrow} {summary}"))
+                                    .font(t::plex_medium(12.0))
+                                    .color(if fails.is_empty() {
+                                        t::TEXT_MUTED
+                                    } else {
+                                        t::DANGER
+                                    }),
+                            )
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::NONE),
+                        )
+                        .clicked()
+                    {
+                        self.log_expanded = !self.log_expanded;
+                    }
+                });
+                if self.log_expanded {
+                    let log_h = (ui.available_height() - hint_h - 12.0).max(80.0);
+                    Frame::new()
+                        .fill(t::BG)
+                        .stroke(Stroke::new(1.0, t::BORDER))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(Margin::symmetric(12, 10))
+                        .show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            for l in &self.log {
-                                match l {
-                                    LogLine::Step(s) => {
-                                        let (idx, rest) = s.split_once(' ').unwrap_or(("", s));
-                                        ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 6.0;
-                                            ui.label(RichText::new(idx).font(t::mono(11.5)).color(t::TEXT_DIM));
-                                            ui.label(RichText::new(rest).font(t::mono(11.5)).color(t::TEXT_MUTED));
-                                        });
+                            ui.set_height(log_h - 20.0);
+                            egui::ScrollArea::vertical().stick_to_bottom(fails.is_empty()).show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                ui.set_width(ui.available_width());
+                                // Failures first so they are not buried under ok lines.
+                                let mut ordered: Vec<&LogLine> = Vec::with_capacity(self.log.len());
+                                ordered.extend(self.log.iter().filter(|l| matches!(l, LogLine::Fail(_))));
+                                ordered.extend(self.log.iter().filter(|l| !matches!(l, LogLine::Fail(_))));
+                                for l in ordered {
+                                    match l {
+                                        LogLine::Step(s) => {
+                                            let (idx, rest) = s.split_once(' ').unwrap_or(("", s));
+                                            ui.horizontal(|ui| {
+                                                ui.spacing_mut().item_spacing.x = 6.0;
+                                                ui.label(RichText::new(idx).font(t::mono(11.5)).color(t::TEXT_DIM));
+                                                ui.label(RichText::new(rest).font(t::mono(11.5)).color(t::TEXT_MUTED));
+                                            });
+                                        }
+                                        LogLine::Ok(s) => { ui.label(RichText::new(format!("      {s}")).font(t::mono(11.5)).color(t::ACCENT)); }
+                                        LogLine::Fail(s) => { ui.label(RichText::new(format!("      {s}")).font(t::mono(11.5)).color(t::DANGER)); }
+                                        LogLine::Plain(s) => { ui.label(RichText::new(s).font(t::mono(11.5)).color(t::TEXT)); }
                                     }
-                                    LogLine::Ok(s) => { ui.label(RichText::new(format!("      {s}")).font(t::mono(11.5)).color(t::ACCENT)); }
-                                    LogLine::Fail(s) => { ui.label(RichText::new(format!("      {s}")).font(t::mono(11.5)).color(t::DANGER)); }
-                                    LogLine::Plain(s) => { ui.label(RichText::new(s).font(t::mono(11.5)).color(t::TEXT)); }
                                 }
-                            }
+                            });
                         });
-                    });
+                } else if !fails.is_empty() {
+                    ui.label(
+                        RichText::new(fails.iter().filter_map(|l| match l {
+                            LogLine::Fail(s) => Some(s.as_str()),
+                            _ => None,
+                        }).take(2).collect::<Vec<_>>().join(" · "))
+                        .font(t::mono(11.0))
+                        .color(t::DANGER),
+                    );
+                }
 
                 ui.label(RichText::new(
                     "After install, in game: press Home for the ReShade overlay, open the DLSS 5 Neural Rendering panel and enable it. \
-                     Keep MSAA/SSAA off. Check dlss5-feed.log next to the exe for 'feature ready'.")
+                     Keep MSAA/SSAA off. Check dlss5-feed.log next to the exe for 'feature ready'. \
+                     Optional TRAA (LUMENITE: TRAA): keep it BELOW DLSS 5 Feed; Edge Detection=Geometric + Protect UI/text on — \
+                     re-run install to patch TRAA if UI still smears.")
                     .font(t::plex(11.0)).color(t::TEXT_DIM));
+                    });
             });
 
         // ── dialogs ───────────────────────────────────────────────
@@ -3049,7 +4016,7 @@ impl eframe::App for App {
                     ui.label("Remove the DLSS 5 files from this game?
 
 Remove takes out what this tool added; ReShade stays.
-Remove incl. ReShade also deletes ReShade (dxgi.dll, ini files, reshade-shaders) - refused if any add-on or shader this tool did not install is still there.");
+Remove incl. ReShade also deletes ReShade (dxgi.dll, ini/logs). Leftover shaders in reshade-shaders are kept; refused only if a foreign .addon64/.addon32 is still there. Never touches dgVoodoo d3d9.dll.");
                     ui.horizontal(|ui| {
                         if ui.button("Remove").clicked() { self.confirm_remove = false; self.start(Some(false)); }
                         if ui.button("Remove incl. ReShade").clicked() { self.confirm_remove = false; self.start(Some(true)); }
@@ -3144,7 +4111,11 @@ pub fn run() -> eframe::Result {
     const TITLE: &str = concat!("DLSS5oneclick ", env!("CARGO_PKG_VERSION"));
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1100.0, 780.0])
-        .with_min_inner_size([880.0, 620.0])
+        // A 1366x768 screen has ~730 px of usable height once the taskbar and the
+        // title bar are gone, so a 620 px floor left the window unshrinkable there
+        // and the buttons unreachable (#64). Everything scrolls now, so this can go
+        // as small as the layout itself needs.
+        .with_min_inner_size([640.0, 420.0])
         .with_title(TITLE);
     if let Some(icon) = logo::icon_data() {
         viewport = viewport.with_icon(icon);
@@ -3158,4 +4129,63 @@ pub fn run() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::{stub_status, Api, Mode};
+
+    /// A long game title used to wrap and then get sliced by the caption's
+    /// clip rect, so it read as cut off mid-word. Shorten it honestly (#77).
+    #[test]
+    fn a_long_title_is_shortened_with_an_ellipsis() {
+        // Fake metrics: every character is 10 wide.
+        let measure = |t: &str| t.chars().count() as f32 * 10.0;
+
+        assert_eq!(truncate_to_fit("Spore", 100.0, measure), "Spore");
+
+        let long = "The Witcher 3: Wild Hunt - Game of the Year Edition";
+        let out = truncate_to_fit(long, 100.0, measure);
+        assert!(out.ends_with('\u{2026}'), "{out}");
+        assert!(measure(&out) <= 100.0, "{out}");
+        assert!(long.starts_with(out.trim_end_matches('\u{2026}')), "{out}");
+
+        // Multi-byte titles must not be cut through a character.
+        let jp = "ファイナルファンタジー";
+        let out = truncate_to_fit(jp, 45.0, measure);
+        assert!(measure(&out) <= 45.0, "{out}");
+        assert!(jp.starts_with(out.trim_end_matches('\u{2026}')), "{out}");
+    }
+
+    /// A finished OptiScaler install must not show a missing row: OptiScaler
+    /// carries its own neural pass, so `renodx-dlss5.addon64` is never
+    /// installed on that route and asking for it contradicted `complete()` (#66).
+    #[test]
+    fn opti_route_tiles_agree_with_complete() {
+        let mut st = stub_status(Mode::Native, Api::Dx11);
+        st.opti = true;
+        st.dlssnr = true;
+        assert!(st.complete());
+        let tiles = tiles_for(Some(&st), Engine::Opti, false, false, false);
+        let missing: Vec<&str> = tiles
+            .iter()
+            .filter(|t| !(t.ok)(&st) && !t.optional)
+            .map(|t| t.title)
+            .collect();
+        assert!(missing.is_empty(), "shown as missing: {missing:?}");
+    }
+
+    /// The ReShade route still wants both files, and still says so when the
+    /// add-on is absent.
+    #[test]
+    fn reshade_route_still_wants_the_addon() {
+        let mut st = stub_status(Mode::Native, Api::Dx11);
+        st.reshade = true;
+        st.dlssnr = true;
+        let tiles = tiles_for(Some(&st), Engine::ReShade, false, false, false);
+        assert!(tiles
+            .iter()
+            .any(|t| t.title == "DLSS 5 add-on \u{00b7} leaked" && !(t.ok)(&st)));
+    }
 }

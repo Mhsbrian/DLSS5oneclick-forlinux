@@ -2,3 +2,22 @@
 nexus/*.zip
 /target-verify
 /target-alt
+
+# Root release / local build junk
+/dlss5oneclick.exe
+/*.exe
+/*.pdb
+/*.ilk
+/*.dll
+
+# Local diagnostic dumps
+gothic_check*.txt
+
+# IDE / VS
+.vs/
+*.user
+*.suo
+
+# Common local logs
+*.log
+cargo-timing*.html

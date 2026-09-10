@@ -82,7 +82,7 @@ fn ngx_init_failure_for(log: &str, exe: Option<&std::path::Path>, out: &mut Vec<
 }
 
 /// Newest Feeder known at build time; only used to nudge users off stale copies.
-const CURRENT_FEEDER: &str = "0.12.0";
+const CURRENT_FEEDER: &str = "0.15.1";
 
 fn version_key(v: &str) -> Vec<u64> {
     v.split(['.', '-'])
@@ -142,6 +142,14 @@ fn reshade_host_exe(log: &str) -> Option<String> {
 pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
     let d = st.game_dir();
     let mut out = Vec::new();
+    let consumer = st.consumer_dir();
+    let rs_log = read(&consumer, "ReShade.log").or_else(|| read(&consumer, "ReShade2.log"));
+    // Wine and Proton substitute their own d3dcompiler_47.dll, whose HLSL
+    // compiler is vkd3d-shader. It does not implement every attribute ReShade
+    // emits, and says so in its own words (#70).
+    let wine_hlsl = rs_log
+        .as_deref()
+        .is_some_and(|l| l.contains("not yet implemented feature"));
 
     // ── a game-shipped HLSL compiler shadowing the system one ──────
     // The add-on compiles its NR pass at cs_5_1. A d3dcompiler_47.dll that
@@ -149,7 +157,7 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
     // one does not know that target: "error X3506: unrecognized compiler
     // target" and no neural rendering, with everything else looking correct.
     let compiler = d.join("d3dcompiler_47.dll");
-    if compiler.is_file() {
+    if compiler.is_file() && !wine_hlsl {
         let ver = crate::ngx::file_version(&compiler).unwrap_or_else(|| "unknown".into());
         out.push(warn(format!(
             "The game ships its own d3dcompiler_47.dll ({ver}), which Windows loads instead of \
@@ -159,11 +167,43 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
         )));
     }
 
+    // ── dgVoodoo's reported VRAM vs what the game was told ─────────
+    // A game that reads VRAM from the adapter and sizes its own pools from it
+    // has to be told the same number, or it sizes for one figure and allocates
+    // against another. GTA IV is the case in hand: with dgVoodoo reporting
+    // 4096 MB and no matching -availablevidmem it black-screens after load,
+    // and with no conf at all it takes dgVoodoo's stock 256 MB and dies with
+    // "TEXP60: Unable to create color render target" (#69).
+    let conf = d.join("dgVoodoo.conf");
+    if conf.is_file() {
+        let vram = fs::read_to_string(&conf).ok().and_then(|t| {
+            t.lines()
+                .filter_map(|l| l.split_once('='))
+                .find(|(k, _)| k.trim().eq_ignore_ascii_case("VRAM"))
+                .and_then(|(_, v)| v.trim().trim_end_matches("MB").trim().parse::<u32>().ok())
+        });
+        let cmdline = d.join("commandline.txt");
+        if let (Some(vram), true) = (vram, cmdline.is_file()) {
+            let text = fs::read_to_string(&cmdline).unwrap_or_default();
+            if !text.to_ascii_lowercase().contains("-availablevidmem") {
+                out.push(warn(format!(
+                    "dgVoodoo reports {vram} MB of video memory and this game reads that number \
+                     to size its own memory pools, but commandline.txt does not set \
+                     -availablevidmem. Add \"-availablevidmem {}\" to commandline.txt — slightly \
+                     below the dgVoodoo figure on purpose, which is what the dgVoodoo guides for \
+                     this engine call for. Without it the game sizes for one number and allocates \
+                     against another, which shows up as a black screen after loading or as \
+                     TEXP60 / TEXP70 at startup.",
+                    vram.saturating_sub(64).max(256)
+                )));
+            }
+        }
+    }
+
     // ── which neural model is installed ────────────────────
     // Two builds of nvngx_dlssnr.dll are in circulation and only the version
     // resource separates them; every failing RTX 50 report so far carries the
     // .SF one, so the log has to name it.
-    let consumer = st.consumer_dir();
     for p in [d.join(game::DLSSNR_DLL), consumer.join(game::DLSSNR_DLL)] {
         if !p.is_file() {
             continue;
@@ -225,12 +265,36 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
     }
 
     // ── ReShade side ────────────────────────────────────────────────
-    let Some(rs) = read(d, "ReShade.log").or_else(|| read(d, "ReShade2.log")) else {
-        out.push(bad(
+    // The DLSS 5 add-on runs under the ReShade in `consumer_dir()`: beside the
+    // exe for a 64-bit game, in host64\ for a 32-bit one. Reading the game
+    // folder's log for a 32-bit game reads the *feeder's* 32-bit ReShade, which
+    // never loads the add-on, so every 32-bit report came back "the add-on
+    // never registered" no matter how healthy the install was (#69).
+    // A 32-bit game has two ReShades: the one beside the exe, which the Home key
+    // opens and which loads the feeder, and the 64-bit one in host64\ that hosts
+    // the neural add-on. Reporting only the second leaves "Home does nothing"
+    // unexplained, which is the first thing the player actually notices (#69).
+    if st.is32() && !game::is_reshade_dll(&d.join(game::RESHADE_PROXY)) {
+        out.push(bad(format!(
+            "No ReShade beside the game exe: {} is missing or is not ReShade, so the Home key \
+             opens nothing and the feeder never loads. That is upstream of anything in host64\\. \
+             Run Remove and then Install again, and if it comes back missing, check antivirus \
+             history for {}.",
+            game::RESHADE_PROXY,
+            game::RESHADE_PROXY
+        )));
+    }
+    let Some(rs) = rs_log else {
+        out.push(bad(if st.is32() {
+            "No host64\\ReShade.log: the 64-bit helper's ReShade never loaded, which is what \
+             \"host lost: pipe never appeared\" in dlss5-feed.log means. Look in \
+             host64\\dlss5-feed-host.log for the reason, and check antivirus did not remove \
+             anything from host64\\."
+        } else {
             "No ReShade.log next to the game exe: ReShade never loaded. Either the game was not \
              started since the install, or it does not load dxgi.dll (wrong exe picked, or a \
-             launcher starts a different one). Check the exe with --check.",
-        ));
+             launcher starts a different one). Check the exe with --check."
+        }));
         return out;
     };
     if rs.contains("Initializing crosire's ReShade") {
@@ -256,10 +320,15 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
     } else if rs.contains("DLSS 5 Neural Rendering") {
         out.push(ok("The DLSS 5 Neural Rendering add-on registered."));
     } else {
-        out.push(bad(
-            "The DLSS 5 add-on never registered. renodx-dlss5.addon64 is missing from the game \
-             folder, disabled in ReShade's Add-ons tab, or quarantined by antivirus.",
-        ));
+        out.push(bad(format!(
+            "The DLSS 5 add-on never registered. renodx-dlss5.addon64 is missing from {}, \
+             disabled in ReShade's Add-ons tab, or quarantined by antivirus.",
+            if st.is32() {
+                "host64\\ (where a 32-bit game's add-on lives)"
+            } else {
+                "the game folder"
+            }
+        )));
     }
     if rs.contains("NR toggled ON") && !rs.contains("NR toggled OFF") {
         out.push(ok("Neural rendering was toggled ON (F6)."));
@@ -312,6 +381,13 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
              in the add-on panel.",
         ));
     } else if st.mode == game::Mode::Native {
+        if st.feeder {
+            out.push(warn(
+                "Mode is Native DLSS (game ships its own DLSS), but dlss5-feed.addon64 is still \
+                 present. Feeder Optimize does not apply here — NR is game/renodx. Run Remove \
+                 (incl. Feeder leftovers) or Install again so Native cleanup drops the Feeder.",
+            ));
+        }
         // The add-on hooks NVSDK_NGX_D3D12_*. A game whose DLSS runs on D3D11
         // calls the D3D11 entry points, which it never sees, so "no create"
         // is expected until the bridge is installed (#33, BG3 DX11).
@@ -329,6 +405,28 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
                  without them it has nothing to work with).",
             ));
         }
+    }
+
+    // Linux/Proton: ReShade generates HLSL with [fastopt] for shader model 4
+    // and up, and Wine's d3dcompiler_47 (vkd3d-shader) has not implemented it,
+    // so DLSS5_Feed.fx and the Lumenite shaders never build — with the feed
+    // add-on then reporting its technique missing, which reads like our bug
+    // rather than a missing compiler (#70).
+    if wine_hlsl {
+        let line = rs
+            .lines()
+            .find(|l| l.contains("not yet implemented feature"))
+            .unwrap_or("")
+            .trim();
+        out.push(bad(format!(
+            "The effects failed to compile in Wine/Proton's own HLSL compiler: {line} \
+             That message comes from vkd3d-shader, which Wine's d3dcompiler_47.dll uses; \
+             ReShade emits attributes it has not implemented. Install Microsoft's real \
+             d3dcompiler_47 into the prefix — protontricks <appid> d3dcompiler_47, or \
+             winetricks d3dcompiler_47 — and start the game again. If the game shipped its \
+             own d3dcompiler_47.dll, leave it in place: under Proton it may be the only \
+             working compiler there is."
+        )));
     }
 
     // The compile failure itself, which is unambiguous when it appears.
@@ -367,7 +465,7 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
     // A game with more than one executable (a Vulkan build and a DX11 build,
     // a launcher and the game) can be installed for one and played through
     // another: ReShade loads, everything looks right, nothing is hooked (#33).
-    if let Some(loaded) = reshade_host_exe(&rs) {
+    if let Some(loaded) = reshade_host_exe(&rs).filter(|_| !st.is32()) {
         let ours = st
             .exe
             .file_name()
@@ -521,6 +619,90 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
                 "NGX reported DLSS unavailable. nvngx_dlss.dll must sit next to the game exe — \
                  re-run Install, and make sure antivirus did not remove it.",
             ));
+        }
+        // Some games refuse the reduced work-resolution path: the feed builds
+        // its shared textures, the staging SRV for the smaller image fails, and
+        // three failed builds stop the feed. Nothing downstream then happens —
+        // the add-on's overlay says "HOOKS ARMED - NO DLSS CREATE SEEN" and
+        // toggling neural rendering in game does nothing, which reads like the
+        // add-on is broken rather than one setting being wrong (#74).
+        // The 32-bit halves talk a versioned protocol. When they disagree the
+        // host exits immediately and the game shows nothing at all (#69).
+        if let Some(line) = fd
+            .lines()
+            .chain(
+                read(&st.consumer_dir(), "dlss5-feed-host.log")
+                    .as_deref()
+                    .unwrap_or("")
+                    .lines(),
+            )
+            .find(|l| l.contains("speaks protocol v") && l.contains("this host v"))
+        {
+            out.push(bad(format!(
+                "The two halves of the 32-bit install are from different releases: {} \
+                 Run Install again — since 0.13.4 both halves are taken from one download and \
+                 each records the release it came from, so this cannot happen silently.",
+                line.trim()
+            )));
+        }
+        // The create faults inside the driver rather than returning a code. The
+        // feed catches it, cannot retry (the consumer's own locks were skipped
+        // by the unwind), and stops — so the game runs and nothing happens,
+        // with the reason six lines up in a log nobody reads (#76).
+        if fd.contains("CreateFeature raised 0xC0000005") {
+            let stack = fd
+                .lines()
+                .find(|l| l.contains("CreateFeature fault stack"))
+                .map(|l| l.split("(innermost first):").nth(1).unwrap_or(l).trim())
+                .unwrap_or("")
+                .to_owned();
+            let two_modules = fd.contains("two copies of the DLSS NGX module are loaded");
+            let mut t = "The DLSS feature create faulted inside the driver (access violation),                  and the feed stopped: it cannot safely call back in, because the neural                  consumer's own code was on the faulting stack and its locks were skipped by the                  unwind."
+                .to_owned();
+            if !stack.is_empty() {
+                t.push_str(&format!(" Fault stack: {stack}."));
+            }
+            if two_modules {
+                // Tested on Proton and it is the wrong advice there: with the
+                // game-local DLL moved aside, the driver's own NGX answers
+                // 0xBAD00012 (NotImplemented) for SuperSampling and DLSS is not
+                // available at all, which is worse than the crash (#76).
+                if wine_hlsl || fd.contains("driver 999.99") {
+                    t.push_str(
+                        " On Windows the usual next step is moving the game-local nvngx_dlss.dll \
+                         aside, because two copies of the NGX module are loaded and the add-on \
+                         hooks both. Do NOT do that here: this is Wine/Proton, where the driver's \
+                         own NGX does not provide DLSS, and removing the game-local copy has been \
+                         measured to leave DLSS unavailable entirely.",
+                    );
+                } else {
+                    t.push_str(
+                        " The log names the most likely cause: two copies of the DLSS NGX module \
+                         are loaded — the game-local nvngx_dlss.dll and the driver's own \
+                         _nvngx.dll — and the add-on hooks both. Try moving nvngx_dlss.dll out of \
+                         the game folder (to nvngx_dlss.dll.off) and starting the game again \
+                         WITHOUT re-running Install, which would put it back.",
+                    );
+                }
+            }
+            out.push(bad(t));
+        }
+        if fd.contains("work-resolution staging SRV failed") {
+            let pct = fd
+                .lines()
+                .find(|l| l.contains("work resolution ("))
+                .and_then(|l| l.split("work resolution (").nth(1))
+                .and_then(|r| r.split(')').next())
+                .unwrap_or("below 100%")
+                .to_owned();
+            out.push(bad(format!(
+                "The feed could not build its textures at {pct} of the frame: \
+                 \"work-resolution staging SRV failed\", three times, and then it stopped. This \
+                 game does not accept the reduced work-resolution path. Set it back to full size \
+                 — Settings ▸ Feeder knobs ▸ work_resolution = 100 and work_upscale = 0, or pick \
+                 the High quality preset — and start the game again. Everything downstream of this \
+                 (no DLSS create, the in-game toggle doing nothing) follows from it."
+            )));
         }
         if fd.contains("stopped:") {
             let line = fd
@@ -912,14 +1094,12 @@ mod tests {
         assert!(bad.text.contains("vkd3d-proton"));
     }
 
-    /// The missing-bridge case is owned by diagnose() (needs a ReShade.log to
-    /// establish "no NGX call"); host_findings only confirms an installed one.
     #[test]
     fn optiscaler_gpu_device_lost_is_named_with_the_model_res_fix() {
         std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
         let t = tempfile::tempdir().unwrap();
         let d = t.path();
-        let exe = game::testutil::make_pe_with_imports(&d.join("game.exe"), &["d3d12.dll"], 2_000_000);
+        let exe = game::testutil::make_pe_importing_padded(&d.join("game.exe"), &["d3d12.dll"], 2_000_000);
         fs::write(d.join(game::DLSS_DLL), b"x").unwrap(); // native mode
         fs::write(d.join(game::OPTI_MANIFEST), "dxgi.dll\nOptiScaler.ini\n").unwrap();
         fs::write(
@@ -952,11 +1132,13 @@ mod tests {
         assert!(d3.iter().any(|x| x.level == Level::Ok && x.text.contains("neural rendering is running")));
     }
 
+    /// The missing-bridge case is owned by diagnose() (needs a ReShade.log to
+    /// establish "no NGX call"); host_findings only confirms an installed one.
     #[test]
     fn native_dx11_missing_bridge_is_caught_by_diagnose() {
         std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
         let t = tempfile::tempdir().unwrap();
-        let exe = game::testutil::make_pe_with_imports(
+        let exe = game::testutil::make_pe_importing_padded(
             &t.path().join("game.exe"),
             &["d3d11.dll"],
             2_000_000,
@@ -993,7 +1175,7 @@ mod tests {
     fn nr_evaluate_failure_beats_earlier_success_and_names_dlaa() {
         std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
         let t = tempfile::tempdir().unwrap();
-        let exe = game::testutil::make_pe_with_imports(
+        let exe = game::testutil::make_pe_importing_padded(
             &t.path().join("game.exe"),
             &["d3d12.dll"],
             2_000_000,
@@ -1018,6 +1200,239 @@ mod tests {
         assert!(f.text.contains("InvalidParameter") && f.text.contains("DLAA"));
         // The optimistic "Neural rendering ran" line must not also appear.
         assert!(!d.iter().any(|x| x.text.contains("Neural rendering ran")));
+    }
+
+    /// A 32-bit game runs the add-on under the 64-bit ReShade in host64\, so
+    /// that is the log to read. Reading the game folder's log — the feeder's
+    /// own 32-bit ReShade, which never loads the add-on — reported "the add-on
+    /// never registered" on installs that were fine (#69).
+    #[test]
+    fn thirty_two_bit_reads_the_host64_reshade_log() {
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe(&t.path().join("game.exe"), game::PE_X86);
+        let host = t.path().join(game::HOST_DIR);
+        fs::create_dir_all(&host).unwrap();
+        // The 32-bit ReShade beside the exe: no add-on, and never will have one.
+        fs::write(
+            t.path().join("ReShade.log"),
+            "Initializing crosire's ReShade version '6.8.0'\n",
+        )
+        .unwrap();
+        // The one that matters, in host64\.
+        fs::write(
+            host.join("ReShade.log"),
+            "Initializing crosire's ReShade version '6.8.0'\nRegistered add-on \"DLSS 5 Neural Rendering\"\n",
+        )
+        .unwrap();
+        let f = run(&exe).unwrap();
+        assert!(
+            f.iter()
+                .any(|x| x.level == Level::Ok && x.text.contains("add-on registered")),
+            "{f:?}"
+        );
+        assert!(
+            !f.iter().any(|x| x.text.contains("never registered")),
+            "{f:?}"
+        );
+    }
+
+    /// And when host64\ has no ReShade log at all, say so in host64 terms
+    /// rather than claiming ReShade never loaded beside the exe.
+    #[test]
+    fn thirty_two_bit_missing_host64_log_names_host64() {
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe(&t.path().join("game.exe"), game::PE_X86);
+        fs::write(
+            t.path().join("ReShade.log"),
+            "Initializing crosire's ReShade version '6.8.0'\n",
+        )
+        .unwrap();
+        let f = run(&exe).unwrap();
+        assert!(f.iter().any(|x| x.text.contains("host64")), "{f:?}");
+    }
+
+    /// Under Proton the effects are compiled by Wine's d3dcompiler_47
+    /// (vkd3d-shader), which has not implemented [fastopt]. Saying "the add-on
+    /// never registered" or "rename your d3dcompiler" sends the user in the
+    /// wrong direction — the second one actively removes the working compiler (#70).
+    #[test]
+    fn wine_hlsl_compiler_is_named_and_rename_advice_suppressed() {
+        let (t, exe) = setup(true);
+        fs::write(t.path().join("d3dcompiler_47.dll"), b"MZ").unwrap();
+        fs::write(
+            t.path().join("ReShade.log"),
+            "Initializing crosire's ReShade version '6.8.0'\n\
+             ERROR | Failed to compile 'DLSS5_Feed.fx':\n\
+             <anonymous>:118:13: E5017: Aborting due to not yet implemented feature: Unhandled attribute 'fastopt'.\n",
+        )
+        .unwrap();
+        let f = run(&exe).unwrap();
+        assert!(
+            f.iter()
+                .any(|x| x.level == Level::Bad && x.text.contains("vkd3d-shader")),
+            "{f:?}"
+        );
+        assert!(
+            !f.iter().any(|x| x.text.contains("d3dcompiler_47.dll.bak")),
+            "{f:?}"
+        );
+    }
+
+    /// Dying Light refuses the reduced work-resolution path. The user sees a
+    /// stopped feed and an add-on saying it never saw a DLSS create, with
+    /// nothing naming the one setting responsible (#74).
+    #[test]
+    fn work_resolution_build_failure_names_the_setting() {
+        let (t, exe) = setup(true);
+        fs::write(
+            t.path().join("ReShade.log"),
+            "Initializing crosire's ReShade\nRegistered add-on \"DLSS 5 Neural Rendering\"\n",
+        )
+        .unwrap();
+        fs::write(
+            t.path().join("dlss5-feed.log"),
+            "[feed] building: 2176x1224 work resolution (85%) -> 2560x1440 backbuffer\n\
+             [feed] work-resolution staging SRV failed\n\
+             [feed] failure: resource build\n\
+             stopped: repeated failures. The game renders normally.\n",
+        )
+        .unwrap();
+        let f = run(&exe).unwrap();
+        let hit = f
+            .iter()
+            .find(|x| x.text.contains("work-resolution staging SRV failed"))
+            .unwrap_or_else(|| panic!("{f:?}"));
+        assert_eq!(hit.level, Level::Bad);
+        assert!(hit.text.contains("85%"), "{}", hit.text);
+        assert!(hit.text.contains("work_resolution = 100"), "{}", hit.text);
+    }
+
+    /// "Home does nothing" on a 32-bit game means the ReShade beside the exe is
+    /// missing, which is upstream of every host64 finding. Diagnose used to
+    /// report only the host64 side and leave the player looking in the wrong
+    /// folder (#69).
+    #[test]
+    fn thirty_two_bit_missing_game_side_reshade_is_named_first() {
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe(&t.path().join("game.exe"), game::PE_X86);
+        let host = t.path().join(game::HOST_DIR);
+        fs::create_dir_all(&host).unwrap();
+        fs::write(
+            host.join("ReShade.log"),
+            "Initializing crosire's ReShade version '6.8.0'\n",
+        )
+        .unwrap();
+        let f = run(&exe).unwrap();
+        assert!(
+            f.iter()
+                .any(|x| x.level == Level::Bad && x.text.contains("No ReShade beside the game exe")),
+            "{f:?}"
+        );
+    }
+
+    /// A create that faults inside the driver stops the feed for good, and the
+    /// log's own hint about two NGX modules is the actionable part. Neither
+    /// reached the user (#76).
+    #[test]
+    fn a_faulting_feature_create_is_explained_with_its_stack() {
+        let (t, exe) = setup(true);
+        fs::write(
+            t.path().join("ReShade.log"),
+            "Initializing crosire's ReShade\nRegistered add-on \"DLSS 5 Neural Rendering\"\n",
+        )
+        .unwrap();
+        fs::write(
+            t.path().join("dlss5-feed.log"),
+            "[feed] CreateFeature raised 0xC0000005 (reading address 00000000575284C0) (caught; nothing submitted)\n\
+             [feed] CreateFeature fault stack, by module (innermost first): d3d12core.dll <- dxgi.dll <- nvapi64.dll <- nvngx_dlss.dll <- renodx-dlss5.addon64\n\
+             [feed] two copies of the DLSS NGX module are loaded (the game-local nvngx_dlss.dll and the driver's _nvngx.dll)\n",
+        )
+        .unwrap();
+        let f = run(&exe).unwrap();
+        let hit = f
+            .iter()
+            .find(|x| x.text.contains("faulted inside the driver"))
+            .unwrap_or_else(|| panic!("{f:?}"));
+        assert_eq!(hit.level, Level::Bad);
+        assert!(hit.text.contains("d3d12core.dll"), "{}", hit.text);
+        assert!(hit.text.contains("nvngx_dlss.dll.off"), "{}", hit.text);
+    }
+
+    /// GTA IV reads the adapter's VRAM and sizes its pools from it, so dgVoodoo
+    /// reporting 4096 MB without a matching -availablevidmem is a black screen
+    /// after load, and no conf at all is TEXP60 at startup (#69).
+    #[test]
+    fn dgvoodoo_vram_without_availablevidmem_is_flagged() {
+        let (t, exe) = setup(true);
+        fs::write(
+            t.path().join("ReShade.log"),
+            "Initializing crosire's ReShade\n",
+        )
+        .unwrap();
+        fs::write(t.path().join("dgVoodoo.conf"), "[DirectX]\nVRAM = 4096\n").unwrap();
+        fs::write(t.path().join("commandline.txt"), "-norestrictions\n").unwrap();
+        let f = run(&exe).unwrap();
+        let hit = f
+            .iter()
+            .find(|x| x.text.contains("-availablevidmem"))
+            .unwrap_or_else(|| panic!("{f:?}"));
+        assert_eq!(hit.level, Level::Warn);
+        assert!(hit.text.contains("4096"), "{}", hit.text);
+
+        // Already set: nothing to say.
+        fs::write(
+            t.path().join("commandline.txt"),
+            "-availablevidmem 4032\n-norestrictions\n",
+        )
+        .unwrap();
+        let f = run(&exe).unwrap();
+        assert!(
+            !f.iter().any(|x| x.text.contains("-availablevidmem")),
+            "{f:?}"
+        );
+    }
+
+    /// Moving the game-local nvngx_dlss.dll aside is the right advice on
+    /// Windows and the wrong advice under Proton, where the driver's own NGX
+    /// answers NotImplemented and DLSS disappears entirely. 0batsy tested both
+    /// and neither helped, but the second left him worse off (#76).
+    #[test]
+    fn the_nvngx_advice_is_withheld_under_proton() {
+        let (t, exe) = setup(true);
+        let crash = "[feed] CreateFeature raised 0xC0000005 (caught; nothing submitted)\n\
+                     [feed] two copies of the DLSS NGX module are loaded (the game-local nvngx_dlss.dll and the driver's _nvngx.dll)\n";
+        fs::write(
+            t.path().join("ReShade.log"),
+            "Initializing crosire's ReShade\nRegistered add-on \"DLSS 5 Neural Rendering\"\n",
+        )
+        .unwrap();
+
+        // Windows: the advice stands.
+        fs::write(t.path().join("dlss5-feed.log"), crash).unwrap();
+        let f = run(&exe).unwrap();
+        assert!(
+            f.iter().any(|x| x.text.contains("nvngx_dlss.dll.off")),
+            "{f:?}"
+        );
+
+        // Proton, identified by the adapter line vkd3d reports.
+        fs::write(
+            t.path().join("dlss5-feed.log"),
+            format!("[feed] adapter: NVIDIA GeForce RTX 4070 SUPER driver 999.99\n{crash}"),
+        )
+        .unwrap();
+        let f = run(&exe).unwrap();
+        assert!(
+            !f.iter().any(|x| x.text.contains("nvngx_dlss.dll.off")),
+            "{f:?}"
+        );
+        assert!(
+            f.iter().any(|x| x.text.contains("Do NOT do that here")),
+            "{f:?}"
+        );
     }
 
     #[test]

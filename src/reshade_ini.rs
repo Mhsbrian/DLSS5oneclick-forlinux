@@ -11,11 +11,10 @@ use anyhow::Result;
 use std::fs;
 use std::path::Path;
 
-pub const MV_PROVIDER_DEFINE: &str = "DLSS5_MV_PROVIDER=3"; // LumeniteFX Kernel
-pub const TECHNIQUES_ORDERED: [&str; 2] = [
-    "Lumenite_Kernel@lumenite_Kernel.fx", // provider must sit ABOVE the feed
-    "DLSS5_Feed@DLSS5_Feed.fx",
-];
+pub const MV_PROVIDER_DEFINE: &str = "DLSS5_MV_PROVIDER=3"; // LumeniteFX Kernel (also used when OFA replaces MV at runtime)
+pub const TECHNIQUE_LUMENITE: &str = "Lumenite_Kernel@lumenite_Kernel.fx";
+pub const TECHNIQUE_FEED: &str = "DLSS5_Feed@DLSS5_Feed.fx";
+pub const TECHNIQUES_ORDERED: [&str; 2] = [TECHNIQUE_LUMENITE, TECHNIQUE_FEED];
 
 /// Ordered sections; the first is always the root ("").
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -157,19 +156,62 @@ fn ensure_define(raw: &str, define: &str) -> String {
     join_list(&items)
 }
 
+/// ReShade recursive glob is a single trailing `\**`. A doubled `\**\**` (common after
+/// ReShade's path UI rewrites our default) fails Win32 resolve with ERROR_INVALID_NAME
+/// (123) and the overlay reports "No effect files (.fx) found".
+fn normalize_search_path(raw: &str) -> String {
+    let mut s = raw.trim().replace('/', "\\");
+    while s.contains(r"**\**") {
+        s = s.replace(r"**\**", "**");
+    }
+    s
+}
+
+fn path_key(p: &str) -> String {
+    normalize_search_path(p)
+        .trim_end_matches(['\\', '/'])
+        .to_ascii_lowercase()
+}
+
+/// Collapse broken `\**\**` globs and ensure `required` is present (prepended if missing).
+fn ensure_search_paths(raw: &str, required: &str) -> String {
+    let required = normalize_search_path(required);
+    let req_key = path_key(&required);
+    let mut items: Vec<String> = split_list(raw)
+        .into_iter()
+        .map(|p| normalize_search_path(&p))
+        .filter(|p| !p.is_empty())
+        .collect();
+    if !items.iter().any(|p| path_key(p) == req_key) {
+        items.insert(0, required);
+    }
+    join_list(&items)
+}
+
+pub const EFFECT_SEARCH_PATH: &str = r".\reshade-shaders\Shaders\**";
+pub const TEXTURE_SEARCH_PATH: &str = r".\reshade-shaders\Textures\**";
+
 /// Create/update ReShade.ini: search paths + PresetPath defaults, provider define forced.
 pub fn write_reshade_ini(game_dir: &Path) -> Result<()> {
     let p = game_dir.join("ReShade.ini");
     let mut ini = Ini::load(&p);
-    ini.set_default(
+    // Always rewrite search paths: set_default left broken `\**\**` values from ReShade
+    // alone, which makes Install look successful while the overlay finds zero .fx files.
+    ini.set(
         "GENERAL",
         "EffectSearchPaths",
-        r".\reshade-shaders\Shaders\**",
+        ensure_search_paths(
+            ini.get("GENERAL", "EffectSearchPaths").unwrap_or(""),
+            EFFECT_SEARCH_PATH,
+        ),
     );
-    ini.set_default(
+    ini.set(
         "GENERAL",
         "TextureSearchPaths",
-        r".\reshade-shaders\Textures\**",
+        ensure_search_paths(
+            ini.get("GENERAL", "TextureSearchPaths").unwrap_or(""),
+            TEXTURE_SEARCH_PATH,
+        ),
     );
     ini.set_default("GENERAL", "PresetPath", r".\ReShadePreset.ini");
     let defs = ensure_define(
@@ -180,12 +222,18 @@ pub fn write_reshade_ini(game_dir: &Path) -> Result<()> {
     ini.save(&p)
 }
 
-/// Create/update ReShadePreset.ini: Lumenite_Kernel then DLSS5_Feed at the head of
-/// the enabled list (existing user techniques kept after), provider define at preset level.
-pub fn write_preset(game_dir: &Path) -> Result<()> {
+/// Create/update ReShadePreset.ini. When `enable_lumenite` is false (Optical Flow preset),
+/// only DLSS5_Feed is enabled; Lumenite files may still be on disk as fallback.
+pub fn write_preset(game_dir: &Path, enable_lumenite: bool) -> Result<()> {
     let p = game_dir.join("ReShadePreset.ini");
     let mut ini = Ini::load(&p);
-    let ours: Vec<String> = TECHNIQUES_ORDERED.iter().map(|s| s.to_string()).collect();
+    let ours: Vec<String> = if enable_lumenite {
+        TECHNIQUES_ORDERED.iter().map(|s| s.to_string()).collect()
+    } else {
+        vec![TECHNIQUE_FEED.to_string()]
+    };
+    // Drop both of our techniques from the existing list, then prepend the desired set.
+    let drop: &[&str] = &TECHNIQUES_ORDERED;
     for key in ["Techniques", "TechniqueSorting"] {
         if key == "TechniqueSorting" && ini.get("", key).is_none() {
             continue;
@@ -194,7 +242,7 @@ pub fn write_preset(game_dir: &Path) -> Result<()> {
         list.extend(
             split_list(ini.get("", key).unwrap_or(""))
                 .into_iter()
-                .filter(|t| !ours.contains(t)),
+                .filter(|t| !drop.iter().any(|d| d == t)),
         );
         ini.set("", key, join_list(&list));
     }
@@ -203,6 +251,68 @@ pub fn write_preset(game_dir: &Path) -> Result<()> {
         MV_PROVIDER_DEFINE,
     );
     ini.set("", "PreprocessorDefinitions", defs);
+    ini.save(&p)
+}
+
+/// Write residual-mask uniforms into `[DLSS5_Feed.fx]`.
+pub fn write_feed_fx_uniforms(game_dir: &Path, kv: &[(&str, String)]) -> Result<()> {
+    let p = game_dir.join("ReShadePreset.ini");
+    let mut ini = Ini::load(&p);
+    for (k, v) in kv {
+        ini.set("DLSS5_Feed.fx", k, v.clone());
+    }
+    ini.save(&p)
+}
+
+/// Soft defaults for optional LUMENITE: TRAA (does not enable the technique).
+/// Geometric DLAA + UI protect reduce HUD/text smear when the user turns TRAA on.
+pub fn write_traa_ui_defaults(game_dir: &Path) -> Result<()> {
+    let p = game_dir.join("ReShadePreset.ini");
+    if !p.is_file() {
+        return Ok(());
+    }
+    let mut ini = Ini::load(&p);
+    let section = "lumenite_TRAA.fx";
+    ini.set_default(section, "EDGE_MODE", "1");
+    ini.set_default(section, "UI_PROTECT", "1");
+    ini.set_default(section, "UI_PROTECT_STRENGTH", "1.000000");
+    ini.set_default(section, "SHARP_STRENGTH", "0.700000");
+    ini.save(&p)
+}
+
+/// neural-upstream's strength presets, exactly as its own `apply_preset()`
+/// defines them: `(label, id, [intensity, local tone, local structure, skin
+/// structure])`. Skin structure -1 means "follow local structure".
+pub const UPSTREAM_PRESETS: [(&str, u8, [f32; 4]); 5] = [
+    ("Light", 1, [0.45, 0.55, 0.25, 0.15]),
+    ("Moderate", 2, [0.70, 0.80, 0.55, 0.40]),
+    ("Reference", 3, [1.00, 1.00, 1.00, -1.00]),
+    ("Overdrive", 4, [1.30, 1.25, 1.45, 1.20]),
+    ("AI slop", 5, [1.80, 1.60, 2.00, 1.90]),
+];
+
+/// Seeds neural-upstream's strength preset before the game starts (#68).
+///
+/// The add-on reads its settings from `ReShade.ini`'s `[NRPreUpscale]` section
+/// through `reshade::get_config_value`, so they can be chosen from here rather
+/// than only in the in-game overlay. It reads `Preset` for the label and the
+/// four strength values as separate keys, and does **not** derive one from the
+/// other, so both go in — with the values its own `apply_preset()` would set.
+pub fn write_upstream_preset(game_dir: &Path, preset: u8) -> Result<()> {
+    let Some((_, id, v)) = UPSTREAM_PRESETS.iter().find(|(_, id, _)| *id == preset) else {
+        return Ok(()); // 0 = custom: leave whatever the user set in the overlay
+    };
+    let p = game_dir.join("ReShade.ini");
+    let mut ini = Ini::load(&p);
+    ini.set("NRPreUpscale", "Preset", id.to_string());
+    for (key, val) in [
+        ("Intensity", v[0]),
+        ("LocalTone", v[1]),
+        ("LocalStructure", v[2]),
+        ("SkinStructure", v[3]),
+    ] {
+        ini.set("NRPreUpscale", key, format!("{val:.6}"));
+    }
     ini.save(&p)
 }
 
@@ -261,6 +371,42 @@ pub fn remove_our_techniques(game_dir: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The preset has to reach the add-on as both the label and the four
+    /// values: neural-upstream reads them as separate keys and never derives
+    /// one from the other, so writing `Preset` alone would show "Light" in the
+    /// overlay while the network still ran at Reference strength (#68).
+    #[test]
+    fn upstream_preset_writes_label_and_values() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(
+            t.path().join("ReShade.ini"),
+            "[GENERAL]\nEffectSearchPaths=.\\reshade-shaders\\Shaders\\**\n",
+        )
+        .unwrap();
+        write_upstream_preset(t.path(), 1).unwrap();
+        let out = std::fs::read_to_string(t.path().join("ReShade.ini")).unwrap();
+        let ini = Ini::parse(&out);
+        assert_eq!(ini.get("NRPreUpscale", "Preset"), Some("1"));
+        assert_eq!(ini.get("NRPreUpscale", "Intensity"), Some("0.450000"));
+        assert_eq!(ini.get("NRPreUpscale", "LocalTone"), Some("0.550000"));
+        assert_eq!(ini.get("NRPreUpscale", "LocalStructure"), Some("0.250000"));
+        assert_eq!(ini.get("NRPreUpscale", "SkinStructure"), Some("0.150000"));
+        // Whatever else was in the file is still there.
+        assert!(ini.get("GENERAL", "EffectSearchPaths").is_some(), "{out}");
+
+        // Reference keeps the add-on's "follow local structure" sentinel.
+        write_upstream_preset(t.path(), 3).unwrap();
+        let out = std::fs::read_to_string(t.path().join("ReShade.ini")).unwrap();
+        let ini = Ini::parse(&out);
+        assert_eq!(ini.get("NRPreUpscale", "Preset"), Some("3"));
+        assert_eq!(ini.get("NRPreUpscale", "SkinStructure"), Some("-1.000000"));
+
+        // 0 is "custom": the overlay's own settings are left alone.
+        write_upstream_preset(t.path(), 0).unwrap();
+        let ini = Ini::parse(&std::fs::read_to_string(t.path().join("ReShade.ini")).unwrap());
+        assert_eq!(ini.get("NRPreUpscale", "Preset"), Some("3"));
+    }
     use super::*;
 
     #[test]
@@ -271,6 +417,37 @@ mod tests {
         assert!(split_list("").is_empty());
     }
 
+    /// A game that already had ReShade kept its own search paths and never saw
+    /// the shaders this tool installed; the reporter had to copy them by hand
+    /// (#4). Ours is now appended to whatever is already there.
+    #[test]
+    fn existing_search_paths_keep_theirs_and_gain_ours() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(
+            t.path().join("ReShade.ini"),
+            "[GENERAL]\nEffectSearchPaths=D:\\my shaders\\**\nTextureSearchPaths=D:\\my textures\n",
+        )
+        .unwrap();
+        write_reshade_ini(t.path()).unwrap();
+        let ini = Ini::load(&t.path().join("ReShade.ini"));
+        let fx = ini.get("GENERAL", "EffectSearchPaths").unwrap().to_owned();
+        assert!(fx.contains(r"D:\my shaders\**"), "{fx}");
+        assert!(fx.contains(r".\reshade-shaders\Shaders\**"), "{fx}");
+        let tx = ini.get("GENERAL", "TextureSearchPaths").unwrap().to_owned();
+        assert!(tx.contains(r"D:\my textures"), "{tx}");
+        assert!(tx.contains(r".\reshade-shaders\Textures\**"), "{tx}");
+
+        // Running it twice must not duplicate our entry.
+        write_reshade_ini(t.path()).unwrap();
+        let ini = Ini::load(&t.path().join("ReShade.ini"));
+        let fx = ini.get("GENERAL", "EffectSearchPaths").unwrap();
+        assert_eq!(
+            fx.matches(r".\reshade-shaders\Shaders\**").count(),
+            1,
+            "{fx}"
+        );
+    }
+
     #[test]
     fn reshade_ini_fresh() {
         let t = tempfile::tempdir().unwrap();
@@ -278,11 +455,11 @@ mod tests {
         let ini = Ini::load(&t.path().join("ReShade.ini"));
         assert_eq!(
             ini.get("GENERAL", "EffectSearchPaths"),
-            Some(r".\reshade-shaders\Shaders\**")
+            Some(EFFECT_SEARCH_PATH)
         );
         assert_eq!(
             ini.get("GENERAL", "TextureSearchPaths"),
-            Some(r".\reshade-shaders\Textures\**")
+            Some(TEXTURE_SEARCH_PATH)
         );
         assert_eq!(
             ini.get("GENERAL", "PresetPath"),
@@ -304,9 +481,11 @@ mod tests {
         .unwrap();
         write_reshade_ini(t.path()).unwrap();
         let ini = Ini::load(&t.path().join("ReShade.ini"));
+        // The user's own path stays, and ours joins it — keeping only theirs
+        // meant the shaders this tool installs were never found (#4).
         assert_eq!(
-            ini.get("GENERAL", "EffectSearchPaths"),
-            Some(".\\custom\\**")
+            split_list(ini.get("GENERAL", "EffectSearchPaths").unwrap()),
+            vec![EFFECT_SEARCH_PATH, r".\custom\**"]
         );
         assert_eq!(
             split_list(ini.get("GENERAL", "PreprocessorDefinitions").unwrap()),
@@ -316,9 +495,29 @@ mod tests {
     }
 
     #[test]
+    fn reshade_ini_collapses_doubled_recursive_glob() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(
+            t.path().join("ReShade.ini"),
+            "[GENERAL]\nEffectSearchPaths=.\\reshade-shaders\\Shaders\\**\\**\nTextureSearchPaths=.\\reshade-shaders\\Textures\\**\\**\n",
+        )
+        .unwrap();
+        write_reshade_ini(t.path()).unwrap();
+        let ini = Ini::load(&t.path().join("ReShade.ini"));
+        assert_eq!(
+            ini.get("GENERAL", "EffectSearchPaths"),
+            Some(EFFECT_SEARCH_PATH)
+        );
+        assert_eq!(
+            ini.get("GENERAL", "TextureSearchPaths"),
+            Some(TEXTURE_SEARCH_PATH)
+        );
+    }
+
+    #[test]
     fn remove_our_techniques_keeps_user_ones() {
         let t = tempfile::tempdir().unwrap();
-        write_preset(t.path()).unwrap();
+        write_preset(t.path(), true).unwrap();
         let p = t.path().join("ReShadePreset.ini");
         let mut ini = Ini::load(&p);
         ini.set(
@@ -337,7 +536,7 @@ mod tests {
     #[test]
     fn preset_fresh() {
         let t = tempfile::tempdir().unwrap();
-        write_preset(t.path()).unwrap();
+        write_preset(t.path(), true).unwrap();
         let ini = Ini::load(&t.path().join("ReShadePreset.ini"));
         assert_eq!(
             split_list(ini.get("", "Techniques").unwrap()),
@@ -358,7 +557,7 @@ mod tests {
             "Techniques=DLSS5_Feed@DLSS5_Feed.fx,Clarity@Clarity.fx\nTechniqueSorting=Clarity@Clarity.fx,DLSS5_Feed@DLSS5_Feed.fx\n[Clarity.fx]\nStrength=0.5\n",
         )
         .unwrap();
-        write_preset(t.path()).unwrap();
+        write_preset(t.path(), true).unwrap();
         let ini = Ini::load(&t.path().join("ReShadePreset.ini"));
         assert_eq!(
             split_list(ini.get("", "Techniques").unwrap()),
@@ -377,6 +576,25 @@ mod tests {
         assert!(
             text.starts_with("Techniques="),
             "root keys must precede sections: {text}"
+        );
+    }
+
+    #[test]
+    fn traa_ui_defaults_are_soft() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(
+            t.path().join("ReShadePreset.ini"),
+            "Techniques=DLSS5_Feed@DLSS5_Feed.fx\n[lumenite_TRAA.fx]\nEDGE_MODE=0\nSHARP_STRENGTH=1.000000\n",
+        )
+        .unwrap();
+        write_traa_ui_defaults(t.path()).unwrap();
+        let ini = Ini::load(&t.path().join("ReShadePreset.ini"));
+        // Existing EDGE_MODE kept; missing UI_PROTECT filled in.
+        assert_eq!(ini.get("lumenite_TRAA.fx", "EDGE_MODE"), Some("0"));
+        assert_eq!(ini.get("lumenite_TRAA.fx", "UI_PROTECT"), Some("1"));
+        assert_eq!(
+            ini.get("lumenite_TRAA.fx", "SHARP_STRENGTH"),
+            Some("1.000000")
         );
     }
 }

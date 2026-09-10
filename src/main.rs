@@ -2,6 +2,7 @@
 
 mod compare;
 mod diagnose;
+mod feeder_cfg;
 mod game;
 mod gpu;
 mod gpupref;
@@ -13,10 +14,12 @@ mod mfg;
 mod net;
 mod ngx;
 mod platform;
+mod quality_preset;
 mod remix;
 mod renodx;
 mod report;
 mod reshade_ini;
+mod settings;
 mod text;
 mod theme;
 mod update;
@@ -758,7 +761,18 @@ fn cli(
             Error => println!("\n      FAILED: {detail}"),
         }
     };
-    match installer::run_all_with(&exe, engine, extras, &progress, &step) {
+    let s = settings::Settings::load();
+    match installer::run_all_with(
+        &exe,
+        engine,
+        extras,
+        installer::InstallOpts {
+            quality: s.quality_choice(),
+            overrides: s.quality_overrides(),
+        },
+        &progress,
+        &step,
+    ) {
         Ok(_) => {
             if engine == installer::Engine::Opti {
                 println!(

@@ -1,22 +1,29 @@
-//! The six install steps, in the order the DLSS5-Feeder README lists them.
+//! The install steps, in the order the DLSS5-Feeder README lists them.
 //!
 //! Sources (verified 2026-08-31):
+//! 0. dgVoodoo 2.87.3 — only when the game is Direct3D 9 and dgVoodoo is not
+//!    already in the game folder. Downloaded from the official GitHub release
+//!    (not bundled); extracts `MS/{x86|x64}/D3D9.dll` by exe bitness → `d3d9.dll`
+//!    + smart-merged conf (force OutputAPI, floor VRAM, preserve the rest).
 //! 1. ReShade add-on build — https://reshade.me links `/downloads/ReShade_Setup_<ver>_Addon.exe`;
 //!    that exe has an appended ZIP with ReShade64.dll / ReShade32.dll. Dropped as dxgi.dll.
 //! 2. ReShade shader headers — raw.githubusercontent.com/crosire/reshade-shaders/slim/Shaders/
 //!    {ReShade.fxh, ReShadeUI.fxh, DrawText.fxh}; the setup exe only carries the DLLs.
-//! 3. DLSS5-Feeder — jlrouzies-fr/DLSS5-Feeder latest release, loose assets
-//!    `dlss5-feed.addon64` + `DLSS5_Feed.fx` (the `feed-vk-layer.zip` is Vulkan-only, unused).
+//! 3. DLSS5-Feeder — jlrouzies-fr/DLSS5-Feeder latest release zip only
+//!    (`dlss5-feed.addon64` + `DLSS5_Feed.fx`; `feed-vk-layer.zip` is Vulkan-only, unused).
+//!    No local overwrite of Feeder binaries or shaders — official release assets only.
 //! 4. LumeniteFX — umar-afzaal/LumeniteFX branch `mainline` (no releases):
 //!    Shaders/lumenite_*.fx, Shaders/include/*.fxh, Textures/lumenite_bluenoise256.png.
 //! 5. DLSS 5 add-on — RankFTW/rhi-repo releases: `renodx-dlss5-*` (renodx-dlss5.addon64),
 //!    `dlssnr-*` (nvngx_dlssnr.dll), `dlss-*` (nvngx_dlss.dll; not dlssg-/dlssd-).
 //! 6. ReShade.ini + ReShadePreset.ini: DLSS5_MV_PROVIDER=3, Lumenite_Kernel above DLSS5_Feed.
+//!    Optional LUMENITE: TRAA stays user-controlled; we soft-patch UI protect + preset defaults.
 
 use crate::game::{self, GameStatus};
 use crate::gpu;
 use crate::gpupref;
 use crate::net::{self, Progress};
+use crate::quality_preset::{self, QualityChoice, QualityOverrides, ResolvedQuality};
 use crate::renodx;
 use crate::reshade_ini;
 use anyhow::{anyhow, bail, Context, Result};
@@ -33,6 +40,239 @@ pub const FEEDER_REPO: &str = "jlrouzies-fr/DLSS5-Feeder";
 pub const LUMENITE_ZIP: &str =
     "https://codeload.github.com/umar-afzaal/LumeniteFX/zip/refs/heads/mainline";
 
+/// Official dgVoodoo 2.87.3 release zip (not bundled — downloaded into the game
+/// folder at Install time). License allows shipping individual DLLs with a
+/// game; forbids bundling inside launchers for general multi-app use.
+pub const DGVOODOO_TAG: &str = "v2.87.3";
+pub const DGVOODOO_ZIP: &str =
+    "https://github.com/dege-diosg/dgVoodoo2/releases/download/v2.87.3/dgVoodoo2_87_3.zip";
+/// Zip members for D3D9 (32-bit Gothic-class vs rare 64-bit DX9).
+const DGVOODOO_D3D9_MEMBER_X86: &str = "MS/x86/D3D9.dll";
+const DGVOODOO_D3D9_MEMBER_X64: &str = "MS/x64/D3D9.dll";
+
+/// Minimum emulated VRAM (MB). Stock dgVoodoo is 256 — too low for Gothic 3 VH @ 1080p.
+const DGVOODOO_VRAM_FLOOR: u32 = 4096;
+/// Feeder/ReShade need D3D11; never leave `bestavailable` (may pick D3D12).
+const DGVOODOO_OUTPUT_API: &str = "d3d11_fl11_0";
+
+/// Full template used only when no `dgVoodoo.conf` exists yet.
+const DGVOODOO_CONF_TEMPLATE: &str = "\
+; Written by DLSS5oneclick — official dgVoodoo 2.87.3 (DX9 → D3D11 for ReShade dxgi.dll)
+; https://github.com/dege-diosg/dgVoodoo2/releases/tag/v2.87.3
+[General]
+OutputAPI = d3d11_fl11_0
+Adapters = all
+FullScreenOutput = default
+ScalingMode = unspecified
+[DirectX]
+VideoCard = geforce_9800_gt
+VRAM = 4096
+Filtering = appdriven
+Mipmapping = appdriven
+Resolution = unforced
+Antialiasing = appdriven
+AppControlledScreenMode = true
+ForceVerticalSync = false
+dgVoodooWatermark = false
+FastVideoMemoryAccess = false
+[DirectXExt]
+RTTexturesForceScaleAndMSAA = false
+";
+
+/// Marker embedded in the Lumenite TRAA UI-protect patch (idempotent).
+const TRAA_UI_MARKER: &str = "DLSS5_TRAA_UI_PROTECT";
+const TRAA_FX: &str = "lumenite_TRAA.fx";
+
+/// Soft-patch installed `lumenite_TRAA.fx`: Geometric DLAA by default + skip temporal
+/// blend where `DLSS5_Mask` / HUD-like luma edges without depth structure say so.
+/// Leaves TRAA enabled/disabled as the user set it; only improves UI/text when on.
+fn apply_traa_ui_patch(game_dir: &Path) -> Result<Option<String>> {
+    let dest = game_dir
+        .join("reshade-shaders")
+        .join("Shaders")
+        .join(TRAA_FX);
+    if !dest.is_file() {
+        return Ok(None);
+    }
+    let mut text =
+        fs::read_to_string(&dest).with_context(|| format!("reading {}", dest.display()))?;
+    if text.contains(TRAA_UI_MARKER) {
+        return Ok(Some(format!(
+            "reshade-shaders/Shaders/{TRAA_FX} (UI protect, already applied)"
+        )));
+    }
+
+    // Default Edge Detection → Geometric (stock tooltip already says it ignores flat UI).
+    let edge_anchor = "\"Geometric: silhouettes only, ignores flat UI.\";\n    > = 0;";
+    if !text.contains(edge_anchor) {
+        return Ok(Some(format!(
+            "reshade-shaders/Shaders/{TRAA_FX} (UI protect skipped: EDGE_MODE layout changed)"
+        )));
+    }
+    text = text.replace(
+        edge_anchor,
+        "\"Geometric: silhouettes only, ignores flat UI.\";\n    > = 1;",
+    );
+
+    let uniforms = r#"
+// DLSS5_TRAA_UI_PROTECT -- favour current frame on HUD/text (DLSS5oneclick)
+uniform bool UI_PROTECT <
+    ui_label = "Protect UI / text (skip temporal)";
+    ui_tooltip = "Lowers temporal blend where DLSS5_Mask distrusts motion, and where\n"
+                 "sharp luma edges lack geometric depth/normal structure (typical HUD/text).\n"
+                 "Needs Kernel above + DLSS 5 Feed above this effect for the bias mask.";
+> = true;
+
+uniform float UI_PROTECT_STRENGTH <
+    ui_type = "drag";
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.05;
+    ui_label = "UI protect strength";
+> = 1.0;
+
+"#;
+    let imports_anchor = "/*--------------.\n| :: IMPORTS :: |\n'--------------*/";
+    if !text.contains(imports_anchor) {
+        return Ok(Some(format!(
+            "reshade-shaders/Shaders/{TRAA_FX} (UI protect skipped: IMPORTS layout changed)"
+        )));
+    }
+    text = text.replace(imports_anchor, &format!("{uniforms}{imports_anchor}"));
+
+    let mask_tex = r#"
+// DLSS5_TRAA_UI_PROTECT -- same pooled mask Feed writes (bias-current-colour)
+texture DLSS5_Mask { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R8; };
+sampler sDLSS5_Mask { Texture = DLSS5_Mask; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
+
+"#;
+    let ns_anchor = "namespace LumeniteTRAA {";
+    if !text.contains(ns_anchor) {
+        return Ok(Some(format!(
+            "reshade-shaders/Shaders/{TRAA_FX} (UI protect skipped: namespace layout changed)"
+        )));
+    }
+    text = text.replace(ns_anchor, &format!("{mask_tex}{ns_anchor}"));
+
+    let conf_anchor = "    confidence = saturate(confidence + 0.11 * 4.0 * confidence * (1.0 - confidence));\n\n    float2 historyUV = texcoord + flow;";
+    let conf_patch = r#"    confidence = saturate(confidence + 0.11 * 4.0 * confidence * (1.0 - confidence));
+
+    // DLSS5_TRAA_UI_PROTECT
+    if (UI_PROTECT)
+    {
+        float distrust = tex2Dlod(sDLSS5_Mask, float4(texcoord, 0.0, 0.0)).x;
+        float4 nPack = tex2Dlod(Kernel::sNormals, float4(texcoord, 0.0, 0.0));
+        float2 px = BUFFER_PIXEL_SIZE;
+        float dL = tex2Dlod(Kernel::sNormals, float4(texcoord - float2(px.x, 0.0), 0.0, 0.0)).a;
+        float dR = tex2Dlod(Kernel::sNormals, float4(texcoord + float2(px.x, 0.0), 0.0, 0.0)).a;
+        float dT = tex2Dlod(Kernel::sNormals, float4(texcoord - float2(0.0, px.y), 0.0, 0.0)).a;
+        float dB = tex2Dlod(Kernel::sNormals, float4(texcoord + float2(0.0, px.y), 0.0, 0.0)).a;
+        float depthEdge = abs(dL - dR) + abs(dT - dB);
+        float nEdge = length(nPack.xyz - tex2Dlod(Kernel::sNormals, float4(texcoord + float2(px.x, 0.0), 0.0, 0.0)).xyz);
+        float lumaEdge = abs(GetLuminance(samples[3]) - GetLuminance(samples[5]))
+                       + abs(GetLuminance(samples[1]) - GetLuminance(samples[7]));
+        // Sharp text/HUD edges without geometric structure
+        float uiHint = saturate(lumaEdge * 6.0) * (1.0 - saturate(depthEdge * 40.0 + nEdge * 4.0));
+        // Screen-space UI often gets camera/scene flow while depth stays flat
+        float mvPx = length(flow * float2(BUFFER_WIDTH, BUFFER_HEIGHT));
+        float badFlow = saturate(mvPx * 0.25) * (1.0 - saturate(depthEdge * 40.0));
+        float skip = saturate(max(max(distrust, uiHint), badFlow) * UI_PROTECT_STRENGTH);
+        confidence *= (1.0 - skip);
+    }
+
+    float2 historyUV = texcoord + flow;"#;
+    if !text.contains(conf_anchor) {
+        return Ok(Some(format!(
+            "reshade-shaders/Shaders/{TRAA_FX} (UI protect skipped: PS_TRAA layout changed)"
+        )));
+    }
+    text = text.replace(conf_anchor, conf_patch);
+
+    text = text.replace(
+        "ui_tooltip = \"Temporal Reprojection Anti-Aliasing.\";",
+        "ui_tooltip = \"Temporal Reprojection Anti-Aliasing.\\n\\n\
+Place BELOW DLSS 5 Feed. Edge Detection=Geometric + Protect UI/text reduce HUD smear.\\n\
+Uses DLSS5_Mask from Feed when present (DLSS5oneclick UI protect patch).\";",
+    );
+
+    fs::write(&dest, text).with_context(|| format!("writing patched {}", dest.display()))?;
+    Ok(Some(format!(
+        "reshade-shaders/Shaders/{TRAA_FX} (UI protect patch)"
+    )))
+}
+
+const VULKAN_SETUP_TXT: &str = "\
+DLSS5oneclick — Vulkan Feeder kit (manual finish)
+================================================
+This tool does NOT register ReShade as a Vulkan layer (that is why full
+Install is refused). Files copied here still need ReShade's own setup.
+
+1. Run ReShade Setup → select this game exe → choose Vulkan → Addon support.
+2. In ReShade.ini next to the exe, under [ADDON]:
+     AddonPath=<this folder>
+3. Ensure dlss5-feed.addon64 and reshade-shaders/Shaders/DLSS5_Feed.fx are here
+   (already copied by «Copy Vulkan Feeder kit»).
+4. Also place a neural consumer (renodx-dlss5.addon64 + nvngx_dlssnr.dll) as for
+   a 64-bit D3D game, or use Deep Fried Chicken per Feeder docs.
+5. If dlss5-feed.log reports missing interop entry points, start the game via
+   run-with-feed-layer.bat from the DLSS5-Feeder repo layer/ folder.
+
+Do not expect dxgi.dll from this tool to load under Vulkan.
+";
+
+/// Drop Feeder addon + FX + setup note for manual Vulkan ReShade (no layer install).
+/// Fetches the official DLSS5-Feeder release zip — never a bundled/modified add-on.
+pub fn copy_vulkan_feeder_kit(game_dir: &Path) -> Result<Vec<String>> {
+    let client = net::client()?;
+    let tag = match net::latest_tag(&client, FEEDER_REPO) {
+        Ok(t) => t,
+        Err(_) => net::github_release_tags_html(&client, FEEDER_REPO, "v", 1)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no DLSS5-Feeder release found"))?,
+    };
+    let url = net::github_asset_url_html(&client, FEEDER_REPO, &tag, r#"[^"]+\.zip"#)?;
+    let work = tempfile::tempdir()?;
+    let zip_path = work.path().join("dlss5-feeder.zip");
+    net::download(&client, &url, &zip_path, "DLSS5-Feeder", &|_, _| {})?;
+    copy_vulkan_feeder_kit_from_zip(&zip_path, game_dir, &tag)
+}
+
+/// Extract official Feeder addon + FX from a release zip (testable offline).
+pub fn copy_vulkan_feeder_kit_from_zip(
+    zip_path: &Path,
+    game_dir: &Path,
+    tag: &str,
+) -> Result<Vec<String>> {
+    let f = fs::File::open(zip_path)?;
+    let mut zip = zip::ZipArchive::new(f).context("DLSS5-Feeder download is not a valid zip")?;
+    let members: Vec<String> = zip.file_names().map(str::to_owned).collect();
+    let pick = |want: &str| -> Option<String> {
+        members
+            .iter()
+            .find(|m| net::file_name(&m.replace('\\', "/")).eq_ignore_ascii_case(want))
+            .cloned()
+    };
+    let addon = pick(game::FEEDER_ADDON)
+        .ok_or_else(|| anyhow!("DLSS5-Feeder {tag} has no {}", game::FEEDER_ADDON))?;
+    let fx = pick(game::FEEDER_FX)
+        .ok_or_else(|| anyhow!("DLSS5-Feeder {tag} has no {}", game::FEEDER_FX))?;
+    net::extract_member(&mut zip, &addon, &game_dir.join(game::FEEDER_ADDON))?;
+    net::extract_member(
+        &mut zip,
+        &fx,
+        &game_dir
+            .join("reshade-shaders")
+            .join("Shaders")
+            .join(game::FEEDER_FX),
+    )?;
+    let note = game_dir.join("VULKAN-SETUP.txt");
+    fs::write(&note, VULKAN_SETUP_TXT).with_context(|| format!("writing {}", note.display()))?;
+    Ok(vec![
+        format!("{} ({tag})", game::FEEDER_ADDON),
+        format!("reshade-shaders/Shaders/{}", game::FEEDER_FX),
+        "VULKAN-SETUP.txt".into(),
+    ])
+}
+
 /// Which install engine carries the DLSS 5 pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Engine {
@@ -43,8 +283,6 @@ pub enum Engine {
     /// Games with native DLSS only (the pass reads the inputs the game hands to DLSS).
     Opti,
 }
-
-pub const OPTI_RELEASES: &str = "https://api.github.com/repos/Dagherbou/OptiScaler_DLSSNR/releases";
 
 const STEP_OPTI: Step = Step {
     name: "OptiScaler + DLSS Neural Rendering",
@@ -81,6 +319,71 @@ impl Latest {
             dlssnr: rhi_latest(client, "dlssnr-").ok().map(|(t, _)| t),
         }
     }
+}
+
+/// Files that must exist after a successful Feeder/Native install.
+/// Used so the UI never says "Everything is in place" on a partial copy.
+pub fn missing_install_files(st: &GameStatus) -> Vec<String> {
+    let mut missing = Vec::new();
+    match st.mode {
+        game::Mode::Feeder => {
+            if !st.reshade {
+                missing.push(format!("{} (ReShade)", game::RESHADE_PROXY));
+            }
+            if !st.headers {
+                missing.push("reshade-shaders/Shaders headers (ReShade.fxh…)".into());
+            }
+            if !st.feeder {
+                let addon = if st.is32() {
+                    game::FEEDER_ADDON32
+                } else {
+                    game::FEEDER_ADDON
+                };
+                missing.push(format!("{addon} / {}", game::FEEDER_FX));
+            }
+            if !st.lumenite {
+                missing.push("LumeniteFX shaders".into());
+            }
+            if !st.dlss5_addon && !st.upstream {
+                missing.push("DLSS 5 neural consumer add-on".into());
+            }
+            if !st.dlssnr {
+                missing.push(game::DLSSNR_DLL.into());
+            }
+            if !st.dlss {
+                missing.push(game::DLSS_DLL.into());
+            }
+            if st.is32() {
+                if !st.host_exe {
+                    missing.push(format!("{}/{}", game::HOST_DIR, game::HOST_EXE));
+                }
+                if !st.host_reshade {
+                    missing.push(format!("{}/{}", game::HOST_DIR, game::RESHADE_PROXY));
+                }
+            }
+        }
+        game::Mode::Native => {
+            if st.opti {
+                if !st.dlssnr {
+                    missing.push(game::DLSSNR_DLL.into());
+                }
+            } else {
+                if !st.reshade {
+                    missing.push(format!("{} (ReShade)", game::RESHADE_PROXY));
+                }
+                if !(st.dlss5_addon || st.upstream) {
+                    missing.push("DLSS 5 neural consumer add-on".into());
+                }
+                if !st.dlssnr {
+                    missing.push(game::DLSSNR_DLL.into());
+                }
+                if st.needs_bridge() && !st.bridge {
+                    missing.push("dx11 bridge add-on".into());
+                }
+            }
+        }
+    }
+    missing
 }
 
 /// Components this tool placed in `dir` whose recorded version is behind
@@ -125,6 +428,23 @@ fn manifest_tag(manifest: &str) -> Option<String> {
         .map(|t| t.trim().to_owned())
 }
 
+/// The first stable release carrying a `.zip`. Both forks also publish rolling
+/// "nightly" releases whose assets are `.7z`, and taking a release's first
+/// asset blindly picked a checksum text file or an archive the installer
+/// cannot open.
+fn pick_opti_zip(releases: &[Value]) -> Option<String> {
+    releases
+        .iter()
+        .filter(|r| r["prerelease"] != Value::Bool(true))
+        .find_map(|r| {
+            r.get("assets")?.as_array()?.iter().find_map(|a| {
+                let url = a.get("browser_download_url")?.as_str()?;
+                let name = a.get("name")?.as_str()?.to_ascii_lowercase();
+                (name.ends_with(".zip") && !name.contains("sha256")).then(|| url.to_owned())
+            })
+        })
+}
+
 fn step_opti(
     client: &Client,
     st: &GameStatus,
@@ -143,7 +463,8 @@ fn step_opti(
     // in August still ran August's build after every reinstall. The tag is
     // recorded in the manifest; a copy this tool placed is refreshed when
     // upstream moves on, and one it did not place is never touched.
-    let latest = net::latest_tag(client, OPTI_REPO).ok();
+    let repo = opti_repo();
+    let latest = net::latest_tag(client, repo).ok();
     if st.opti {
         // No manifest at all: somebody else put OptiScaler there. A manifest
         // without a "# tag" line is ours, from before the tag was recorded --
@@ -169,24 +490,18 @@ fn step_opti(
     // Stable release only (releases/latest skips pre-releases); the API list
     // and the releases page both put betas first.
     let asset: String = match latest.clone() {
-        Some(tag) => net::github_asset_url_html(client, OPTI_REPO, &tag, r#"[^"]+\.zip"#)?,
-        None => match net::get_json_github(client, OPTI_RELEASES) {
+        Some(tag) => net::github_asset_url_html(client, repo, &tag, r#"[^"]+\.zip"#)?,
+        None => match net::get_json_github(client, &opti_releases_url()) {
             Ok(releases) => releases
                 .as_array()
-                .and_then(|a| a.iter().find(|r| r["prerelease"] != Value::Bool(true)))
-                .and_then(|r| r.get("assets"))
-                .and_then(Value::as_array)
-                .and_then(|a| a.first())
-                .and_then(|a| a.get("browser_download_url"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .ok_or_else(|| anyhow!("OptiScaler_DLSSNR has no release asset"))?,
+                .and_then(|a| pick_opti_zip(a))
+                .ok_or_else(|| anyhow!("{repo} has no release asset"))?,
             Err(_) => {
-                let tags = net::github_release_tags_html(client, OPTI_REPO, "v", 2)?;
+                let tags = net::github_release_tags_html(client, repo, "v", 2)?;
                 let tag = tags
                     .first()
-                    .ok_or_else(|| anyhow!("no OptiScaler_DLSSNR release found"))?;
-                net::github_asset_url_html(client, OPTI_REPO, tag, r#"[^"]+\.zip"#)?
+                    .ok_or_else(|| anyhow!("no {repo} release found"))?;
+                net::github_asset_url_html(client, repo, tag, r#"[^"]+\.zip"#)?
             }
         },
     };
@@ -247,6 +562,12 @@ fn step_opti(
     if let Ok(text) = fs::read_to_string(&ini) {
         let mut cur = text;
         if let Some(patched) = set_dlss_nr_enabled(&cur) {
+            cur = patched;
+        }
+        // The frame stays full size; only the model's own work is done small and
+        // enlarged, and its cost falls with the square of this. The single
+        // biggest performance lever on this route.
+        if let Some(patched) = set_ini_key(&cur, "DlssNr", "WorkingScale", &working_scale()) {
             cur = patched;
         }
         // RE Engine trips its own scheduler assertion unless the compute root
@@ -379,6 +700,30 @@ pub const RHI_RELEASES: &str =
     "https://api.github.com/repos/RankFTW/rhi-repo/releases?per_page=100";
 pub const RHI_REPO: &str = "RankFTW/rhi-repo";
 pub const OPTI_REPO: &str = "Dagherbou/OptiScaler_DLSSNR";
+/// wilsjo2's fork: the neural pass runs before super resolution instead of
+/// after it, with 1-3 configurable passes. Same zip layout as Dagherbou's, so
+/// it installs through the same step (#72).
+pub const OPTI_PRESR_REPO: &str = "wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass";
+
+/// Which OptiScaler build to install; unset means Dagherbou's.
+pub const OPTI_SOURCE_ENV: &str = "DLSS5ONECLICK_OPTI_SOURCE";
+
+/// True when the pre-SR multipass fork was asked for.
+pub fn opti_presr() -> bool {
+    std::env::var(OPTI_SOURCE_ENV).is_ok_and(|v| v.eq_ignore_ascii_case("presr"))
+}
+
+pub fn opti_repo() -> &'static str {
+    if opti_presr() {
+        OPTI_PRESR_REPO
+    } else {
+        OPTI_REPO
+    }
+}
+
+fn opti_releases_url() -> String {
+    format!("https://api.github.com/repos/{}/releases", opti_repo())
+}
 
 #[derive(Clone, Copy)]
 pub struct Step {
@@ -389,6 +734,10 @@ pub struct Step {
 const STEP_RESHADE: Step = Step {
     name: "ReShade (add-on build)",
     run: step_reshade,
+};
+const STEP_DGVOODOO: Step = Step {
+    name: "dgVoodoo 2.87.3 (DX9 → D3D11)",
+    run: step_dgvoodoo,
 };
 const STEP_HEADERS: Step = Step {
     name: "ReShade shader headers",
@@ -433,6 +782,10 @@ const STEP_CONFIG: Step = Step {
 const STEP_FEEDER_CLEANUP: Step = Step {
     name: "Remove DLSS5-Feeder (game has native DLSS)",
     run: step_feeder_cleanup,
+};
+const STEP_DLSS5_CLEANUP: Step = Step {
+    name: "Remove the RenoDX DLSS 5 add-on (Neural Upstream replaces it)",
+    run: step_dlss5_cleanup,
 };
 const STEP_REFRAMEWORK: Step = Step {
     name: "REFramework (RE Engine needs it before ReShade)",
@@ -564,6 +917,18 @@ pub fn set_load_reshade(ini: &str) -> Option<String> {
         changed = true;
     }
     changed.then_some(out)
+}
+
+/// Fraction of the frame the DLSS 5 model works at, as OptiScaler's
+/// `[DlssNr] WorkingScale` wants it. Set through the UI; `1` when unset.
+pub const WORKING_SCALE_ENV: &str = "DLSS5ONECLICK_WORKING_SCALE";
+
+/// Reads the chosen model resolution, falling back to full size.
+fn working_scale() -> String {
+    std::env::var(WORKING_SCALE_ENV)
+        .ok()
+        .filter(|v| v.parse::<f32>().is_ok_and(|f| (0.25..=2.0).contains(&f)))
+        .unwrap_or_else(|| "1.0".to_owned())
 }
 
 /// `[DlssNr] Enabled=true` in OptiScaler.ini; `None` when it already says so.
@@ -815,6 +1180,13 @@ pub fn plan_with(st: &GameStatus, engine: Engine, x: Extras) -> Vec<Step> {
     if x.with_mfg {
         v.push(STEP_MFG);
     }
+    // DX9 never loads dxgi.dll; dgVoodoo must sit in the game folder first.
+    // Always run on Dx9 (even when the DLL is already present) so Install can
+    // refresh dgVoodoo.conf — Uninstall never removes dgVoodoo, and a bare
+    // OutputAPI-only conf leaves stock VRAM=256 (Gothic 3 texture failures).
+    if st.api == game::Api::Dx9 {
+        v.insert(0, STEP_DGVOODOO);
+    }
     v.push(STEP_GPU_PREF);
     v
 }
@@ -844,6 +1216,7 @@ fn plan_reshade(st: &GameStatus, upstream: bool) -> Vec<Step> {
             // DLSSNR feature and needs only the model beside it, so it takes
             // the RenoDX add-on's place rather than sitting next to it.
             if upstream {
+                v.push(STEP_DLSS5_CLEANUP);
                 v.push(STEP_UPSTREAM);
                 v.push(STEP_DLSSNR_ONLY);
             } else {
@@ -909,7 +1282,35 @@ fn best_tag(mut cands: Vec<(Vec<u64>, String, String)>) -> (String, String) {
 
 /// rhi-repo lookup that never needs the API: HTML releases pages for the tag,
 /// the expanded-assets fragment for the file.
+/// Tag of the DLSS 5 add-on build to install; unset means the newest one.
+pub const RENODX_TAG_ENV: &str = "DLSS5ONECLICK_RENODX_TAG";
+
+/// The classic-engine add-on. The Feeder's own host measured v4.7 to fault
+/// inside the driver's NGX runtime on NVIDIA 616.64 — an access violation in
+/// D3D12Core.dll reached through nvngx_dlssnr.dll — and names this build as one
+/// that passes there (#69).
+pub const RENODX_CLASSIC_TAG: &str = "renodx-dlss5-4.55";
+
+/// A pinned add-on build, when one was asked for: `(tag, url)`.
+fn rhi_env_pinned(client: &Client, prefix: &str) -> Option<Result<(String, String)>> {
+    if prefix != "renodx-dlss5-" {
+        return None;
+    }
+    let tag = std::env::var(RENODX_TAG_ENV).ok()?;
+    if tag.is_empty() {
+        return None;
+    }
+    Some(
+        net::github_asset_url_html(client, RHI_REPO, &tag, r#"[^"]+\.zip"#)
+            .map(|url| (tag.clone(), url))
+            .with_context(|| format!("DLSS 5 add-on build {tag} not found on {RHI_REPO}")),
+    )
+}
+
 pub fn rhi_latest(client: &Client, prefix: &str) -> Result<(String, String)> {
+    if let Some(pinned) = rhi_env_pinned(client, prefix) {
+        return pinned;
+    }
     if let Ok(releases) = net::get_json_github(client, RHI_RELEASES) {
         if let Some(arr) = releases.as_array() {
             if let Ok(r) = pick_latest_asset(arr, prefix) {
@@ -1112,6 +1513,258 @@ pub fn install_reshade_from_setup(
     Ok(vec![dest_name.into()])
 }
 
+/// Parse a loose dgVoodoo-style INI and ensure Feeder-safe keys without wiping CPL settings.
+/// - Force `OutputAPI = d3d11_fl11_0` under `[General]`
+/// - Floor `VRAM` under `[DirectX]` to at least [`DGVOODOO_VRAM_FLOOR`]
+/// - Create missing sections/keys; leave every other line untouched
+fn merge_dgvoodoo_conf(existing: &str) -> String {
+    let mut out = String::with_capacity(existing.len() + 128);
+    let mut section = String::new();
+    let mut saw_general = false;
+    let mut saw_directx = false;
+    let mut output_api_set = false;
+    let mut vram_set = false;
+    let mut watermark_set = false;
+
+    for raw in existing.lines() {
+        let line = raw.trim_end();
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
+            // Flush required keys before leaving a section.
+            if section.eq_ignore_ascii_case("General") && !output_api_set {
+                out.push_str(&format!("OutputAPI = {DGVOODOO_OUTPUT_API}\n"));
+                output_api_set = true;
+            }
+            if section.eq_ignore_ascii_case("DirectX") {
+                if !vram_set {
+                    out.push_str(&format!("VRAM = {DGVOODOO_VRAM_FLOOR}\n"));
+                    vram_set = true;
+                }
+                if !watermark_set {
+                    out.push_str("dgVoodooWatermark = false\n");
+                    watermark_set = true;
+                }
+            }
+            section = trimmed[1..trimmed.len() - 1].to_string();
+            if section.eq_ignore_ascii_case("General") {
+                saw_general = true;
+            }
+            if section.eq_ignore_ascii_case("DirectX") {
+                saw_directx = true;
+            }
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        if let Some((k, v)) = trimmed.split_once('=') {
+            let key = k.trim();
+            let val = v.trim();
+            if section.eq_ignore_ascii_case("General") && key.eq_ignore_ascii_case("OutputAPI") {
+                out.push_str(&format!("OutputAPI = {DGVOODOO_OUTPUT_API}\n"));
+                output_api_set = true;
+                continue;
+            }
+            if section.eq_ignore_ascii_case("DirectX") && key.eq_ignore_ascii_case("VRAM") {
+                let cur = val
+                    .split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(0);
+                let floor = cur.max(DGVOODOO_VRAM_FLOOR);
+                out.push_str(&format!("VRAM = {floor}\n"));
+                vram_set = true;
+                continue;
+            }
+            if section.eq_ignore_ascii_case("DirectX")
+                && key.eq_ignore_ascii_case("dgVoodooWatermark")
+            {
+                out.push_str("dgVoodooWatermark = false\n");
+                watermark_set = true;
+                continue;
+            }
+        }
+
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    if section.eq_ignore_ascii_case("General") && !output_api_set {
+        out.push_str(&format!("OutputAPI = {DGVOODOO_OUTPUT_API}\n"));
+        output_api_set = true;
+    }
+    if section.eq_ignore_ascii_case("DirectX") {
+        if !vram_set {
+            out.push_str(&format!("VRAM = {DGVOODOO_VRAM_FLOOR}\n"));
+            vram_set = true;
+        }
+        if !watermark_set {
+            out.push_str("dgVoodooWatermark = false\n");
+            watermark_set = true;
+        }
+    }
+
+    if !saw_general {
+        out.push_str("\n[General]\n");
+        out.push_str(&format!("OutputAPI = {DGVOODOO_OUTPUT_API}\n"));
+        output_api_set = true;
+    } else if !output_api_set {
+        // Section existed but key never appeared (empty section mid-file already handled).
+        out.push_str(&format!("OutputAPI = {DGVOODOO_OUTPUT_API}\n"));
+    }
+
+    if !saw_directx {
+        out.push_str("\n[DirectX]\n");
+        out.push_str("VideoCard = geforce_9800_gt\n");
+        out.push_str(&format!("VRAM = {DGVOODOO_VRAM_FLOOR}\n"));
+        out.push_str("dgVoodooWatermark = false\n");
+        out.push_str("Antialiasing = appdriven\n");
+        out.push_str("FastVideoMemoryAccess = false\n");
+    } else {
+        if !vram_set {
+            out.push_str(&format!("VRAM = {DGVOODOO_VRAM_FLOOR}\n"));
+        }
+        if !watermark_set {
+            out.push_str("dgVoodooWatermark = false\n");
+        }
+    }
+
+    let _ = (output_api_set, vram_set);
+    out
+}
+
+fn assert_dgvoodoo_conf_healthy(text: &str) -> Result<()> {
+    let lower = text.to_ascii_lowercase();
+    if !lower.contains("outputapi") || !lower.contains("d3d11_fl11_0") {
+        bail!("dgVoodoo.conf health check failed: OutputAPI must be d3d11_fl11_0");
+    }
+    // Find VRAM value
+    let mut vram_ok = false;
+    let mut section = "";
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') && t.ends_with(']') {
+            section = t;
+            continue;
+        }
+        if section.eq_ignore_ascii_case("[DirectX]") {
+            if let Some((k, v)) = t.split_once('=') {
+                if k.trim().eq_ignore_ascii_case("VRAM") {
+                    let n = v
+                        .split_whitespace()
+                        .next()
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .unwrap_or(0);
+                    vram_ok = n >= DGVOODOO_VRAM_FLOOR;
+                }
+            }
+        }
+    }
+    if !vram_ok {
+        bail!("dgVoodoo.conf health check failed: VRAM must be >= {DGVOODOO_VRAM_FLOOR}");
+    }
+    Ok(())
+}
+
+/// Smart-merge (or create) `dgVoodoo.conf`: force OutputAPI, floor VRAM, preserve the rest.
+/// Writes `dgVoodoo.conf.bak` once before the first edit of an existing file.
+pub fn write_dgvoodoo_conf(game_dir: &Path) -> Result<()> {
+    let conf = game_dir.join("dgVoodoo.conf");
+    let bak = game_dir.join("dgVoodoo.conf.bak");
+    let text = if conf.is_file() {
+        let existing =
+            fs::read_to_string(&conf).with_context(|| format!("reading {}", conf.display()))?;
+        if !bak.is_file() {
+            fs::write(&bak, &existing).with_context(|| format!("writing {}", bak.display()))?;
+        }
+        merge_dgvoodoo_conf(&existing)
+    } else {
+        DGVOODOO_CONF_TEMPLATE.to_string()
+    };
+    assert_dgvoodoo_conf_healthy(&text)?;
+    fs::write(&conf, text).with_context(|| format!("writing {}", conf.display()))?;
+    Ok(())
+}
+
+fn dgvoodoo_d3d9_member(bitness: u8) -> &'static str {
+    if bitness == 64 {
+        DGVOODOO_D3D9_MEMBER_X64
+    } else {
+        DGVOODOO_D3D9_MEMBER_X86
+    }
+}
+
+/// Place official dgVoodoo `MS/{x86|x64}/D3D9.dll` + smart-merged conf in the game folder.
+/// Never restores `d3d9.dll.off` (old ReShade); always extracts from the release zip.
+pub fn install_dgvoodoo_from_zip(
+    zip_path: &Path,
+    game_dir: &Path,
+    bitness: u8,
+) -> Result<Vec<String>> {
+    let want = dgvoodoo_d3d9_member(bitness);
+    let f = fs::File::open(zip_path)?;
+    let mut zip = zip::ZipArchive::new(f).context("dgVoodoo download is not a valid zip")?;
+    let member = zip
+        .file_names()
+        .find(|n| {
+            let norm = n.replace('\\', "/");
+            norm.eq_ignore_ascii_case(want)
+                || (bitness != 64 && norm.to_ascii_lowercase().ends_with("/ms/x86/d3d9.dll"))
+                || (bitness == 64 && norm.to_ascii_lowercase().ends_with("/ms/x64/d3d9.dll"))
+        })
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            anyhow!("dgVoodoo zip does not contain {want} — unexpected release layout")
+        })?;
+    let dest = game_dir.join("d3d9.dll");
+    // Refuse to clobber a foreign wrapper; callers should have blocked Install already.
+    if dest.is_file() && !game::is_dgvoodoo(game_dir) {
+        bail!(
+            "a d3d9.dll that is not dgVoodoo is already present; remove or replace it, then Install again"
+        );
+    }
+    net::extract_member(&mut zip, &member, &dest)?;
+    write_dgvoodoo_conf(game_dir)?;
+    if !game::is_dgvoodoo(game_dir) {
+        bail!("wrote d3d9.dll + dgVoodoo.conf but dgVoodoo was not detected afterward");
+    }
+    Ok(vec!["d3d9.dll".into(), "dgVoodoo.conf".into()])
+}
+
+fn step_dgvoodoo(
+    client: &Client,
+    st: &GameStatus,
+    work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    let d = st.game_dir();
+    let mut out: Vec<String> = Vec::new();
+    let member = dgvoodoo_d3d9_member(st.bitness);
+    if game::is_dgvoodoo(d) {
+        progress(50, "dgVoodoo DLL present — merging conf");
+    } else {
+        // Do not treat d3d9.dll.off (old ReShade) as dgVoodoo — download the real DLL.
+        if d.join("d3d9.dll").is_file() {
+            bail!(
+                "a d3d9.dll that is not dgVoodoo is already present; remove or replace it with \
+                 dgVoodoo 2.87.3 ({member}), then Install again"
+            );
+        }
+        progress(0, &format!("Downloading dgVoodoo {DGVOODOO_TAG}"));
+        let z = work.join("dgVoodoo2_87_3.zip");
+        net::download(client, DGVOODOO_ZIP, &z, "dgVoodoo 2.87.3", progress)?;
+        progress(90, &format!("Extracting {member}"));
+        out.extend(install_dgvoodoo_from_zip(&z, d, st.bitness)?);
+        progress(100, "dgVoodoo 2.87.3 ready");
+        return Ok(out);
+    }
+    // DLL already there: merge conf so VRAM/OutputAPI stay safe without wiping CPL.
+    write_dgvoodoo_conf(d)?;
+    out.push("dgVoodoo.conf (OutputAPI/VRAM merged)".into());
+    progress(100, "dgVoodoo conf merged");
+    Ok(out)
+}
+
 fn step_reshade(
     client: &Client,
     st: &GameStatus,
@@ -1126,9 +1779,13 @@ fn step_reshade(
             game::RESHADE_PROXY
         );
     }
+    // A proxy of the wrong bitness is invisible from inside the game: the
+    // loader simply does not load it, ReShade writes no log, and the Home key
+    // does nothing. Whatever the marker says, that one gets replaced (#69).
+    let wrong_bitness = st.reshade && game::exe_bitness(&proxy).is_ok_and(|b| b != st.bitness);
     progress(0, "Looking up latest ReShade");
     let (ver, url) = resolve_reshade_setup(client)?;
-    if st.reshade {
+    if st.reshade && !wrong_bitness {
         // Only a copy this tool placed is refreshed; a user's own ReShade stays.
         match fs::read_to_string(d.join(game::RESHADE_MARKER)) {
             Ok(mine) if mine.trim() == ver => {
@@ -1144,8 +1801,26 @@ fn step_reshade(
     }
     let setup = work.join(format!("ReShade_Setup_{ver}_Addon.exe"));
     net::download(client, &url, &setup, "ReShade", progress)?;
-    let out = install_reshade_from_setup(&setup, d, st.bitness, game::RESHADE_PROXY)?;
+    let mut out = install_reshade_from_setup(&setup, d, st.bitness, game::RESHADE_PROXY)?;
     fs::write(d.join(game::RESHADE_MARKER), ver.as_bytes())?;
+    if wrong_bitness {
+        out.push(format!(
+            "{} was {}-bit in a {}-bit game and has been replaced",
+            game::RESHADE_PROXY,
+            if st.bitness == 32 { 64 } else { 32 },
+            st.bitness
+        ));
+        // The 64-bit add-on cannot belong to a 32-bit game either; it came from
+        // the same mistaken install and ReShade would keep trying to load it.
+        let stray = d.join(game::FEEDER_ADDON);
+        if st.is32() && stray.is_file() {
+            fs::remove_file(&stray)?;
+            out.push(format!(
+                "{} removed (64-bit add-on in a 32-bit game)",
+                game::FEEDER_ADDON
+            ));
+        }
+    }
     Ok(out)
 }
 
@@ -1249,11 +1924,25 @@ fn step_feeder(
     if st.is32() && host_member.is_none() {
         bail!("DLSS5-Feeder {tag} has no {}", game::HOST_EXE);
     }
+    // The 32-bit halves talk a versioned IPC protocol to each other, and a
+    // mismatch is fatal at runtime: "the game add-on speaks protocol v8, this
+    // host v9 -- the two halves are from different releases" and the host exits
+    // (#69). Sizes cannot see that, so the tag each half was taken from is
+    // recorded and both are replaced unless both markers name this release.
+    let marker_says = |dir: &Path| -> bool {
+        fs::read_to_string(dir.join(game::FEEDER_MARKER)).is_ok_and(|m| m.trim() == tag.as_str())
+    };
+    let halves_agree = !st.is32() || marker_says(&st.consumer_dir());
     let host_current = match &host_member {
         Some(m) => same_size(&mut zip, m, &st.consumer_dir().join(game::HOST_EXE)),
         None => true,
     };
-    if st.feeder && host_current && same_size(&mut zip, &addon, &d.join(addon_name)) {
+    if st.feeder
+        && halves_agree
+        && marker_says(d)
+        && host_current
+        && same_size(&mut zip, &addon, &d.join(addon_name))
+    {
         return Ok(vec![format!("DLSS5-Feeder already current ({tag}{note})")]);
     }
     net::extract_member(&mut zip, &addon, &d.join(addon_name))?;
@@ -1263,6 +1952,9 @@ fn step_feeder(
         let host = st.consumer_dir();
         fs::create_dir_all(&host)?;
         net::extract_member(&mut zip, m, &host.join(game::HOST_EXE))?;
+        // Both halves now carry the tag they came from, so a later install can
+        // tell "same release" from "same size".
+        fs::write(host.join(game::FEEDER_MARKER), tag.as_bytes())?;
         out.push(format!(
             "{}/{} ({tag}{note})",
             game::HOST_DIR,
@@ -1313,6 +2005,9 @@ pub fn install_lumenite_from_zip(zip_path: &Path, game_dir: &Path) -> Result<Vec
             installed.push(format!("{rel}/{name}"));
         }
     }
+    if let Some(msg) = apply_traa_ui_patch(game_dir)? {
+        installed.push(msg);
+    }
     Ok(installed)
 }
 
@@ -1324,7 +2019,11 @@ fn step_lumenite(
 ) -> Result<Vec<String>> {
     if st.lumenite {
         progress(100, "LumeniteFX already installed");
-        return Ok(vec![]);
+        let mut out = vec![];
+        if let Some(msg) = apply_traa_ui_patch(st.game_dir())? {
+            out.push(msg);
+        }
+        return Ok(out);
     }
     let z = work.join("LumeniteFX.zip");
     net::download(client, LUMENITE_ZIP, &z, "LumeniteFX", progress)?;
@@ -1393,7 +2092,24 @@ fn step_dlss5(
     let addon_pin = renodx_dlss5_pin(feeder_tag.as_deref(), gpu::driver_for_pin().as_deref());
     let cdir = st.consumer_dir();
     fs::create_dir_all(&cdir)?;
+    // This machine has already been told, by the Feeder's own host, that the
+    // current add-on build faults in its driver. Fetching that build again just
+    // reproduces it, so take the one the host names as passing — unless the
+    // user pinned a build themselves, in which case that wins (#69).
+    // A 32-bit game was excluded here for no reason I can defend: its add-on
+    // lives in host64\ and is fetched by this same loop, and its host is the
+    // very thing that prints the verdict. sempie27's GTA IV kept getting v4.7
+    // back while its own log said v4.7 faults on this driver (#69).
+    let auto_classic = std::env::var_os(RENODX_TAG_ENV).is_none() && addon_faulted_in_driver(&cdir);
+    if auto_classic {
+        std::env::set_var(RENODX_TAG_ENV, RENODX_CLASSIC_TAG);
+    }
     let mut installed = Vec::new();
+    if auto_classic {
+        installed.push(format!(
+            "{RENODX_CLASSIC_TAG}: this game's log reports the newer build faulting in the driver"
+        ));
+    }
     for (prefix, fname, present, marker) in plan {
         let pin = (prefix == "renodx-dlss5-").then_some(addon_pin).flatten();
         if let Some(p) = pin {
@@ -1445,6 +2161,11 @@ fn step_dlss5(
             format!("{fname} ({tag})")
         };
         installed.push(shown);
+    }
+    // The pin belongs to this game, not to the session: leaving it set would
+    // quietly hold the next game on the classic build too.
+    if auto_classic {
+        std::env::remove_var(RENODX_TAG_ENV);
     }
     Ok(installed)
 }
@@ -1524,6 +2245,36 @@ fn step_feeder_cleanup(
     Ok(removed)
 }
 
+/// The plan already declines to *install* the RenoDX add-on on the Neural
+/// Upstream route, but nothing removed one an earlier run had placed. Anyone who
+/// installed once without the box and again with it ends up with both, and
+/// ReShade loads every add-on it finds.
+///
+/// They are not additive. Both detour `NVSDK_NGX_D3D12_CreateFeature` and
+/// `EvaluateFeature`, and both create NGX feature 18 on the same device. The
+/// second create is refused, so the user gets no neural rendering at all rather
+/// than one of the two implementations.
+fn step_dlss5_cleanup(
+    _c: &Client,
+    st: &GameStatus,
+    _w: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    let mut removed = Vec::new();
+    let f = st.consumer_dir().join(game::DLSS5_ADDON);
+    if f.is_file() {
+        fs::remove_file(&f)?;
+        removed.push(game::DLSS5_ADDON.to_owned());
+        progress(
+            100,
+            "RenoDX DLSS 5 add-on removed; Neural Upstream replaces it",
+        );
+    } else {
+        progress(100, "no RenoDX DLSS 5 add-on to remove");
+    }
+    Ok(removed)
+}
+
 // ── step 5b: DX11 bridge (native-DLSS games rendering with D3D11) ──
 
 fn step_bridge(
@@ -1595,7 +2346,169 @@ fn step_upstream(
         game::UPSTREAM_ADDON,
         progress,
     )?;
-    Ok(vec![game::UPSTREAM_ADDON.into()])
+    let mut done = vec![game::UPSTREAM_ADDON.to_owned()];
+    // The add-on reads its strength from ReShade.ini at startup, so the choice
+    // can be made here instead of only in the in-game overlay (#68).
+    let preset = upstream_preset();
+    if preset != 0 {
+        reshade_ini::write_upstream_preset(st.game_dir(), preset)?;
+        if let Some((name, ..)) = reshade_ini::UPSTREAM_PRESETS
+            .iter()
+            .find(|(_, id, _)| *id == preset)
+        {
+            done.push(format!("neural-upstream preset: {name}"));
+        }
+    }
+    Ok(done)
+}
+
+/// Which neural-upstream strength preset to seed; 0 leaves the overlay's own.
+pub const UPSTREAM_PRESET_ENV: &str = "DLSS5ONECLICK_UPSTREAM_PRESET";
+
+fn upstream_preset() -> u8 {
+    std::env::var(UPSTREAM_PRESET_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok())
+        .filter(|p| {
+            reshade_ini::UPSTREAM_PRESETS
+                .iter()
+                .any(|(_, id, _)| id == p)
+        })
+        .unwrap_or(0)
+}
+
+/// Active quality resolution for the install currently running (set by `run_all_with`).
+static INSTALL_QUALITY: std::sync::Mutex<Option<ResolvedQuality>> = std::sync::Mutex::new(None);
+
+fn install_quality() -> ResolvedQuality {
+    INSTALL_QUALITY
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_else(quality_preset::fallback_medium)
+}
+
+/// True when this game has already refused a reduced work resolution.
+///
+/// Some games cannot create the staging SRV for the smaller image at any size
+/// below full — Dying Light fails identically at 90% and 85% and works at 100%.
+/// The feed retries three times and stops, before any DLSS create, so the whole
+/// install goes quiet and nothing on screen says why (#74).
+pub fn work_resolution_refused(game_dir: &Path) -> bool {
+    let Ok(log) = fs::read_to_string(game_dir.join("dlss5-feed.log")) else {
+        return false;
+    };
+    if !log.contains("work-resolution staging SRV failed") {
+        return false;
+    }
+    // Feeder 0.15.0 fixed the cause: the staging copy was created in the
+    // backbuffer's exact ..._UNORM_SRGB format and then viewed as ..._UNORM,
+    // which a D3D11 view may not do unless the resource is typeless, so every
+    // reduced work resolution failed on an sRGB swapchain (DLSS5-Feeder#85).
+    // A failure logged by an older build says nothing about the one this very
+    // install is about to put in the folder, so it must not hold the setting
+    // down forever.
+    feeder_log_version(&log).is_none_or(|v| v >= FEEDER_SRGB_FIX)
+}
+
+/// First Feeder release where a reduced work resolution works on an sRGB
+/// swapchain.
+const FEEDER_SRGB_FIX: [u64; 3] = [0, 15, 0];
+
+/// `"HH:MM:SS.mmm  dlss5-feed 0.15.0 (built ...) attached."` -> `[0, 15, 0]`.
+fn feeder_log_version(log: &str) -> Option<[u64; 3]> {
+    let mut it = log.lines().next()?.split_whitespace();
+    it.find(|t| t.starts_with("dlss5-feed"))?;
+    let raw = it.next()?;
+    let mut parts = raw.split(['.', '-']).map(|p| p.parse::<u64>().unwrap_or(0));
+    let v = [
+        parts.next()?,
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    ];
+    raw.chars().next()?.is_ascii_digit().then_some(v)
+}
+
+/// True when this game's own logs say the DLSS 5 add-on faulted inside the
+/// driver's NGX runtime.
+///
+/// The Feeder's host prints that verdict itself, having measured it: the neural
+/// evaluate takes an access violation in `D3D12Core.dll` reached through
+/// `nvngx_dlssnr.dll`, so DLSS 5 delivers nothing while everything else keeps
+/// working. It names the classic add-on build as one that passes there. Read
+/// the machine's own evidence rather than assuming it from a driver number —
+/// the measurement covers 616.64, and newer drivers are untested (#69).
+/// Where the driver verdict is remembered once a log has stated it. A game
+/// folder is the wrong place to keep it: Remove empties the folder, a fresh
+/// game has no log yet, and the fault belongs to the driver rather than to any
+/// one game.
+fn driver_fault_flag() -> PathBuf {
+    crate::settings::Settings::path().with_file_name("driver-fault.txt")
+}
+
+pub fn addon_faulted_in_driver(consumer_dir: &Path) -> bool {
+    faulted_in_driver_at(
+        consumer_dir,
+        &driver_fault_flag(),
+        crate::gpu::nvidia_driver(),
+    )
+}
+
+/// The decision itself, with its two pieces of state passed in so a test can
+/// exercise it without touching the machine's own file or its real driver.
+fn faulted_in_driver_at(consumer_dir: &Path, flag: &Path, driver: Option<String>) -> bool {
+    // On a 32-bit game the feed's log is beside the exe and the host's is in
+    // host64\; on a 64-bit one both are the same folder. Check the pair either
+    // way rather than assuming which layout this is.
+    let dirs = [consumer_dir.to_path_buf(), consumer_dir.join("..")];
+    let in_logs = dirs.iter().any(|d| {
+        ["dlss5-feed.log", "dlss5-feed-host.log"].iter().any(|n| {
+            fs::read_to_string(d.join(n))
+                .is_ok_and(|l| l.contains("is a combination measured to fail"))
+        })
+    });
+    let Some(drv) = driver else {
+        return in_logs;
+    };
+    if in_logs {
+        // Record it against the driver that produced it, so a driver update
+        // retires the verdict by itself.
+        if let Some(dir) = flag.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        let _ = fs::write(flag, drv.as_bytes());
+        return true;
+    }
+    match fs::read_to_string(flag) {
+        Ok(seen) if seen.trim() == drv => true,
+        Ok(_) => {
+            let _ = fs::remove_file(flag);
+            false
+        }
+        Err(_) => false,
+    }
+}
+
+pub fn write_feeder_cfg(game_dir: &Path, r: &ResolvedQuality) -> Result<()> {
+    let path = game_dir.join("dlss5-feed.cfg");
+    // A preset that seeds a reduced work resolution would otherwise put this
+    // game straight back into the failure it just came out of, every install.
+    let mut r = r.clone();
+    if r.work_resolution < 100 && work_resolution_refused(game_dir) {
+        r.work_resolution = 100;
+        r.work_upscale = 0;
+        r.summary = format!(
+            "{} - work_resolution held at 100% (this game refused a smaller one)",
+            r.summary
+        );
+    }
+    let r = &r;
+    let mut text = quality_preset::feeder_cfg_text(r);
+    // Overlay UX defaults from Settings (log_detail / evaluate_stride / …).
+    let settings = crate::settings::Settings::load();
+    text = crate::settings::apply_overlay_to_cfg(&text, &settings);
+    fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }
 
 // ── RTX Remix: download a complete mod for a game that has one ──────
@@ -1829,9 +2742,26 @@ fn step_config(_c: &Client, st: &GameStatus, _w: &Path, progress: Progress) -> R
         progress(100, "ReShade.ini written");
         return Ok(vec![game::RESHADE_INI.into()]);
     }
-    reshade_ini::write_preset(st.game_dir())?;
-    progress(100, "ReShade.ini + ReShadePreset.ini written");
-    Ok(vec![game::RESHADE_INI.into(), game::RESHADE_PRESET.into()])
+    let q = install_quality();
+    reshade_ini::write_preset(st.game_dir(), q.enable_lumenite)?;
+    reshade_ini::write_feed_fx_uniforms(st.game_dir(), &quality_preset::feed_fx_uniforms(&q))?;
+    reshade_ini::write_traa_ui_defaults(st.game_dir())?;
+    write_feeder_cfg(st.game_dir(), &q)?;
+    let mut out = vec![
+        game::RESHADE_INI.into(),
+        game::RESHADE_PRESET.into(),
+        "dlss5-feed.cfg".into(),
+    ];
+    if q.work_resolution < 100 && work_resolution_refused(st.game_dir()) {
+        out.push(
+            "work_resolution held at 100%: this game's log shows it refused a smaller one".into(),
+        );
+    }
+    progress(100, "ReShade + feeder defaults (Optimize on first attach)");
+    if let Some(msg) = apply_traa_ui_patch(st.game_dir())? {
+        out.push(msg);
+    }
+    Ok(out)
 }
 
 // ── step 7: which GPU Windows starts the process on ────────────
@@ -1894,10 +2824,28 @@ pub enum StepState {
     Error,
 }
 
+/// Quality seed for an install (Settings page / CLI).
+#[derive(Debug, Clone)]
+pub struct InstallOpts {
+    pub quality: QualityChoice,
+    pub overrides: QualityOverrides,
+}
+
+impl Default for InstallOpts {
+    fn default() -> Self {
+        let s = crate::settings::Settings::load();
+        Self {
+            quality: s.quality_choice(),
+            overrides: s.quality_overrides(),
+        }
+    }
+}
+
 pub fn run_all_with(
     exe: &Path,
     engine: Engine,
     x: Extras,
+    opts: InstallOpts,
     progress: Progress,
     step_cb: &(dyn Fn(usize, usize, &str, StepState, &str) + Sync),
 ) -> Result<Vec<(String, Vec<String>)>> {
@@ -1930,6 +2878,10 @@ pub fn run_all_with(
             );
         }
     }
+    let resolved = quality_preset::resolve(opts.quality, &st, &opts.overrides);
+    if let Ok(mut slot) = INSTALL_QUALITY.lock() {
+        *slot = Some(resolved);
+    }
     let client = net::client()?;
     let work = tempfile::Builder::new()
         .prefix("dlss5oneclick-")
@@ -1952,6 +2904,9 @@ pub fn run_all_with(
             Err(e) => {
                 let msg = format!("{e:#}");
                 step_cb(i, n, step.name, StepState::Error, &msg);
+                if let Ok(mut slot) = INSTALL_QUALITY.lock() {
+                    *slot = None;
+                }
                 return Err(anyhow!("{}: {msg}", step.name));
             }
         }
@@ -1977,7 +2932,42 @@ pub fn run_all_with(
             }
         }
     }
+    if let Ok(mut slot) = INSTALL_QUALITY.lock() {
+        *slot = None;
+    }
+    // Re-inspect and refuse a hollow "success" when critical files are missing.
+    st = game::inspect(exe)?;
+    let missing = missing_install_files(&st);
+    if !missing.is_empty() {
+        bail!(
+            "Install finished but files are missing: {}. Not reporting success.",
+            missing.join(", ")
+        );
+    }
     Ok(results)
+}
+
+/// Convenience wrapper used by CLI / GUI when no explicit quality is passed —
+/// reads `%LOCALAPPDATA%\dlss5oneclick\settings.json` for defaults.
+pub fn run_all(
+    exe: &Path,
+    engine: Engine,
+    x: Extras,
+    progress: Progress,
+    step_cb: &(dyn Fn(usize, usize, &str, StepState, &str) + Sync),
+) -> Result<Vec<(String, Vec<String>)>> {
+    let s = crate::settings::Settings::load();
+    run_all_with(
+        exe,
+        engine,
+        x,
+        InstallOpts {
+            quality: s.quality_choice(),
+            overrides: s.quality_overrides(),
+        },
+        progress,
+        step_cb,
+    )
 }
 
 /// Remove everything this tool places except ReShade itself and nvngx_dlss.dll.
@@ -2041,12 +3031,10 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
             targets.push(host.join(game::RESHADE_PROXY));
             targets.push(host.join(game::RESHADE_MARKER));
         }
-        for n in [
-            "ReShade.ini",
-            "ReShade.log",
-            "dlss5-feed-host.log",
-            "ReShadePreset.ini",
-        ] {
+        // The two .log files are evidence, not installed files. Remove used to
+        // delete them, which erased the very verdict the next Install reads to
+        // decide which add-on build this machine can use (#69).
+        for n in ["ReShade.ini", "ReShadePreset.ini"] {
             targets.push(host.join(n));
         }
     }
@@ -2099,13 +3087,15 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
     Ok(removed)
 }
 
-/// `uninstall`, then ReShade itself — but only when nothing foreign remains.
+/// `uninstall`, then ReShade itself (`dxgi.dll` + ini/logs).
 ///
-/// Refuses to touch ReShade when, after removing this tool's files, the game
-/// still has other `.addon64`/`.addon32` files or other shaders in
-/// `reshade-shaders` — that is somebody's own ReShade setup. `dxgi.dll` is
-/// only deleted when it verifiably is a ReShade DLL. Returns
-/// `(removed, kept_reason)`; `kept_reason` is `Some` when ReShade was left.
+/// Refuses only when a foreign `.addon64`/`.addon32` remains — those need
+/// ReShade to load. Leftover shaders under `reshade-shaders` (common on older
+/// packs, e.g. Gothic 3) no longer block removal: this tool always installs
+/// ReShade as `dxgi.dll`, never as `d3d9.dll`, and never deletes dgVoodoo's
+/// `d3d9.dll` / `dgVoodoo.conf`. `dxgi.dll` is only deleted when it
+/// verifiably is a ReShade DLL. Returns `(removed, kept_reason)`;
+/// `kept_reason` is `Some` when ReShade was left.
 pub fn uninstall_all(exe: &Path) -> Result<(Vec<String>, Option<String>)> {
     let mut removed = uninstall(exe)?;
     let d = exe.parent().context("exe has no parent")?;
@@ -2114,42 +3104,23 @@ pub fn uninstall_all(exe: &Path) -> Result<(Vec<String>, Option<String>)> {
         return Ok((removed, None));
     }
 
-    let mut foreign: Vec<String> = Vec::new();
+    let mut foreign_addons: Vec<String> = Vec::new();
     if let Ok(rd) = fs::read_dir(d) {
         for e in rd.flatten() {
             let n = e.file_name().to_string_lossy().to_lowercase();
             if n.ends_with(".addon64") || n.ends_with(".addon32") {
-                foreign.push(n);
+                foreign_addons.push(n);
             }
         }
     }
-    let shaders_root = game::join_ci(d, &["reshade-shaders"]);
-    let mut walk = vec![shaders_root.clone()];
-    while let Some(dir) = walk.pop() {
-        if let Ok(rd) = fs::read_dir(&dir) {
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk.push(p);
-                } else {
-                    foreign.push(
-                        p.strip_prefix(d)
-                            .unwrap_or(&p)
-                            .to_string_lossy()
-                            .replace('\\', "/"),
-                    );
-                }
-            }
-        }
-    }
-    if !foreign.is_empty() {
-        foreign.sort();
-        foreign.truncate(6);
+    if !foreign_addons.is_empty() {
+        foreign_addons.sort();
+        foreign_addons.truncate(6);
         return Ok((
             removed,
             Some(format!(
-                "ReShade left in place: the game still has files this tool did not install ({})",
-                foreign.join(", ")
+                "ReShade left in place: the game still has add-ons this tool did not install ({})",
+                foreign_addons.join(", ")
             )),
         ));
     }
@@ -2183,9 +3154,32 @@ pub fn uninstall_all(exe: &Path) -> Result<(Vec<String>, Option<String>)> {
             }
         }
     }
+    let shaders_root = d.join("reshade-shaders");
+    let mut leftover_shaders = false;
+    let mut walk = vec![shaders_root.clone()];
+    while let Some(dir) = walk.pop() {
+        if let Ok(rd) = fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk.push(p);
+                } else {
+                    leftover_shaders = true;
+                    break;
+                }
+            }
+        }
+        if leftover_shaders {
+            break;
+        }
+    }
     if shaders_root.is_dir() {
-        fs::remove_dir_all(&shaders_root)?;
-        removed.push("reshade-shaders/".into());
+        if leftover_shaders {
+            removed.push("reshade-shaders/ (left: shaders this tool did not install)".into());
+        } else {
+            fs::remove_dir_all(&shaders_root)?;
+            removed.push("reshade-shaders/".into());
+        }
     }
     Ok((removed, None))
 }
@@ -2205,6 +3199,295 @@ mod tests {
             .iter()
             .map(|t| json!({"tag_name": t, "assets": [{"browser_download_url": format!("https://x/{t}.zip")}]}))
             .collect()
+    }
+
+    /// Both OptiScaler forks publish a rolling "nightly" release whose assets
+    /// are .7z, and the stable ones ship a checksum .txt beside the zip. Taking
+    /// a release's first asset picked whichever happened to be listed first (#72).
+    #[test]
+    fn opti_zip_is_picked_over_checksums_and_7z() {
+        let releases = json!([
+            {"prerelease": false, "tag_name": "nightly", "assets": [
+                {"name": "OptiScaler_v10.0.0-pre1_20260908.7z", "browser_download_url": "https://x/n.7z"}
+            ]},
+            {"prerelease": false, "tag_name": "v0.7.1-hybrid", "assets": [
+                {"name": "ASSET-SHA256SUMS-v0.7.1.txt", "browser_download_url": "https://x/sums.txt"},
+                {"name": "OptiScaler-DLSSNR-v0.7.1-hybrid.zip", "browser_download_url": "https://x/good.zip"}
+            ]}
+        ]);
+        assert_eq!(
+            pick_opti_zip(releases.as_array().unwrap()).as_deref(),
+            Some("https://x/good.zip")
+        );
+    }
+
+    /// The engine choice decides which fork is fetched, and nothing else.
+    #[test]
+    fn opti_source_selects_the_fork() {
+        std::env::remove_var(OPTI_SOURCE_ENV);
+        assert_eq!(opti_repo(), OPTI_REPO);
+        std::env::set_var(OPTI_SOURCE_ENV, "presr");
+        assert_eq!(opti_repo(), OPTI_PRESR_REPO);
+        std::env::set_var(OPTI_SOURCE_ENV, "something else");
+        assert_eq!(opti_repo(), OPTI_REPO);
+        std::env::remove_var(OPTI_SOURCE_ENV);
+    }
+
+    /// Dying Light refuses any reduced work resolution: identical failure at
+    /// 90% and 85%, fine at 100%. Re-running Install used to write the preset's
+    /// smaller value straight back and break the game again (#74).
+    #[test]
+    fn a_game_that_refused_a_smaller_work_resolution_keeps_full_size() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let mut q = quality_preset::fallback_medium();
+        q.work_resolution = 85;
+        q.work_upscale = 1;
+
+        // No log yet: the preset is written as chosen.
+        write_feeder_cfg(d, &q).unwrap();
+        let cfg = fs::read_to_string(d.join("dlss5-feed.cfg")).unwrap();
+        assert!(cfg.contains("work_resolution=85"), "{cfg}");
+
+        // A log carrying the failure pins it back to full size.
+        fs::write(
+            d.join("dlss5-feed.log"),
+            "[feed] building: 2304x1296 work resolution (90%) -> 2560x1440 backbuffer\n\
+             [feed] work-resolution staging SRV failed\n\
+             [feed] failure: resource build\n",
+        )
+        .unwrap();
+        assert!(work_resolution_refused(d));
+        write_feeder_cfg(d, &q).unwrap();
+        let cfg = fs::read_to_string(d.join("dlss5-feed.cfg")).unwrap();
+        assert!(cfg.contains("work_resolution=100"), "{cfg}");
+        assert!(cfg.contains("work_upscale=0"), "{cfg}");
+    }
+
+    /// A machine whose own log carries the driver-fault verdict must not be
+    /// handed the same add-on build again. The evidence has to come from the
+    /// log, not from a driver number, because the measurement upstream covers
+    /// one driver and assumes the rest (#69).
+    /// On a 32-bit game the host writes that verdict into host64\ while the
+    /// feed's own log sits beside the exe. Reading only one folder missed it,
+    /// and the exclusion of 32-bit games on top of that meant GTA IV was handed
+    /// the faulting build every single install (#69).
+    #[test]
+    fn the_driver_verdict_is_found_from_either_side_of_a_32_bit_layout() {
+        let t = tempfile::tempdir().unwrap();
+        let game = t.path();
+        let host = game.join(game::HOST_DIR);
+        fs::create_dir_all(&host).unwrap();
+        let flag = t.path().join("state").join("driver-fault.txt");
+        let faulted = |dir: &Path| faulted_in_driver_at(dir, &flag, Some("616.64".to_owned()));
+        assert!(!faulted(&host));
+
+        // The host's own log, which is where a 32-bit game records it.
+        fs::write(
+            host.join("dlss5-feed-host.log"),
+            "[host] WARNING: renodx-dlss5 v4.7 with NVIDIA driver 616.64 is a combination \
+             measured to fail\n",
+        )
+        .unwrap();
+        assert!(faulted(&host));
+
+        // And the feed's log beside the exe, one level up from the consumer dir.
+        let t2 = tempfile::tempdir().unwrap();
+        let host2 = t2.path().join(game::HOST_DIR);
+        fs::create_dir_all(&host2).unwrap();
+        fs::write(
+            t2.path().join("dlss5-feed.log"),
+            "[feed] WARNING: renodx-dlss5 v4.7 with NVIDIA driver 616.64 is a combination \
+             measured to fail\n",
+        )
+        .unwrap();
+        assert!(faulted(&host2));
+    }
+
+    /// Remove deletes the game folder's logs, and a fresh game has none yet, so
+    /// a verdict read out of a log has to outlive the folder it was read in.
+    /// sempie27 was told to Remove and Install, which erased the evidence and
+    /// handed him the faulting build again (#69).
+    #[test]
+    fn the_driver_verdict_outlives_the_folder_it_was_read_in() {
+        let t = tempfile::tempdir().unwrap();
+        let host = t.path().join(game::HOST_DIR);
+        fs::create_dir_all(&host).unwrap();
+        let flag = t.path().join("state").join("driver-fault.txt");
+        let drv = || Some("616.64".to_owned());
+
+        assert!(!faulted_in_driver_at(&host, &flag, drv()));
+
+        fs::write(
+            host.join("dlss5-feed-host.log"),
+            "[host] WARNING: renodx-dlss5 v4.7 with NVIDIA driver 616.64 is a combination \
+             measured to fail\n",
+        )
+        .unwrap();
+        assert!(faulted_in_driver_at(&host, &flag, drv()));
+        assert_eq!(fs::read_to_string(&flag).unwrap().trim(), "616.64");
+
+        // Remove empties the folder; the verdict survives it.
+        fs::remove_file(host.join("dlss5-feed-host.log")).unwrap();
+        assert!(
+            faulted_in_driver_at(&host, &flag, drv()),
+            "the verdict must outlive the log"
+        );
+
+        // A driver update retires it, and the stale flag is dropped.
+        assert!(!faulted_in_driver_at(
+            &host,
+            &flag,
+            Some("620.10".to_owned())
+        ));
+        assert!(!flag.is_file());
+    }
+
+    #[test]
+    fn a_driver_fault_in_the_log_pins_the_classic_addon() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let flag = t.path().join("state").join("driver-fault.txt");
+        let faulted = |dir: &Path| faulted_in_driver_at(dir, &flag, Some("616.64".to_owned()));
+        assert!(!faulted(d));
+
+        fs::write(
+            d.join("dlss5-feed-host.log"),
+            "[host] WARNING: renodx-dlss5 v4.7 with NVIDIA driver 616.64 is a combination \
+             measured to fail (on 616.64 exactly; anything newer is untested here). The neural \
+             evaluate faults inside the driver's own NGX runtime -- an access violation in \
+             D3D12Core.dll, reached through nvngx_dlssnr.dll\n",
+        )
+        .unwrap();
+        assert!(faulted(d));
+
+        // The feed's own log carries the same verdict on a 64-bit game.
+        let d2 = tempfile::tempdir().unwrap();
+        fs::write(
+            d2.path().join("dlss5-feed.log"),
+            "[feed] WARNING: renodx-dlss5 v4.7 with NVIDIA driver 616.64 is a combination \
+             measured to fail\n",
+        )
+        .unwrap();
+        assert!(faulted(d2.path()));
+
+        // A healthy log changes nothing.
+        let d3 = tempfile::tempdir().unwrap();
+        fs::write(d3.path().join("dlss5-feed.log"), "[feed] feature ready\n").unwrap();
+        let fresh = t.path().join("state2").join("driver-fault.txt");
+        assert!(!faulted_in_driver_at(
+            d3.path(),
+            &fresh,
+            Some("616.64".to_owned())
+        ));
+    }
+
+    /// Two neural consumers in one folder is not two implementations to choose
+    /// from: both detour the same NGX entry points and create feature 18 on the
+    /// same device, the second create is refused (0xBAD0000B), and the user gets
+    /// neither. Installing once with the default and again with Neural Upstream
+    /// left exactly that (#75).
+    #[test]
+    fn the_upstream_route_removes_the_addon_it_replaces() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe(&t.path().join("game.exe"), game::PE_X64);
+        fs::write(t.path().join(game::DLSS_DLL), b"x").unwrap(); // native DLSS
+        let addon = t.path().join(game::DLSS5_ADDON);
+        fs::write(&addon, b"addon").unwrap();
+        let st = game::inspect(&exe).unwrap();
+
+        // The step is in the plan for that route, and not for the default one.
+        let named = |v: Vec<Step>| -> Vec<&'static str> { v.iter().map(|s| s.name).collect() };
+        let with = named(plan_with(&st, Engine::ReShade, Extras { upstream: true, ..Default::default() }));
+        let without = named(plan_with(&st, Engine::ReShade, Extras::default()));
+        assert!(
+            with.iter().any(|n| n.contains("Remove the RenoDX")),
+            "{with:?}"
+        );
+        assert!(
+            !without.iter().any(|n| n.contains("Remove the RenoDX")),
+            "{without:?}"
+        );
+
+        // And it takes the file out.
+        let c = reqwest::blocking::Client::new();
+        step_dlss5_cleanup(&c, &st, t.path(), &|_, _| {}).unwrap();
+        assert!(!addon.exists());
+        // A second run is a no-op rather than an error.
+        step_dlss5_cleanup(&c, &st, t.path(), &|_, _| {}).unwrap();
+    }
+
+    /// Feeder 0.15.0 fixed the sRGB staging-view bug that made every reduced
+    /// work resolution fail. A failure logged by an older build must stop
+    /// holding the setting down, or the fix never reaches anyone who hit it
+    /// (DLSS5-Feeder#85).
+    #[test]
+    fn the_work_resolution_hold_expires_with_the_feeder_that_logged_it() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let log = |ver: &str| {
+            fs::write(
+                d.join("dlss5-feed.log"),
+                format!(
+                    "02:08:22.172  dlss5-feed {ver} (built Sep  7 2026 07:47:43) attached.\n\
+                     [feed] work-resolution staging SRV failed\n"
+                ),
+            )
+            .unwrap();
+        };
+
+        log("0.14.0-beta.5");
+        assert!(
+            !work_resolution_refused(d),
+            "an old build's failure is stale"
+        );
+        log("0.15.0");
+        assert!(
+            work_resolution_refused(d),
+            "the fixed build still failing counts"
+        );
+        log("0.16.2");
+        assert!(work_resolution_refused(d));
+
+        // A log with no version line at all is still taken at its word.
+        fs::write(
+            d.join("dlss5-feed.log"),
+            "[feed] work-resolution staging SRV failed\n",
+        )
+        .unwrap();
+        assert!(work_resolution_refused(d));
+    }
+
+    /// The 32-bit halves talk a versioned protocol; if one is refreshed and the
+    /// other is not, the host exits at startup and nothing says why from inside
+    /// the game. Same size is not the same release (#69).
+    #[test]
+    fn both_thirty_two_bit_halves_carry_the_tag_they_came_from() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let host = d.join(game::HOST_DIR);
+        fs::create_dir_all(&host).unwrap();
+
+        // What an install writes.
+        fs::write(d.join(game::FEEDER_MARKER), b"v0.15.1").unwrap();
+        fs::write(host.join(game::FEEDER_MARKER), b"v0.15.1").unwrap();
+        let agree = |tag: &str| {
+            let says = |dir: &Path| {
+                fs::read_to_string(dir.join(game::FEEDER_MARKER)).is_ok_and(|m| m.trim() == tag)
+            };
+            says(d) && says(&host)
+        };
+        assert!(agree("v0.15.1"));
+
+        // A newer release: neither half is current, so both are replaced.
+        assert!(!agree("v0.16.0"));
+
+        // The failure this fixes: the helper refreshed, the in-game half not.
+        fs::write(host.join(game::FEEDER_MARKER), b"v0.16.0").unwrap();
+        assert!(
+            !agree("v0.16.0"),
+            "a half-updated pair must not look current"
+        );
     }
 
     #[test]
@@ -2467,6 +3750,157 @@ mod tests {
     }
 
     #[test]
+    fn vulkan_feeder_kit_writes_addon_fx_and_note() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let z = t.path().join("feeder.zip");
+        write_zip(
+            &z,
+            &[(game::FEEDER_ADDON, b"addon"), (game::FEEDER_FX, b"fx")],
+            &[],
+        );
+        let out = copy_vulkan_feeder_kit_from_zip(&z, d, "v0.14.0").unwrap();
+        assert!(d.join(game::FEEDER_ADDON).is_file());
+        assert!(d
+            .join("reshade-shaders")
+            .join("Shaders")
+            .join(game::FEEDER_FX)
+            .is_file());
+        assert!(d.join("VULKAN-SETUP.txt").is_file());
+        assert!(out.iter().any(|s| s.contains("VULKAN-SETUP")));
+        assert!(out.iter().any(|s| s.contains("v0.14.0")));
+    }
+
+    #[test]
+    fn dgvoodoo_from_zip_writes_d3d9_and_conf_ignores_off() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        // Old ReShade rename must not be restored as dgVoodoo.
+        fs::write(d.join("d3d9.dll.off"), b"MZ old reshade not dgVoodoo").unwrap();
+        let z = d.join("dgVoodoo2_87_3.zip");
+        write_zip(
+            &z,
+            &[(
+                "MS/x86/D3D9.dll",
+                b"MZ....dgVoodoo2 wrapper bytes for detect....",
+            )],
+            &[],
+        );
+        let out = install_dgvoodoo_from_zip(&z, d, 32).unwrap();
+        assert!(out.contains(&"d3d9.dll".to_string()));
+        assert!(out.contains(&"dgVoodoo.conf".to_string()));
+        let dll = fs::read(d.join("d3d9.dll")).unwrap();
+        assert!(dll.windows(8).any(|w| w.eq_ignore_ascii_case(b"dgVoodoo")));
+        assert_ne!(
+            fs::read(d.join("d3d9.dll.off")).unwrap(),
+            dll,
+            "must not restore d3d9.dll.off"
+        );
+        let conf = fs::read_to_string(d.join("dgVoodoo.conf")).unwrap();
+        assert!(conf.contains("OutputAPI = d3d11_fl11_0"));
+        assert!(conf.contains("VRAM = 4096"));
+        assert!(conf.contains("Antialiasing = appdriven"));
+        assert!(conf.contains("FastVideoMemoryAccess = false"));
+        assert!(game::is_dgvoodoo(d));
+    }
+
+    #[test]
+    fn dgvoodoo_conf_merge_preserves_user_keys_and_floors_vram() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        fs::write(
+            d.join("dgVoodoo.conf"),
+            "[General]\nOutputAPI = bestavailable\nAdapters = all\n\
+             [DirectX]\nVRAM = 256\nFiltering = force16bit\n",
+        )
+        .unwrap();
+        write_dgvoodoo_conf(d).unwrap();
+        assert!(d.join("dgVoodoo.conf.bak").is_file());
+        let conf = fs::read_to_string(d.join("dgVoodoo.conf")).unwrap();
+        assert!(conf.contains("OutputAPI = d3d11_fl11_0"));
+        assert!(!conf.to_ascii_lowercase().contains("bestavailable"));
+        assert!(conf.contains("VRAM = 4096"));
+        assert!(conf.contains("Filtering = force16bit"));
+        assert!(conf.contains("Adapters = all"));
+        // Second merge must not overwrite bak with already-merged text.
+        let bak1 = fs::read(d.join("dgVoodoo.conf.bak")).unwrap();
+        write_dgvoodoo_conf(d).unwrap();
+        assert_eq!(fs::read(d.join("dgVoodoo.conf.bak")).unwrap(), bak1);
+        // Keep a higher user VRAM.
+        fs::write(
+            d.join("dgVoodoo.conf"),
+            "[General]\nOutputAPI = d3d11_fl11_0\n[DirectX]\nVRAM = 8192\n",
+        )
+        .unwrap();
+        write_dgvoodoo_conf(d).unwrap();
+        let conf2 = fs::read_to_string(d.join("dgVoodoo.conf")).unwrap();
+        assert!(conf2.contains("VRAM = 8192"));
+    }
+
+    #[test]
+    fn dgvoodoo_from_zip_picks_x64_member() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let z = d.join("dgVoodoo2_87_3.zip");
+        write_zip(
+            &z,
+            &[(
+                "MS/x64/D3D9.dll",
+                b"MZ....dgVoodoo2 wrapper bytes for detect....",
+            )],
+            &[],
+        );
+        install_dgvoodoo_from_zip(&z, d, 64).unwrap();
+        assert!(game::is_dgvoodoo(d));
+    }
+
+    #[test]
+    fn plan_puts_dgvoodoo_first_for_dx9() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe_with_imports(&t.path().join("g3.exe"), game::PE_X86, &["engine.dll"]);
+        make_pe_with_imports(
+            &t.path().join("Engine.dll"),
+            game::PE_X86,
+            &["d3d9.dll", "kernel32.dll"],
+        );
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+        let st = game::inspect(&exe).unwrap();
+        assert!(st.needs_dgvoodoo());
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, Extras::default())
+            .iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names[0], "dgVoodoo 2.87.3 (DX9 → D3D11)");
+        assert!(names.iter().any(|n| n.starts_with("ReShade")));
+    }
+
+    #[test]
+    fn plan_refreshes_dgvoodoo_conf_when_already_present() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe_with_imports(&d.join("g3.exe"), game::PE_X86, &["engine.dll"]);
+        make_pe_with_imports(
+            &d.join("Engine.dll"),
+            game::PE_X86,
+            &["d3d9.dll", "kernel32.dll"],
+        );
+        fs::write(d.join("d3d9.dll"), b"MZ...dgVoodoo2 wrapper...").unwrap();
+        fs::write(
+            d.join("dgVoodoo.conf"),
+            b"[General]\nOutputAPI = bestavailable\n",
+        )
+        .unwrap();
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+        let st = game::inspect(&exe).unwrap();
+        assert!(!st.needs_dgvoodoo());
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, Extras::default())
+            .iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names[0], "dgVoodoo 2.87.3 (DX9 → D3D11)");
+    }
+
+    #[test]
     fn reshade_from_setup_exe_with_prepended_stub() {
         let t = tempfile::tempdir().unwrap();
         let exe = make_pe(&t.path().join("game.exe"), game::PE_X64);
@@ -2513,7 +3947,10 @@ mod tests {
             &[],
         );
         let installed = install_lumenite_from_zip(&z, t.path()).unwrap();
-        assert_eq!(installed.len(), 4);
+        assert!(
+            installed.len() >= 4,
+            "expected at least Kernel/TRAA/include/png, got {installed:?}"
+        );
         assert!(t
             .path()
             .join("reshade-shaders/Shaders/lumenite_Kernel.fx")
@@ -2532,6 +3969,42 @@ mod tests {
         let bad = t.path().join("bad.zip");
         write_zip(&bad, &[("whatever.txt", b"x")], &[]);
         assert!(install_lumenite_from_zip(&bad, t.path()).is_err());
+    }
+
+    #[test]
+    fn traa_ui_protect_patch_is_idempotent() {
+        let t = tempfile::tempdir().unwrap();
+        let shaders = t.path().join("reshade-shaders").join("Shaders");
+        fs::create_dir_all(&shaders).unwrap();
+        // Anchors must match stock lumenite_TRAA.fx (LumeniteFX mainline).
+        let body = concat!(
+            "uniform int EDGE_MODE <\n",
+            "    ui_tooltip = \"Luma: shading and texture edges as well; the classic DLAA mask.\\n\"\n",
+            "                 \"Geometric: silhouettes only, ignores flat UI.\";\n",
+            "    > = 0;\n",
+            "/*--------------.\n",
+            "| :: IMPORTS :: |\n",
+            "'--------------*/\n",
+            "namespace Kernel {}\n",
+            "namespace LumeniteTRAA {\n",
+            "    confidence = saturate(confidence + 0.11 * 4.0 * confidence * (1.0 - confidence));\n",
+            "\n",
+            "    float2 historyUV = texcoord + flow;\n",
+            "technique Lumenite_TRAA <\n",
+            "    ui_tooltip = \"Temporal Reprojection Anti-Aliasing.\";\n",
+            ">\n",
+            "}\n",
+        );
+        let dest = shaders.join("lumenite_TRAA.fx");
+        fs::write(&dest, body).unwrap();
+        let first = apply_traa_ui_patch(t.path()).unwrap().unwrap();
+        assert!(first.contains("UI protect patch"), "{first}");
+        let text = fs::read_to_string(&dest).unwrap();
+        assert!(text.contains("DLSS5_TRAA_UI_PROTECT"));
+        assert!(text.contains("UI_PROTECT"));
+        assert!(text.contains("> = 1;"));
+        let second = apply_traa_ui_patch(t.path()).unwrap().unwrap();
+        assert!(second.contains("already applied"), "{second}");
     }
 
     #[test]
@@ -2682,6 +4155,26 @@ X=1
 RestoreComputeSignature=true
 "
         ));
+    }
+
+    /// The model-resolution dial is the biggest performance lever on the
+    /// OptiScaler route: cost falls with the square of WorkingScale.
+    #[test]
+    fn working_scale_is_written_and_bounded() {
+        std::env::remove_var(WORKING_SCALE_ENV);
+        assert_eq!(working_scale(), "1.0");
+        std::env::set_var(WORKING_SCALE_ENV, "0.75");
+        assert_eq!(working_scale(), "0.75");
+        // Nonsense and out-of-range values fall back rather than reaching the ini.
+        std::env::set_var(WORKING_SCALE_ENV, "banana");
+        assert_eq!(working_scale(), "1.0");
+        std::env::set_var(WORKING_SCALE_ENV, "9");
+        assert_eq!(working_scale(), "1.0");
+        std::env::remove_var(WORKING_SCALE_ENV);
+
+        let ini = "[DlssNr]\nEnabled=auto\n";
+        let out = set_ini_key(ini, "DlssNr", "WorkingScale", "0.75").unwrap();
+        assert!(out.contains("WorkingScale=0.75"), "{out}");
     }
 
     #[test]
@@ -2836,11 +4329,12 @@ RestoreComputeSignature=true
     }
 
     #[test]
-    fn uninstall_all_removes_reshade_only_when_nothing_foreign_remains() {
+    fn uninstall_all_removes_reshade_even_with_leftover_shaders() {
         let t = tempfile::tempdir().unwrap();
         let d = t.path();
         let exe = make_pe(&d.join("game.exe"), game::PE_X64);
         crate::game::testutil::make_reshade_dll(&d.join("dxgi.dll"));
+        fs::write(d.join(game::RESHADE_MARKER), b"6.8.0").unwrap();
         let sh = d.join("reshade-shaders").join("Shaders");
         fs::create_dir_all(&sh).unwrap();
         fs::write(d.join(game::FEEDER_ADDON), b"x").unwrap();
@@ -2849,20 +4343,49 @@ RestoreComputeSignature=true
         fs::write(d.join("ReShade.ini"), b"x").unwrap();
         fs::write(d.join("ReShadePreset.ini"), b"x").unwrap();
         fs::write(d.join("dlss5-feed.cfg"), b"x").unwrap();
-        // a foreign shader blocks ReShade removal
+        // Pre-existing shader pack (Gothic 3 etc.) must not block dxgi.dll removal.
         fs::write(sh.join("Clarity.fx"), b"user shader").unwrap();
-        let (_removed, kept) = uninstall_all(&exe).unwrap();
-        assert!(kept.is_some());
-        assert!(d.join("dxgi.dll").is_file());
+        // dgVoodoo for DX9 games must never be touched.
+        fs::write(d.join("d3d9.dll"), b"MZ...dgVoodoo2 wrapper...").unwrap();
+        fs::write(
+            d.join("dgVoodoo.conf"),
+            b"[DirectX]\nOutputAPI = bestavailable\n",
+        )
+        .unwrap();
+
+        let (removed, kept) = uninstall_all(&exe).unwrap();
+        assert!(kept.is_none(), "{kept:?}");
+        assert!(removed.iter().any(|r| r == "dxgi.dll"));
+        assert!(!d.join("dxgi.dll").exists());
+        assert!(!d.join(game::RESHADE_MARKER).exists());
+        assert!(!d.join("ReShade.ini").exists());
+        assert!(!d.join("dlss5-feed.cfg").exists());
         assert!(!d.join(game::FEEDER_ADDON).is_file());
-        // without it, everything goes
-        fs::remove_file(sh.join("Clarity.fx")).unwrap();
+        assert!(d
+            .join("reshade-shaders")
+            .join("Shaders")
+            .join("Clarity.fx")
+            .is_file());
+        assert!(d.join("d3d9.dll").is_file(), "dgVoodoo d3d9.dll must stay");
+        assert!(d.join("dgVoodoo.conf").is_file());
+        assert!(!game::inspect(&exe).unwrap().reshade);
+    }
+
+    #[test]
+    fn uninstall_all_cleans_empty_reshade_shaders_tree() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe(&d.join("game.exe"), game::PE_X64);
+        crate::game::testutil::make_reshade_dll(&d.join("dxgi.dll"));
+        let sh = d.join("reshade-shaders").join("Shaders");
+        fs::create_dir_all(&sh).unwrap();
+        fs::write(sh.join("ReShade.fxh"), b"x").unwrap();
+        fs::write(d.join("ReShade.ini"), b"x").unwrap();
         let (removed, kept) = uninstall_all(&exe).unwrap();
         assert!(kept.is_none(), "{kept:?}");
         assert!(removed.iter().any(|r| r == "dxgi.dll"));
         assert!(!d.join("dxgi.dll").exists());
         assert!(!d.join("ReShade.ini").exists());
-        assert!(!d.join("dlss5-feed.cfg").exists());
         assert!(!d.join("reshade-shaders").exists());
     }
 
@@ -2917,6 +4440,10 @@ RestoreComputeSignature=true
                 upstream: true,
                 ..Default::default()
             },
+            InstallOpts {
+                quality: QualityChoice::Auto,
+                overrides: QualityOverrides::default(),
+            },
             &|_, _| {},
             &|_, _, _, _, _| {},
         )
@@ -2950,6 +4477,10 @@ RestoreComputeSignature=true
             &exe,
             Engine::Opti,
             Extras::default(),
+            InstallOpts {
+                quality: QualityChoice::Auto,
+                overrides: QualityOverrides::default(),
+            },
             &|_, _| {},
             &|_, _, _, _, _| {},
         )
@@ -2986,6 +4517,10 @@ RestoreComputeSignature=true
             &exe,
             Engine::Opti,
             Extras::default(),
+            InstallOpts {
+                quality: QualityChoice::Auto,
+                overrides: QualityOverrides::default(),
+            },
             &|_, _| {},
             &|_, _, _, _, _| {},
         )

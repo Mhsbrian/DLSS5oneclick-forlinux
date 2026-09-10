@@ -248,21 +248,21 @@ fn read_zip_text(zip_path: &Path, member: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game::testutil::make_pe_with_imports;
+    use crate::game::testutil::make_pe_importing_padded;
 
     #[test]
     fn pick_proxy_prefers_version_and_never_dxgi() {
         let t = tempfile::tempdir().unwrap();
-        let a = make_pe_with_imports(
+        let a = make_pe_importing_padded(
             &t.path().join("a.exe"),
             &["dxgi.dll", "winmm.dll", "version.dll"],
             2_000_000,
         );
         assert_eq!(pick_proxy(&a), Some("version")); // version beats winmm
-        let b = make_pe_with_imports(&t.path().join("b.exe"), &["dxgi.dll", "winmm.dll"], 2_000_000);
+        let b = make_pe_importing_padded(&t.path().join("b.exe"), &["dxgi.dll", "winmm.dll"], 2_000_000);
         assert_eq!(pick_proxy(&b), Some("winmm"));
         // dxgi alone is never a proxy — ReShade owns it.
-        let c = make_pe_with_imports(&t.path().join("c.exe"), &["dxgi.dll", "kernel32.dll"], 2_000_000);
+        let c = make_pe_importing_padded(&t.path().join("c.exe"), &["dxgi.dll", "kernel32.dll"], 2_000_000);
         assert_eq!(pick_proxy(&c), None);
     }
 
