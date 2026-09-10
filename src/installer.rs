@@ -579,12 +579,6 @@ fn step_opti(
         if let Some(patched) = set_dlss_nr_enabled(&cur) {
             cur = patched;
         }
-        // The frame stays full size; only the model's own work is done small and
-        // enlarged, and its cost falls with the square of this. The single
-        // biggest performance lever on this route.
-        if let Some(patched) = set_ini_key(&cur, "DlssNr", "WorkingScale", &working_scale()) {
-            cur = patched;
-        }
         // RE Engine trips its own scheduler assertion unless the compute root
         // signature is put back, and fights REFramework over WndProc unless
         // input is polled. The graphics-side restores must stay off there: they
@@ -934,18 +928,6 @@ pub fn set_load_reshade(ini: &str) -> Option<String> {
     changed.then_some(out)
 }
 
-/// Fraction of the frame the DLSS 5 model works at, as OptiScaler's
-/// `[DlssNr] WorkingScale` wants it. Set through the UI; `1` when unset.
-pub const WORKING_SCALE_ENV: &str = "DLSS5ONECLICK_WORKING_SCALE";
-
-/// Reads the chosen model resolution, falling back to full size.
-fn working_scale() -> String {
-    std::env::var(WORKING_SCALE_ENV)
-        .ok()
-        .filter(|v| v.parse::<f32>().is_ok_and(|f| (0.25..=2.0).contains(&f)))
-        .unwrap_or_else(|| "1.0".to_owned())
-}
-
 /// `[DlssNr] Enabled=true` in OptiScaler.ini; `None` when it already says so.
 /// Section-scoped: `Enabled` appears under half a dozen headings in that file.
 pub fn set_dlss_nr_enabled(ini: &str) -> Option<String> {
@@ -1006,6 +988,36 @@ fn step_opti_fg(
 /// already reads that way.
 fn scale_ini(ini: &str, scale: f32) -> Option<String> {
     set_ini_key(ini, "DlssNr", "WorkingScale", &format!("{scale:.2}"))
+}
+
+/// The model resolution this game's OptiScaler.ini already asks for, so the
+/// GUI dial opens on it and a reinstall does not quietly reset hand tuning.
+/// `None` without an ini, or when the key is absent, `auto` or out of range.
+pub fn opti_working_scale(game_dir: &Path) -> Option<f32> {
+    let text = fs::read_to_string(game::join_ci(game_dir, &[OPTI_INI])).ok()?;
+    get_ini_key(&text, "DlssNr", "WorkingScale")?
+        .parse::<f32>()
+        .ok()
+        .filter(|f| (0.25..=2.0).contains(f))
+}
+
+/// `key`'s value in `[section]`, matched the way `set_ini_key` matches it.
+fn get_ini_key<'a>(ini: &'a str, section: &str, key: &str) -> Option<&'a str> {
+    let header = format!("[{section}]");
+    let mut in_section = false;
+    for line in ini.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_section = t.eq_ignore_ascii_case(&header);
+        } else if in_section {
+            if let Some((k, v)) = t.split_once('=') {
+                if k.trim() == key {
+                    return Some(v.trim());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Apply the FSR 3.1 frame-generation keys to an OptiScaler.ini, section-scoped
@@ -1149,7 +1161,7 @@ pub struct Extras {
     pub with_fg: bool,
     /// OptiScaler engine: the fraction of native the neural model runs at
     /// (`[DlssNr] WorkingScale`; cost falls with its square). `None` leaves the
-    /// OptiScaler default (1.0, full).
+    /// ini's own value; the GUI passes its dial, which opens on that value.
     pub model_scale: Option<f32>,
     /// Remix route: replace a runtime that has no neural pass with a DLSS
     /// 5-capable community one (originals backed up; experimental).
@@ -3523,6 +3535,23 @@ mod tests {
         assert!(again.is_empty());
     }
 
+    /// The dial opens on what the game's ini already says. `auto`, a missing
+    /// key, a commented-out one and nonsense all read as "not set", and another
+    /// section's identically-named key is not mistaken for it.
+    #[test]
+    fn opti_working_scale_reads_the_dlssnr_value() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        assert_eq!(opti_working_scale(d), None);
+        let ini = d.join(OPTI_INI);
+        fs::write(&ini, "[FrameGen]\nWorkingScale=0.5\n\n[DlssNr]\nWorkingScale=auto\n").unwrap();
+        assert_eq!(opti_working_scale(d), None);
+        fs::write(&ini, "[DlssNr]\n;WorkingScale=0.5\nWorkingScale = 0.75\n").unwrap();
+        assert_eq!(opti_working_scale(d), Some(0.75));
+        fs::write(&ini, "[DlssNr]\nWorkingScale=9\n").unwrap();
+        assert_eq!(opti_working_scale(d), None);
+    }
+
     #[test]
     fn scale_ini_sets_workingscale_section_scoped() {
         let ini = "[FrameGen]\nWorkingScale=99\n\n[DlssNr]\nEnabled=true\nWorkingScale=auto\n";
@@ -4193,25 +4222,6 @@ RestoreComputeSignature=true
     }
 
     /// The model-resolution dial is the biggest performance lever on the
-    /// OptiScaler route: cost falls with the square of WorkingScale.
-    #[test]
-    fn working_scale_is_written_and_bounded() {
-        std::env::remove_var(WORKING_SCALE_ENV);
-        assert_eq!(working_scale(), "1.0");
-        std::env::set_var(WORKING_SCALE_ENV, "0.75");
-        assert_eq!(working_scale(), "0.75");
-        // Nonsense and out-of-range values fall back rather than reaching the ini.
-        std::env::set_var(WORKING_SCALE_ENV, "banana");
-        assert_eq!(working_scale(), "1.0");
-        std::env::set_var(WORKING_SCALE_ENV, "9");
-        assert_eq!(working_scale(), "1.0");
-        std::env::remove_var(WORKING_SCALE_ENV);
-
-        let ini = "[DlssNr]\nEnabled=auto\n";
-        let out = set_ini_key(ini, "DlssNr", "WorkingScale", "0.75").unwrap();
-        assert!(out.contains("WorkingScale=0.75"), "{out}");
-    }
-
     #[test]
     fn dlss_nr_enabled_is_section_scoped() {
         // "Enabled" also lives under other headings; only DlssNr's may move.

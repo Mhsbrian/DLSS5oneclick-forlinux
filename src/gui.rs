@@ -139,13 +139,11 @@ pub struct App {
     upstream_on: bool,
     /// OptiScaler engine: turn on FSR 3.1 frame generation (any RTX card).
     fg_on: bool,
-    /// OptiScaler engine: model resolution as a percent of native (100 = off).
-    opti_scale_pct: u32,
     /// Remix route: replace a runtime that has no neural pass.
     remix_swap_on: bool,
     /// OptiScaler route: fraction of the frame the DLSS 5 model works at.
     /// Its cost falls with the square of this, so it is the biggest fps lever
-    /// on that route. 1.0 = full size.
+    /// on that route. 1.0 = full size. Opens on the game's own ini value.
     working_scale: f32,
     /// neural-upstream strength preset to write into ReShade.ini before the
     /// game starts (#68). 3 = Reference, the add-on's own default.
@@ -306,7 +304,6 @@ impl App {
             mfg_on: false,
             upstream_on: false,
             fg_on: false,
-            opti_scale_pct: 100,
             remix_swap_on: false,
             working_scale: 1.0,
             upstream_preset: 3,
@@ -398,7 +395,14 @@ impl App {
             self.renodx_on = false;
             self.mfg_on = false;
             self.fg_on = false;
-            self.opti_scale_pct = 100;
+            // The dial opens on what this game's OptiScaler.ini already says,
+            // so a reinstall keeps hand tuning instead of resetting it to 100%.
+            self.working_scale = self
+                .resolved_exe
+                .as_deref()
+                .and_then(Path::parent)
+                .and_then(installer::opti_working_scale)
+                .unwrap_or(1.0);
             self.remix_swap_on = false;
             self.start_renodx_lookup();
         }
@@ -495,7 +499,7 @@ impl App {
             with_mfg: self.mfg_on,
             upstream: self.upstream_on,
             with_fg: self.fg_on,
-            model_scale: (self.opti_scale_pct < 100).then(|| self.opti_scale_pct as f32 / 100.0),
+            model_scale: Some(self.working_scale),
             remix_swap: self.remix_swap_on,
         }
     }
@@ -548,10 +552,6 @@ impl App {
         self.launch_panel = None;
         let engine = self.engine;
         let extras = self.extras();
-        std::env::set_var(
-            installer::WORKING_SCALE_ENV,
-            format!("{:.2}", self.working_scale),
-        );
         if self.opti_presr {
             std::env::set_var(installer::OPTI_SOURCE_ENV, "presr");
         } else {
@@ -3676,32 +3676,6 @@ impl eframe::App for App {
                             }
                         });
                     }
-                }
-
-                // ── OptiScaler model resolution (cost dial) ──────────
-                if ok_status.is_some() && self.engine == Engine::Opti {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        ui.label(
-                            RichText::new("MODEL RESOLUTION")
-                                .font(t::plex_semibold(11.0))
-                                .color(t::TEXT_MUTED),
-                        );
-                        ui.add_enabled(
-                            !self.running,
-                            egui::Slider::new(&mut self.opti_scale_pct, 50..=100).suffix("%"),
-                        )
-                        .on_hover_text(
-                            "How much of the frame the neural model works at ([DlssNr] WorkingScale). The frame keeps full detail; only the model's own work is done small. Cost falls with the square — 75% is about half the cost of 100%, 50% a quarter. 100% leaves it at full.",
-                        );
-                        let note = match self.opti_scale_pct {
-                            100 => "— full (Quality)".to_string(),
-                            75 => "— Balanced (~half the cost)".to_string(),
-                            50 => "— Performance (~a quarter)".to_string(),
-                            p => format!("— ~{:.0}% of full cost", (p as f32 / 100.0).powi(2) * 100.0),
-                        };
-                        ui.label(RichText::new(note).font(t::plex(11.0)).color(t::TEXT_DIM));
-                    });
                 }
 
                 // ── RTX Remix route (overrides the engine choice) ────
