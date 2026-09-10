@@ -2585,7 +2585,7 @@ fn faulted_in_driver_at(consumer_dir: &Path, flag: &Path, driver: Option<String>
 }
 
 pub fn write_feeder_cfg(game_dir: &Path, r: &ResolvedQuality) -> Result<()> {
-    let path = game_dir.join("dlss5-feed.cfg");
+    let path = game::join_ci(game_dir, &[crate::feeder_cfg::CFG_NAME]);
     // A preset that seeds a reduced work resolution would otherwise put this
     // game straight back into the failure it just came out of, every install.
     let mut r = r.clone();
@@ -2598,7 +2598,14 @@ pub fn write_feeder_cfg(game_dir: &Path, r: &ResolvedQuality) -> Result<()> {
         );
     }
     let r = &r;
-    let mut text = quality_preset::feeder_cfg_text(r);
+    // A fresh cfg gets the full layout. An existing one keeps everything the
+    // preset does not decide -- a raised create_delay (diagnose's own advice
+    // for a crash in the add-on), the HDR / depth / motion-vector fixes a game
+    // needed, comments -- so reinstalling or updating does not undo tuning.
+    let mut text = match fs::read_to_string(&path) {
+        Ok(prev) => quality_preset::apply_preset_to_cfg(&prev, r),
+        Err(_) => quality_preset::feeder_cfg_text(r),
+    };
     // Overlay UX defaults from Settings (log_detail / evaluate_stride / …).
     let settings = crate::settings::Settings::load();
     text = crate::settings::apply_overlay_to_cfg(&text, &settings);
@@ -3383,6 +3390,27 @@ mod tests {
         let cfg = fs::read_to_string(d.join("dlss5-feed.cfg")).unwrap();
         assert!(cfg.contains("work_resolution=100"), "{cfg}");
         assert!(cfg.contains("work_upscale=0"), "{cfg}");
+    }
+
+    /// Reinstalling or updating lays the preset over an existing cfg instead
+    /// of replacing it: a raised create_delay and the user's comments survive,
+    /// the preset's keys move, and the Feeder is told to profile again.
+    #[test]
+    fn write_feeder_cfg_keeps_what_the_preset_does_not_decide() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let mut q = quality_preset::fallback_medium();
+        q.work_resolution = 90;
+        fs::write(
+            d.join("dlss5-feed.cfg"),
+            "; tuned for this game\ncreate_delay=240\nwork_resolution=70\nauto_profile_applied=1\n",
+        )
+        .unwrap();
+        write_feeder_cfg(d, &q).unwrap();
+        let cfg = fs::read_to_string(d.join("dlss5-feed.cfg")).unwrap();
+        assert!(cfg.contains("; tuned for this game\ncreate_delay=240\n"), "{cfg}");
+        assert!(cfg.contains("work_resolution=90\n"), "{cfg}");
+        assert!(cfg.contains("auto_profile_applied=0\n"), "{cfg}");
     }
 
     /// A machine whose own log carries the driver-fault verdict must not be

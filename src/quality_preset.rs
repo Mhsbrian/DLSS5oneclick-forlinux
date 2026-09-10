@@ -232,10 +232,25 @@ pub fn resolve(
     st: &GameStatus,
     overrides: &QualityOverrides,
 ) -> ResolvedQuality {
+    resolve_for(choice, st, overrides, cfg!(target_os = "linux"))
+}
+
+/// `resolve`, told whether the game runs under Proton. There the Feeder's
+/// D3D11 device is DXVK's, and NVIDIA's Optical Flow API has not been shown to
+/// work on it; the Optical Flow presets switch Lumenite off, so a failed OFA
+/// path would leave the model with no motion vectors at all. No preset turns
+/// it on by itself there -- an explicit override in Settings still can.
+fn resolve_for(
+    choice: QualityChoice,
+    st: &GameStatus,
+    overrides: &QualityOverrides,
+    proton: bool,
+) -> ResolvedQuality {
     let ofa_ok = st.mode == Mode::Feeder
         && matches!(st.api, Api::Dx11)
         && !st.is32()
         && st.anticheat.is_none()
+        && !proton
         && nvidia_ofa_capable(st);
 
     let base = match choice {
@@ -382,6 +397,38 @@ pub fn feed_fx_uniforms(r: &ResolvedQuality) -> Vec<(&'static str, String)> {
     ]
 }
 
+/// The keys a quality preset decides. Everything else in an existing
+/// dlss5-feed.cfg is the user's, or the Feeder's own, and is kept.
+const PRESET_KEYS: [&str; 10] = [
+    "work_resolution",
+    "work_upscale",
+    "work_sharpness",
+    "ofa_enabled",
+    "ofa_grid",
+    "ofa_perf",
+    "engine_velocity",
+    "quality_preset",
+    // Cleared so the Feeder profiles the game again under the new preset.
+    "auto_profile_applied",
+    "auto_profile",
+];
+
+/// The preset's keys laid over an existing cfg, line by line, with the values
+/// `feeder_cfg_text` would write -- one source for both.
+pub fn apply_preset_to_cfg(existing: &str, r: &ResolvedQuality) -> String {
+    let fresh = feeder_cfg_text(r);
+    let mut lines: Vec<String> = existing.lines().map(str::to_owned).collect();
+    for key in PRESET_KEYS {
+        let prefix = format!("{key}=");
+        if let Some(line) = fresh.lines().find(|l| l.starts_with(&prefix)) {
+            crate::feeder_cfg::set_line(&mut lines, key, line[prefix.len()..].to_owned());
+        }
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,7 +437,7 @@ mod tests {
     #[test]
     fn auto_d3d11_rtx_enables_ofa() {
         let st = stub_status(Mode::Feeder, Api::Dx11);
-        let r = resolve(QualityChoice::Auto, &st, &QualityOverrides::default());
+        let r = resolve_for(QualityChoice::Auto, &st, &QualityOverrides::default(), false);
         assert!(r.ofa_enabled);
         assert!(!r.enable_lumenite);
     }
@@ -441,5 +488,32 @@ mod tests {
         assert!(r.customized);
         assert_eq!(r.work_resolution, 90);
         assert!(feeder_cfg_text(&r).contains("quality_preset=custom"));
+    }
+
+    /// Under Proton no preset picks Optical Flow by itself: with Lumenite off
+    /// and OFA not working on DXVK's device the model would get no motion
+    /// vectors. An explicit override still wins.
+    #[test]
+    fn proton_keeps_lumenite_unless_told_otherwise() {
+        let st = stub_status(Mode::Feeder, Api::Dx11);
+        for choice in [QualityChoice::Auto, QualityChoice::High] {
+            let r = resolve_for(choice, &st, &QualityOverrides::default(), true);
+            assert!(!r.ofa_enabled && r.enable_lumenite);
+        }
+        let o = QualityOverrides {
+            ofa_enabled: Some(true),
+            ..Default::default()
+        };
+        assert!(resolve_for(QualityChoice::Auto, &st, &o, true).ofa_enabled);
+    }
+
+    /// The preset moves only its own keys; the rest of an existing cfg stays.
+    #[test]
+    fn preset_is_laid_over_an_existing_cfg() {
+        let out = apply_preset_to_cfg("create_delay=240\nWORK_RESOLUTION=70\n", &base_medium());
+        assert!(out.contains("create_delay=240\n"), "{out}");
+        assert!(out.contains("work_resolution=85\n") && !out.contains("=70"), "{out}");
+        assert!(out.contains("ofa_enabled=0\n") && out.contains("auto_profile_applied=0\n"), "{out}");
+        assert!(!out.contains("warmup_rebuild"), "adds nothing it does not decide: {out}");
     }
 }

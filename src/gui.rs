@@ -551,6 +551,11 @@ impl App {
     }
 
     fn start(&mut self, remove: Option<bool>) {
+        // One install at a time: a second worker on the same folder would race
+        // the first, and its channel would replace the first one's.
+        if self.running {
+            return;
+        }
         let Some(exe) = self.exe() else { return };
         self.finishing_install = remove.is_none();
         self.launch_panel = None;
@@ -788,6 +793,9 @@ impl App {
 
     /// Install / Update from a Games card: resolve Shipping exe, keep progress on the card.
     fn update_game(&mut self, path: PathBuf, index: usize) {
+        if self.running {
+            return;
+        }
         // Prefer the canonical Shipping exe from meta when we already inspected it.
         let target = self.meta.get(&index).map(|m| m.exe.clone()).unwrap_or(path);
         self.exe_text = target.to_string_lossy().into_owned();
@@ -2324,7 +2332,10 @@ impl App {
                         .font(t::plex(12.0))
                         .color(t::TEXT_MUTED),
                 );
-                if ui.button("Install DLSS 5").clicked() {
+                if ui
+                    .add_enabled(!self.running, egui::Button::new("Install DLSS 5"))
+                    .clicked()
+                {
                     self.start(None);
                 }
             } else {
@@ -2395,7 +2406,7 @@ impl App {
             } else {
                 "Write cfg"
             });
-            if ui.add_enabled(self.knobs.is_some(), write).clicked() {
+            if ui.add_enabled(self.knobs.is_some() && !self.running, write).clicked() {
                 if let (Some(exe), Some(k)) = (self.exe(), self.knobs.clone()) {
                     if let Some(dir) = exe.parent() {
                         match feeder_cfg::save(dir, &k) {

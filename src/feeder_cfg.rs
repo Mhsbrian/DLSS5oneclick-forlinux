@@ -163,7 +163,7 @@ pub fn load(game_dir: &Path) -> Result<FeederKnobs> {
     Ok(k)
 }
 
-fn set_line(lines: &mut Vec<String>, key: &str, value: String) {
+pub(crate) fn set_line(lines: &mut Vec<String>, key: &str, value: String) {
     let prefix = format!("{key}=");
     if let Some(i) = lines.iter().position(|l| {
         l.to_ascii_lowercase()
