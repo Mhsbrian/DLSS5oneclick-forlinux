@@ -91,6 +91,25 @@ pub fn is_reshade_dll(path: &Path) -> bool {
     }
 }
 
+/// True when `dinput8.dll` is really REFramework rather than something else
+/// wearing that name.
+///
+/// `dinput8.dll` is a proxy slot, not a product: REFramework uses it, and so do
+/// the RTX 20/30 frame-generation mods (`dlssg_for_sm75` and `dlssg_for_sm86`
+/// ship `dinput8.dll` and `version.dll` to intercept nvapi and spoof the GPU
+/// architecture). Testing only for the file's presence meant an RE Engine game
+/// with one of those installed looked like it already had REFramework, so the
+/// install skipped it — and RE Engine games crash under ReShade without it.
+pub fn is_reframework_dll(path: &Path) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+    // praydog's own name and the project's are both in every build; the
+    // frame-generation proxies carry neither.
+    has(b"REFramework") || has(b"praydog")
+}
+
 /// OptiScaler's own `dxgi.dll` carries the string `ReShade` six times, because
 /// it can load ReShade itself — so "contains ReShade" called it ReShade and
 /// refused to update a game that had OptiScaler installed. crosire's name is in
@@ -1047,7 +1066,7 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         host_exe: is32 && cdir.join(HOST_EXE).is_file(),
         host_reshade: is32 && is_reshade_dll(&cdir.join(RESHADE_PROXY)),
         re_engine: d.join(RE_ENGINE_PAK).is_file(),
-        reframework: d.join(REFRAMEWORK_DLL).is_file(),
+        reframework: is_reframework_dll(&d.join(REFRAMEWORK_DLL)),
         unreal_likely: unreal_likely(exe, d),
         unity_likely: unity_likely(d),
         rt_likely: rt_likely(d),
@@ -1645,6 +1664,33 @@ mod tests {
             );
         }
         assert_eq!(known_anticheat_exe(Path::new("wowzers.exe")), None);
+    }
+
+    /// dinput8.dll is a proxy slot, not a product. The RTX 20/30 frame-gen mods
+    /// ship their own, and an RE Engine game with one installed looked like it
+    /// already had REFramework — so Install skipped it, and RE Engine games
+    /// crash under ReShade without it.
+    #[test]
+    fn someone_elses_dinput8_is_not_reframework() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let dll = d.join(REFRAMEWORK_DLL);
+        assert!(!is_reframework_dll(&dll), "missing file is not REFramework");
+
+        // What the frame-generation proxies look like: nvapi interception, no
+        // mention of REFramework or its author.
+        fs::write(
+            &dll,
+            b"MZ\x00\x00nvapi_QueryInterface\x00sm_75\x00NVAPI_GPU_ARCHITECTURE_AD100\x00",
+        )
+        .unwrap();
+        assert!(
+            !is_reframework_dll(&dll),
+            "a frame-gen proxy is not REFramework"
+        );
+
+        fs::write(&dll, b"MZ\x00\x00REFramework\x00praydog\x00").unwrap();
+        assert!(is_reframework_dll(&dll));
     }
 
     #[test]
