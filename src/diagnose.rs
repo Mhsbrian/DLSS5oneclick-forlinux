@@ -528,13 +528,27 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
                 t.push_str(&format!(" Fault stack: {stack}."));
             }
             if two_modules {
-                t.push_str(
-                    " The log names the most likely cause: two copies of the DLSS NGX module are \
-                     loaded — the game-local nvngx_dlss.dll and the driver's own _nvngx.dll — and \
-                     the add-on hooks both. Try moving nvngx_dlss.dll out of the game folder (to \
-                     nvngx_dlss.dll.off) and starting the game again WITHOUT re-running Install, \
-                     which would put it back.",
-                );
+                // Tested on Proton and it is the wrong advice there: with the
+                // game-local DLL moved aside, the driver's own NGX answers
+                // 0xBAD00012 (NotImplemented) for SuperSampling and DLSS is not
+                // available at all, which is worse than the crash (#76).
+                if wine_hlsl || fd.contains("driver 999.99") {
+                    t.push_str(
+                        " On Windows the usual next step is moving the game-local nvngx_dlss.dll \
+                         aside, because two copies of the NGX module are loaded and the add-on \
+                         hooks both. Do NOT do that here: this is Wine/Proton, where the driver's \
+                         own NGX does not provide DLSS, and removing the game-local copy has been \
+                         measured to leave DLSS unavailable entirely.",
+                    );
+                } else {
+                    t.push_str(
+                        " The log names the most likely cause: two copies of the DLSS NGX module \
+                         are loaded — the game-local nvngx_dlss.dll and the driver's own \
+                         _nvngx.dll — and the add-on hooks both. Try moving nvngx_dlss.dll out of \
+                         the game folder (to nvngx_dlss.dll.off) and starting the game again \
+                         WITHOUT re-running Install, which would put it back.",
+                    );
+                }
             }
             out.push(bad(t));
         }
@@ -799,6 +813,46 @@ mod tests {
         let f = run(&exe).unwrap();
         assert!(
             !f.iter().any(|x| x.text.contains("-availablevidmem")),
+            "{f:?}"
+        );
+    }
+
+    /// Moving the game-local nvngx_dlss.dll aside is the right advice on
+    /// Windows and the wrong advice under Proton, where the driver's own NGX
+    /// answers NotImplemented and DLSS disappears entirely. 0batsy tested both
+    /// and neither helped, but the second left him worse off (#76).
+    #[test]
+    fn the_nvngx_advice_is_withheld_under_proton() {
+        let (t, exe) = setup(true);
+        let crash = "[feed] CreateFeature raised 0xC0000005 (caught; nothing submitted)\n\
+                     [feed] two copies of the DLSS NGX module are loaded (the game-local nvngx_dlss.dll and the driver's _nvngx.dll)\n";
+        fs::write(
+            t.path().join("ReShade.log"),
+            "Initializing crosire's ReShade\nRegistered add-on \"DLSS 5 Neural Rendering\"\n",
+        )
+        .unwrap();
+
+        // Windows: the advice stands.
+        fs::write(t.path().join("dlss5-feed.log"), crash).unwrap();
+        let f = run(&exe).unwrap();
+        assert!(
+            f.iter().any(|x| x.text.contains("nvngx_dlss.dll.off")),
+            "{f:?}"
+        );
+
+        // Proton, identified by the adapter line vkd3d reports.
+        fs::write(
+            t.path().join("dlss5-feed.log"),
+            format!("[feed] adapter: NVIDIA GeForce RTX 4070 SUPER driver 999.99\n{crash}"),
+        )
+        .unwrap();
+        let f = run(&exe).unwrap();
+        assert!(
+            !f.iter().any(|x| x.text.contains("nvngx_dlss.dll.off")),
+            "{f:?}"
+        );
+        assert!(
+            f.iter().any(|x| x.text.contains("Do NOT do that here")),
             "{f:?}"
         );
     }

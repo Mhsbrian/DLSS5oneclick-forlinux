@@ -925,6 +925,30 @@ const TILE_REFRAMEWORK: Tile = Tile {
     optional: false,
 };
 
+/// Shortens `text` until it measures within `max_w`, ending in an ellipsis.
+///
+/// egui will happily wrap a long title onto a second line that the caption has
+/// no room for, and the clip rect then cuts that line through the middle of the
+/// letters. One line that says it was shortened is honest; half a line is not.
+fn truncate_to_fit(text: &str, max_w: f32, measure: impl Fn(&str) -> f32) -> String {
+    if measure(text) <= max_w {
+        return text.to_owned();
+    }
+    let mut end = text.len();
+    while end > 0 {
+        // Step back to a character boundary, never into the middle of one.
+        end -= 1;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let candidate = format!("{}\u{2026}", text[..end].trim_end());
+        if measure(&candidate) <= max_w {
+            return candidate;
+        }
+    }
+    String::new()
+}
+
 fn tiles_for(
     st: Option<&GameStatus>,
     engine: Engine,
@@ -1539,6 +1563,17 @@ impl App {
             ] {
                 let Some(label) = label else { continue };
                 let cy = band.center().y;
+                // Three labels do not always fit the poster's width, and the
+                // last one ran out past the card's border rather than being
+                // dropped (#77). The dots are a summary; a summary that
+                // overflows is worse than a shorter one.
+                let w = p
+                    .layout_no_wrap(label.to_owned(), t::plex_medium(10.5), t::TEXT_SOFT)
+                    .size()
+                    .x;
+                if x + 11.0 + w > band.right() - 6.0 {
+                    break;
+                }
                 p.circle_filled(
                     egui::pos2(x + 3.0, cy),
                     3.0,
@@ -1571,11 +1606,19 @@ impl App {
         );
         store_mark(ui, &self.store_icons, mark, g.store, t::TEXT_OFF);
         let title_x = mark.right() + 7.0;
-        let title = p.layout(
-            g.title.clone(),
+        // The title used to wrap to two lines and then have the second line
+        // sliced in half by the caption's clip rect, which reads as the text
+        // being cut off mid-word — because it is (#77). One line, ellipsis.
+        let avail = cap.right() - title_x - 8.0;
+        let measure = |t: &str| {
+            p.layout_no_wrap(t.to_owned(), t::plex_medium(12.0), t::TEXT)
+                .size()
+                .x
+        };
+        let title = p.layout_no_wrap(
+            truncate_to_fit(&g.title, avail, measure),
             t::plex_medium(12.0),
             t::TEXT,
-            cap.right() - title_x - 8.0,
         );
         let clip = egui::Rect::from_min_max(cap.min, egui::pos2(cap.right(), cap.bottom() - 4.0));
         ui.painter().with_clip_rect(clip).galley(
@@ -3409,6 +3452,28 @@ pub fn run() -> eframe::Result {
 mod tests {
     use super::*;
     use crate::game::{stub_status, Api, Mode};
+
+    /// A long game title used to wrap and then get sliced by the caption's
+    /// clip rect, so it read as cut off mid-word. Shorten it honestly (#77).
+    #[test]
+    fn a_long_title_is_shortened_with_an_ellipsis() {
+        // Fake metrics: every character is 10 wide.
+        let measure = |t: &str| t.chars().count() as f32 * 10.0;
+
+        assert_eq!(truncate_to_fit("Spore", 100.0, measure), "Spore");
+
+        let long = "The Witcher 3: Wild Hunt - Game of the Year Edition";
+        let out = truncate_to_fit(long, 100.0, measure);
+        assert!(out.ends_with('\u{2026}'), "{out}");
+        assert!(measure(&out) <= 100.0, "{out}");
+        assert!(long.starts_with(out.trim_end_matches('\u{2026}')), "{out}");
+
+        // Multi-byte titles must not be cut through a character.
+        let jp = "ファイナルファンタジー";
+        let out = truncate_to_fit(jp, 45.0, measure);
+        assert!(measure(&out) <= 45.0, "{out}");
+        assert!(jp.starts_with(out.trim_end_matches('\u{2026}')), "{out}");
+    }
 
     /// A finished OptiScaler install must not show a missing row: OptiScaler
     /// carries its own neural pass, so `renodx-dlss5.addon64` is never
