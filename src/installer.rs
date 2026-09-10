@@ -322,9 +322,24 @@ impl Latest {
 }
 
 /// Files that must exist after a successful Feeder/Native install.
-/// Used so the UI never says "Everything is in place" on a partial copy.
+/// Used so the UI never says "Everything is in place" on a partial copy. A
+/// Remix install is judged by its own two pieces instead.
 pub fn missing_install_files(st: &GameStatus) -> Vec<String> {
     let mut missing = Vec::new();
+    // The Remix route places none of the ReShade/Feeder set: its install is the
+    // model inside `.trex/` and the neural pass switched on in rtx.conf.
+    if st.remix.is_some() {
+        if !st.remix_model {
+            missing.push(format!(".trex/{}", game::DLSSNR_DLL));
+        }
+        if !st.remix_enabled {
+            missing.push(
+                "a neural pass enabled in rtx.conf (a runtime without one needs the runtime swap)"
+                    .into(),
+            );
+        }
+        return missing;
+    }
     match st.mode {
         game::Mode::Feeder => {
             if !st.reshade {
@@ -3624,6 +3639,26 @@ mod tests {
         let conf = std::fs::read_to_string(d.join("rtx.conf")).unwrap();
         assert_eq!(conf, "rtx.a = 1\n");
         assert!(removed.iter().any(|r| r.contains("nvngx_dlssnr.dll")));
+    }
+
+    /// The post-install check judged a Remix install by ReShade/Feeder files
+    /// that route never places, so every good Remix install ended in "files
+    /// are missing". It is the model in `.trex/` plus the rtx.conf switch.
+    #[test]
+    fn remix_install_is_judged_by_its_own_files() {
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe(&d.join("game.exe"), game::PE_X64);
+        std::fs::create_dir_all(d.join(".trex")).unwrap();
+        std::fs::write(d.join(".trex").join("d3d9.dll"), b"stub runtime").unwrap();
+        let missing = missing_install_files(&game::inspect(&exe).unwrap());
+        assert_eq!(missing.len(), 2, "{missing:?}");
+        assert!(!missing.iter().any(|m| m.contains("ReShade")), "{missing:?}");
+
+        std::fs::write(d.join(".trex").join(game::DLSSNR_DLL), b"model").unwrap();
+        std::fs::write(d.join("rtx.conf"), "rtx.neuralUplift.enable = True\n").unwrap();
+        assert!(missing_install_files(&game::inspect(&exe).unwrap()).is_empty());
     }
 
     #[test]

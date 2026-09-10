@@ -1040,7 +1040,9 @@ impl GameStatus {
     }
     /// DX9 without dgVoodoo2 yet: Install will download it into the game folder.
     pub fn needs_dgvoodoo(&self) -> bool {
-        self.api == Api::Dx9 && !is_dgvoodoo(self.game_dir())
+        // A Remix game renders through its own d3d9 bridge, which dgVoodoo's
+        // d3d9.dll would replace; the Remix route never plans that step anyway.
+        self.remix.is_none() && self.api == Api::Dx9 && !is_dgvoodoo(self.game_dir())
     }
     /// Where the DLSS 5 add-on and the NVIDIA DLLs live: beside the exe for a
     /// 64-bit game, in `host64\` for a 32-bit one.
@@ -2493,6 +2495,8 @@ mod tests {
         let st = inspect(&exe).unwrap();
         assert_eq!(st.remix.as_deref(), Some(d.join(".trex").as_path()));
         assert!(!st.remix_model && !st.remix_enabled && !st.complete());
+        // Nor does the DirectX 9 route offer to put dgVoodoo over its bridge.
+        assert!(!st.needs_dgvoodoo());
         assert!(!st
             .problems
             .iter()

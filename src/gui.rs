@@ -3180,7 +3180,9 @@ impl eframe::App for App {
                 }
                 // Driver 616.64 faults inside NGX with the current add-on build;
                 // the classic one is the way through until that is fixed (#69).
-                if self.engine == Engine::ReShade {
+                if self.engine == Engine::ReShade
+                    && !ok_status.as_ref().is_some_and(|s| s.remix.is_some())
+                {
                     let mut on = self.renodx_classic;
                     let cb = egui::Checkbox::new(
                         &mut on,
@@ -3896,8 +3898,16 @@ impl eframe::App for App {
                     });
                 });
 
-                // Offline knobs / expected FPS from Feeder perf log.
-                self.knobs_panel(ui);
+                // Offline knobs / expected FPS from Feeder perf log. The knobs
+                // are dlss5-feed.cfg's, which only a Feeder-path install writes:
+                // a native-DLSS or Remix game was shown an error and an Install
+                // button that could never create the file.
+                if ok_status
+                    .as_ref()
+                    .is_some_and(|s| s.mode == game::Mode::Feeder && s.remix.is_none())
+                {
+                    self.knobs_panel(ui);
+                }
 
                 // ── progress ──────────────────────────────────────
                 let (bar, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 4.0), egui::Sense::hover());
