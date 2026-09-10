@@ -714,16 +714,23 @@ pub const OPTI_REPO: &str = "Dagherbou/OptiScaler_DLSSNR";
 /// it installs through the same step (#72).
 pub const OPTI_PRESR_REPO: &str = "wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass";
 
-/// Which OptiScaler build to install; unset means Dagherbou's.
+/// Which OptiScaler build a scripted install asks for (`presr` = wilsjo2's
+/// fork); unset means Dagherbou's. Read once by the CLI into
+/// `Extras::opti_presr` -- nothing writes it at runtime.
 pub const OPTI_SOURCE_ENV: &str = "DLSS5ONECLICK_OPTI_SOURCE";
 
-/// True when the pre-SR multipass fork was asked for.
-pub fn opti_presr() -> bool {
+/// True when `DLSS5ONECLICK_OPTI_SOURCE` asks for the pre-SR multipass fork.
+pub fn opti_presr_from_env() -> bool {
     std::env::var(OPTI_SOURCE_ENV).is_ok_and(|v| v.eq_ignore_ascii_case("presr"))
 }
 
+/// The OptiScaler repository the install running on this thread asked for.
 pub fn opti_repo() -> &'static str {
-    if opti_presr() {
+    opti_repo_for(install_extras().opti_presr)
+}
+
+fn opti_repo_for(presr: bool) -> &'static str {
+    if presr {
         OPTI_PRESR_REPO
     } else {
         OPTI_REPO
@@ -1166,6 +1173,14 @@ pub struct Extras {
     /// Remix route: replace a runtime that has no neural pass with a DLSS
     /// 5-capable community one (originals backed up; experimental).
     pub remix_swap: bool,
+    /// OptiScaler engine: install wilsjo2's pre-SR multipass fork instead of
+    /// Dagherbou's build (#72).
+    pub opti_presr: bool,
+    /// ReShade route: hold the DLSS 5 add-on on the classic build (#69).
+    pub classic_addon: bool,
+    /// Neural Upstream: strength preset to seed into ReShade.ini; 0 leaves the
+    /// overlay's own (`reshade_ini::UPSTREAM_PRESETS`).
+    pub upstream_preset: u8,
 }
 
 pub fn plan_with(st: &GameStatus, engine: Engine, x: Extras) -> Vec<Step> {
@@ -1307,9 +1322,9 @@ fn best_tag(mut cands: Vec<(Vec<u64>, String, String)>) -> (String, String) {
     (tag, url)
 }
 
-/// rhi-repo lookup that never needs the API: HTML releases pages for the tag,
-/// the expanded-assets fragment for the file.
-/// Tag of the DLSS 5 add-on build to install; unset means the newest one.
+/// Tag of a DLSS 5 add-on build to install outright (`renodx-dlss5-4.6`);
+/// unset means this tool chooses. Only ever read: the GUI's classic tick
+/// travels in `Extras::classic_addon` instead of being written here.
 pub const RENODX_TAG_ENV: &str = "DLSS5ONECLICK_RENODX_TAG";
 
 /// The classic-engine add-on. The Feeder's own host measured v4.7 to fault
@@ -1317,6 +1332,9 @@ pub const RENODX_TAG_ENV: &str = "DLSS5ONECLICK_RENODX_TAG";
 /// D3D12Core.dll reached through nvngx_dlssnr.dll — and names this build as one
 /// that passes there (#69).
 pub const RENODX_CLASSIC_TAG: &str = "renodx-dlss5-4.55";
+
+/// `RENODX_CLASSIC_TAG`'s line as `rhi_pinned` matches it: 4.55 and any 4.55.x.
+const CLASSIC_LINE: &str = "4.55";
 
 /// A pinned add-on build, when one was asked for: `(tag, url)`.
 fn rhi_env_pinned(client: &Client, prefix: &str) -> Option<Result<(String, String)>> {
@@ -1334,6 +1352,9 @@ fn rhi_env_pinned(client: &Client, prefix: &str) -> Option<Result<(String, Strin
     )
 }
 
+/// The newest rhi-repo release for `prefix`: `(tag, url)`. Tries the API, then
+/// the HTML releases pages for the tag and the expanded-assets fragment for
+/// the file, so it never needs the API.
 pub fn rhi_latest(client: &Client, prefix: &str) -> Result<(String, String)> {
     if let Some(pinned) = rhi_env_pinned(client, prefix) {
         return pinned;
@@ -1364,24 +1385,19 @@ pub fn rhi_latest(client: &Client, prefix: &str) -> Result<(String, String)> {
     Ok((tag, url))
 }
 
-// ── add-on pinning (feeder ↔ renodx-dlss5, and the driver fault) ────
+// ── add-on pinning (feeder ↔ renodx-dlss5) ─────────────────────────
 //
 // The DLSS5-Feeder and the renodx-dlss5 add-on are one contract: a feeder
 // release supports only certain add-on generations, and pairing a newer add-on
 // with an older feeder is the `CreateFeature 0xC0000005` crash on an otherwise
 // correct install. jlrouzies-fr pins it in the feeder's own README — the stable
 // line (< 0.8.0-beta.3) works only with 4.55; 0.8.0-beta.3 added 4.6 and
-// 0.9.0-beta.1 added 4.7. Separately, NVIDIA's DLSS 5 launch drivers route NGX
-// feature 18 into the runtime itself, where renodx-dlss5 4.6/4.7 faults on every
-// evaluate (measured by the feeder's author: 4.7 passes 0/300, 4.55 300/300), so
-// on those drivers the add-on is pinned to 4.55 too. 4.55 is the known-good
-// build, so pinning to it is the safe direction when in doubt.
-
-/// The Windows driver number where NGX feature-18 routing starts faulting
-/// renodx-dlss5 4.6/4.7. The Linux kernel-driver number is a different space, so
-/// on Linux this only bites a very new driver (≥ this in the same numeric sense)
-/// — the conservative side, since it pins to the known-good 4.55.
-const DRIVER_FAULT_MIN: &str = "616.64";
+// 0.9.0-beta.1 added 4.7. The driver side of the same fault (NVIDIA's DLSS 5
+// launch drivers route NGX feature 18 into the runtime, where 4.6/4.7 fault on
+// every evaluate) is no longer guessed from a version threshold: the Feeder's
+// host measures it on this machine and says so in its log, and
+// `addon_faulted_in_driver` keeps that verdict per driver (#69). Either way
+// 4.55 is the known-good build, so holding to it is the safe direction.
 
 /// 'v0.9.0-beta.1' -> [0,9,0,0,1]: sortable, a beta sorting below its release.
 fn feeder_key(tag: &str) -> Vec<u64> {
@@ -1401,38 +1417,10 @@ fn feeder_key(tag: &str) -> Vec<u64> {
     base
 }
 
-/// `have >= min`, comparing dotted numeric driver versions component by
-/// component ("610.57.04" < "616.64").
-fn driver_ge(have: &str, min: &str) -> bool {
-    let parse = |s: &str| -> Vec<u64> {
-        s.split('.')
-            .map(|p| {
-                p.chars()
-                    .take_while(char::is_ascii_digit)
-                    .collect::<String>()
-                    .parse()
-                    .unwrap_or(0)
-            })
-            .collect()
-    };
-    parse(have) >= parse(min)
-}
-
-/// Which renodx-dlss5 build to pin, or `None` to take the newest. Pins to 4.55
-/// when the feeder being installed is too old for a newer add-on, or when the
-/// driver is one that faults 4.6/4.7.
-pub fn renodx_dlss5_pin(feeder_tag: Option<&str>, driver: Option<&str>) -> Option<&'static str> {
-    if let Some(ft) = feeder_tag {
-        if feeder_key(ft) < feeder_key("v0.8.0-beta.3") {
-            return Some("4.55");
-        }
-    }
-    if let Some(d) = driver {
-        if driver_ge(d, DRIVER_FAULT_MIN) {
-            return Some("4.55");
-        }
-    }
-    None
+/// True when the feeder being installed is too old for any add-on newer than
+/// the classic build. The native route has no feeder, so no constraint.
+fn feeder_needs_classic(feeder_tag: Option<&str>) -> bool {
+    feeder_tag.is_some_and(|ft| feeder_key(ft) < feeder_key("v0.8.0-beta.3"))
 }
 
 /// The label part of an rhi-repo tag (`renodx-dlss5-4.55` -> `4.55`) equals or
@@ -1486,9 +1474,10 @@ pub fn rhi_pinned(client: &Client, prefix: &str, pin: Option<&str>) -> Result<(S
 /// Refuse a downloaded `nvngx_dlssnr.dll` that has no code for this card, before
 /// the install can look finished while nothing renders. Only refuses when the
 /// card's exact `sm` is known (nvidia-smi) and absent from the file's fatbins;
-/// silent otherwise, and skipped by `DLSS5ONECLICK_SKIP_GPU_CHECK`.
+/// silent otherwise, and skipped with the GPU check (the GUI tick or
+/// `DLSS5ONECLICK_SKIP_GPU_CHECK`).
 fn validate_dlssnr(dll: &Path) -> Result<()> {
-    if std::env::var_os("DLSS5ONECLICK_SKIP_GPU_CHECK").is_some() {
+    if game::skip_gpu_check() {
         return Ok(());
     }
     let Some(sm) = gpu::compute_capability() else {
@@ -2110,38 +2099,47 @@ fn step_dlss5(
         ),
     ];
     progress(0, "Looking up DLSS 5 add-on releases");
-    // The renodx-dlss5 add-on is pinned to match the feeder step_feeder just
-    // placed (its marker carries the tag) and the driver, so a newer add-on is
-    // never paired with a feeder or driver that faults it.
-    let feeder_tag = fs::read_to_string(st.game_dir().join(game::FEEDER_MARKER))
-        .ok()
-        .map(|s| s.trim().to_owned());
-    let addon_pin = renodx_dlss5_pin(feeder_tag.as_deref(), gpu::driver_for_pin().as_deref());
     let cdir = st.consumer_dir();
     fs::create_dir_all(&cdir)?;
-    // This machine has already been told, by the Feeder's own host, that the
-    // current add-on build faults in its driver. Fetching that build again just
-    // reproduces it, so take the one the host names as passing — unless the
-    // user pinned a build themselves, in which case that wins (#69).
-    // A 32-bit game was excluded here for no reason I can defend: its add-on
-    // lives in host64\ and is fetched by this same loop, and its host is the
-    // very thing that prints the verdict. sempie27's GTA IV kept getting v4.7
-    // back while its own log said v4.7 faults on this driver (#69).
-    let auto_classic = std::env::var_os(RENODX_TAG_ENV).is_none() && addon_faulted_in_driver(&cdir);
-    if auto_classic {
-        std::env::set_var(RENODX_TAG_ENV, RENODX_CLASSIC_TAG);
-    }
+    // Which renodx-dlss5 build. One named in DLSS5ONECLICK_RENODX_TAG is taken
+    // as is (rhi_latest). Otherwise the classic line when the user ticked it;
+    // when the feeder step_feeder just placed (its marker carries the tag) is
+    // too old for anything newer; or when this machine's Feeder host has
+    // already measured the newer build faulting in the current driver --
+    // fetching that build again only reproduces it (#69). The last holds for a
+    // 32-bit game too: its add-on lives in host64\ and is fetched by this same
+    // loop, and its host is what prints the verdict (sempie27's GTA IV kept
+    // getting v4.7 back while its own log said v4.7 faults, #69).
+    let named = std::env::var_os(RENODX_TAG_ENV).is_some_and(|v| !v.is_empty());
+    let feeder_tag = fs::read_to_string(game::join_ci(st.game_dir(), &[game::FEEDER_MARKER]))
+        .ok()
+        .map(|s| s.trim().to_owned());
+    // Read, and recorded against the driver, even when something else decides:
+    // a later install without the tick still knows.
+    let measured = addon_faulted_in_driver(&cdir);
+    let classic = if named {
+        None
+    } else if install_extras().classic_addon {
+        Some("chosen in the app")
+    } else if feeder_needs_classic(feeder_tag.as_deref()) {
+        Some("the feeder installed here predates the newer add-on builds")
+    } else if measured {
+        Some("this game's log reports the newer build faulting in the driver")
+    } else {
+        None
+    };
     let mut installed = Vec::new();
-    if auto_classic {
-        installed.push(format!(
-            "{RENODX_CLASSIC_TAG}: this game's log reports the newer build faulting in the driver"
-        ));
+    if let Some(why) = classic {
+        installed.push(format!("{RENODX_CLASSIC_TAG}: {why}"));
     }
     for (prefix, fname, present, marker) in plan {
-        let pin = (prefix == "renodx-dlss5-").then_some(addon_pin).flatten();
-        if let Some(p) = pin {
-            progress(0, &format!("Pinning {fname} to {p} (matches the feeder/driver)"));
-        }
+        let pin = match classic {
+            Some(why) if prefix == "renodx-dlss5-" => {
+                progress(0, &format!("Holding {fname} on {CLASSIC_LINE}: {why}"));
+                Some(CLASSIC_LINE)
+            }
+            _ => None,
+        };
         let (tag, url) = rhi_pinned(client, prefix, pin)?;
         if present {
             match marker.map(|m| fs::read_to_string(cdir.join(m))) {
@@ -2188,11 +2186,6 @@ fn step_dlss5(
             format!("{fname} ({tag})")
         };
         installed.push(shown);
-    }
-    // The pin belongs to this game, not to the session: leaving it set would
-    // quietly hold the next game on the classic build too.
-    if auto_classic {
-        std::env::remove_var(RENODX_TAG_ENV);
     }
     Ok(installed)
 }
@@ -2389,30 +2382,72 @@ fn step_upstream(
     Ok(done)
 }
 
-/// Which neural-upstream strength preset to seed; 0 leaves the overlay's own.
+/// Which neural-upstream strength preset a scripted install seeds; read once
+/// by the CLI into `Extras::upstream_preset` -- nothing writes it at runtime.
 pub const UPSTREAM_PRESET_ENV: &str = "DLSS5ONECLICK_UPSTREAM_PRESET";
 
-fn upstream_preset() -> u8 {
+/// `DLSS5ONECLICK_UPSTREAM_PRESET` as a number; 0 when unset or not one.
+pub fn upstream_preset_from_env() -> u8 {
     std::env::var(UPSTREAM_PRESET_ENV)
         .ok()
-        .and_then(|v| v.parse::<u8>().ok())
-        .filter(|p| {
-            reshade_ini::UPSTREAM_PRESETS
-                .iter()
-                .any(|(_, id, _)| id == p)
-        })
+        .and_then(|v| v.trim().parse().ok())
         .unwrap_or(0)
 }
 
-/// Active quality resolution for the install currently running (set by `run_all_with`).
-static INSTALL_QUALITY: std::sync::Mutex<Option<ResolvedQuality>> = std::sync::Mutex::new(None);
+/// The preset the running install asked for when it is a real one; 0 leaves
+/// the overlay's own.
+fn upstream_preset() -> u8 {
+    let p = install_extras().upstream_preset;
+    if reshade_ini::UPSTREAM_PRESETS
+        .iter()
+        .any(|(_, id, _)| *id == p)
+    {
+        p
+    } else {
+        0
+    }
+}
 
+thread_local! {
+    /// The install running on this thread: its resolved quality preset and
+    /// the extras it was asked for. Steps are plain fn pointers, so this is
+    /// how a choice reaches one -- never the process environment, which the
+    /// GUI would have to write while its other threads read it (setenv is not
+    /// thread-safe on glibc). Per thread, so a GUI worker and parallel tests
+    /// never see each other's install.
+    static INSTALL: std::cell::RefCell<Option<(ResolvedQuality, Extras)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Holds this thread's install context for one run and clears it however the
+/// run ends, early `?` returns included.
+struct InstallScope;
+
+impl InstallScope {
+    fn enter(quality: ResolvedQuality, x: Extras) -> Self {
+        INSTALL.with(|c| *c.borrow_mut() = Some((quality, x)));
+        InstallScope
+    }
+}
+
+impl Drop for InstallScope {
+    fn drop(&mut self) {
+        INSTALL.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// Quality resolution for the install running on this thread.
 fn install_quality() -> ResolvedQuality {
-    INSTALL_QUALITY
-        .lock()
-        .ok()
-        .and_then(|g| g.clone())
+    INSTALL
+        .with(|c| c.borrow().as_ref().map(|(q, _)| q.clone()))
         .unwrap_or_else(quality_preset::fallback_medium)
+}
+
+/// Extras of the install running on this thread; all off outside one.
+fn install_extras() -> Extras {
+    INSTALL
+        .with(|c| c.borrow().as_ref().map(|(_, x)| *x))
+        .unwrap_or_default()
 }
 
 /// True when this game has already refused a reduced work resolution.
@@ -2905,10 +2940,10 @@ pub fn run_all_with(
             );
         }
     }
-    let resolved = quality_preset::resolve(opts.quality, &st, &opts.overrides);
-    if let Ok(mut slot) = INSTALL_QUALITY.lock() {
-        *slot = Some(resolved);
-    }
+    let _run = InstallScope::enter(
+        quality_preset::resolve(opts.quality, &st, &opts.overrides),
+        x,
+    );
     let client = net::client()?;
     let work = tempfile::Builder::new()
         .prefix("dlss5oneclick-")
@@ -2931,9 +2966,6 @@ pub fn run_all_with(
             Err(e) => {
                 let msg = format!("{e:#}");
                 step_cb(i, n, step.name, StepState::Error, &msg);
-                if let Ok(mut slot) = INSTALL_QUALITY.lock() {
-                    *slot = None;
-                }
                 return Err(anyhow!("{}: {msg}", step.name));
             }
         }
@@ -2958,9 +2990,6 @@ pub fn run_all_with(
                 }
             }
         }
-    }
-    if let Ok(mut slot) = INSTALL_QUALITY.lock() {
-        *slot = None;
     }
     // Re-inspect and refuse a hollow "success" when critical files are missing.
     st = game::inspect(exe)?;
@@ -3248,16 +3277,48 @@ mod tests {
         );
     }
 
-    /// The engine choice decides which fork is fetched, and nothing else.
+    /// The engine choice decides which fork is fetched, and nothing else. It
+    /// reaches the step through the install's own context, never the process
+    /// environment, so it holds only on the thread and for the run it was set.
     #[test]
     fn opti_source_selects_the_fork() {
-        std::env::remove_var(OPTI_SOURCE_ENV);
-        assert_eq!(opti_repo(), OPTI_REPO);
-        std::env::set_var(OPTI_SOURCE_ENV, "presr");
-        assert_eq!(opti_repo(), OPTI_PRESR_REPO);
-        std::env::set_var(OPTI_SOURCE_ENV, "something else");
-        assert_eq!(opti_repo(), OPTI_REPO);
-        std::env::remove_var(OPTI_SOURCE_ENV);
+        assert_eq!(opti_repo_for(false), OPTI_REPO);
+        assert_eq!(opti_repo_for(true), OPTI_PRESR_REPO);
+        assert_eq!(opti_repo(), OPTI_REPO, "outside an install nothing asked for the fork");
+        {
+            let _run = InstallScope::enter(
+                quality_preset::fallback_medium(),
+                Extras {
+                    opti_presr: true,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(opti_repo(), OPTI_PRESR_REPO);
+            let elsewhere = std::thread::spawn(opti_repo).join().unwrap();
+            assert_eq!(elsewhere, OPTI_REPO, "another thread's install is not this one");
+        }
+        assert_eq!(opti_repo(), OPTI_REPO, "and the choice ends with the run");
+    }
+
+    /// The neural-upstream preset comes from the install, and only a real one
+    /// is written; anything else leaves the overlay's own.
+    #[test]
+    fn upstream_preset_comes_from_the_install_and_must_be_real() {
+        let (_, real, _) = reshade_ini::UPSTREAM_PRESETS[0];
+        let during = |p: u8| {
+            let _run = InstallScope::enter(
+                quality_preset::fallback_medium(),
+                Extras {
+                    upstream: true,
+                    upstream_preset: p,
+                    ..Default::default()
+                },
+            );
+            upstream_preset()
+        };
+        assert_eq!(during(real), real);
+        assert_eq!(during(250), 0);
+        assert_eq!(upstream_preset(), 0);
     }
 
     /// Dying Light refuses any reduced work resolution: identical failure at
@@ -3738,24 +3799,17 @@ mod tests {
     }
 
     #[test]
-    fn driver_ge_compares_numeric_components() {
-        assert!(!driver_ge("610.57.04", "616.64")); // this machine: no fault
-        assert!(driver_ge("616.64", "616.64"));
-        assert!(driver_ge("616.86", "616.64"));
-        assert!(driver_ge("620.10", "616.64"));
-        assert!(!driver_ge("616.56", "616.64"));
-    }
-
-    #[test]
-    fn renodx_pin_matches_feeder_and_driver() {
-        // Stable feeder (< 0.8.0-beta.3) only works with 4.55.
-        assert_eq!(renodx_dlss5_pin(Some("v0.7.0"), None), Some("4.55"));
-        // A feeder that supports the newer add-on: no pin.
-        assert_eq!(renodx_dlss5_pin(Some("v0.9.0-beta.1"), None), None);
-        // The native route has no feeder; a faulting driver still pins.
-        assert_eq!(renodx_dlss5_pin(None, Some("616.86")), Some("4.55"));
-        assert_eq!(renodx_dlss5_pin(None, Some("610.57.04")), None);
-        assert_eq!(renodx_dlss5_pin(None, None), None);
+    fn an_old_feeder_needs_the_classic_addon() {
+        // The stable feeder line (< 0.8.0-beta.3) speaks only 4.55.
+        assert!(feeder_needs_classic(Some("v0.7.0")));
+        assert!(feeder_needs_classic(Some("v0.8.0-beta.1")));
+        // One that knows the newer add-ons holds nothing back, and neither does
+        // the native route, which has no feeder at all.
+        assert!(!feeder_needs_classic(Some("v0.8.0-beta.3")));
+        assert!(!feeder_needs_classic(Some("v0.9.0-beta.1")));
+        assert!(!feeder_needs_classic(None));
+        // The line held to is the classic build upstream names.
+        assert_eq!(RENODX_CLASSIC_TAG, format!("renodx-dlss5-{CLASSIC_LINE}"));
     }
 
     #[test]

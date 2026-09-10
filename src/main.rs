@@ -148,11 +148,11 @@ error: {e:#}"
         game::set_ignore_anticheat(true);
     }
     if let Some(m) = args.iter().find_map(|a| a.strip_prefix("--mode=")) {
-        std::env::set_var(game::MODE_ENV, m);
-        if game::mode_override().is_none() {
+        let Some(mode) = game::parse_mode(m) else {
             eprintln!("error: --mode must be feeder or native");
             std::process::exit(1);
-        }
+        };
+        game::set_mode_override(Some(mode));
     }
     if args.iter().any(|a| a == "--bridge") {
         std::env::set_var(game::BRIDGE_ENV, "1");
@@ -544,6 +544,16 @@ fn cli(
         with_fg,
         model_scale,
         remix_swap,
+        // Upstream's knobs for scripted installs, read once here: the steps
+        // take them from Extras, and nothing writes the environment.
+        // (DLSS5ONECLICK_RENODX_TAG names an add-on build directly.)
+        opti_presr: installer::opti_presr_from_env(),
+        classic_addon: false,
+        upstream_preset: if upstream {
+            installer::upstream_preset_from_env()
+        } else {
+            0
+        },
     };
     let (exe, candidates) = match game::resolve_target(&target) {
         Ok(v) => v,

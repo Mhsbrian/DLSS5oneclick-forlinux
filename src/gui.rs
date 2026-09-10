@@ -501,6 +501,13 @@ impl App {
             with_fg: self.fg_on,
             model_scale: Some(self.working_scale),
             remix_swap: self.remix_swap_on,
+            opti_presr: self.opti_presr,
+            classic_addon: self.renodx_classic,
+            upstream_preset: if self.upstream_on {
+                self.upstream_preset
+            } else {
+                0
+            },
         }
     }
 
@@ -537,7 +544,7 @@ impl App {
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             gpu,
-            driver: crate::gpu::driver_for_pin().unwrap_or_default(),
+            driver: crate::gpu::nvidia_driver().unwrap_or_default(),
             api: st.api.label().to_string(),
             route,
             diagnosis,
@@ -552,24 +559,6 @@ impl App {
         self.launch_panel = None;
         let engine = self.engine;
         let extras = self.extras();
-        if self.opti_presr {
-            std::env::set_var(installer::OPTI_SOURCE_ENV, "presr");
-        } else {
-            std::env::remove_var(installer::OPTI_SOURCE_ENV);
-        }
-        if self.renodx_classic {
-            std::env::set_var(installer::RENODX_TAG_ENV, installer::RENODX_CLASSIC_TAG);
-        } else {
-            std::env::remove_var(installer::RENODX_TAG_ENV);
-        }
-        std::env::set_var(
-            installer::UPSTREAM_PRESET_ENV,
-            if extras.upstream {
-                self.upstream_preset.to_string()
-            } else {
-                "0".to_owned()
-            },
-        );
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
         self.rx = Some(rx);
         self.running = true;

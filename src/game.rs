@@ -5,6 +5,7 @@ use anyhow::{bail, Context, Result};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
 
 pub const PE_X64: u16 = 0x8664;
 pub const PE_X86: u16 = 0x014C;
@@ -957,25 +958,78 @@ pub const IGNORE_ANTICHEAT_ENV: &str = "DLSS5ONECLICK_IGNORE_ANTICHEAT";
 /// makes a game without DLSS look native; some games load DLSS from elsewhere).
 pub const MODE_ENV: &str = "DLSS5ONECLICK_MODE";
 
+// The switches below are flipped by the GUI while its other threads run. They
+// used to be written into the process environment, but setenv is not
+// thread-safe on glibc while another thread reads the environment (a DNS
+// lookup on a poster or update thread is enough), so the GUI's side lives
+// in-process. The variables still work -- read, never written -- as the way in
+// for the CLI, a launcher or a shell.
+
+/// A yes/no switch a variable can preset and the GUI or CLI set at runtime.
+/// Once set, that choice wins in either direction, so a tick means what it shows.
+struct Switch {
+    /// 0 follows the variable, 1 off, 2 on.
+    state: AtomicU8,
+    env: &'static str,
+}
+
+impl Switch {
+    const fn new(env: &'static str) -> Self {
+        Switch {
+            state: AtomicU8::new(0),
+            env,
+        }
+    }
+
+    fn get(&self) -> bool {
+        match self.state.load(Relaxed) {
+            0 => std::env::var_os(self.env).is_some(),
+            s => s == 2,
+        }
+    }
+
+    fn set(&self, on: bool) {
+        self.state.store(if on { 2 } else { 1 }, Relaxed);
+    }
+}
+
+static SKIP_GPU_CHECK: Switch = Switch::new(SKIP_GPU_CHECK_ENV);
+static IGNORE_ANTICHEAT: Switch = Switch::new(IGNORE_ANTICHEAT_ENV);
+/// The GUI's DLSS-path pick: 0 follows `DLSS5ONECLICK_MODE`, 1 auto, 2 feeder,
+/// 3 native.
+static MODE_PICK: AtomicU8 = AtomicU8::new(0);
+
 pub fn mode_override() -> Option<Mode> {
-    match std::env::var(MODE_ENV).ok()?.to_ascii_lowercase().as_str() {
+    match MODE_PICK.load(Relaxed) {
+        0 => parse_mode(&std::env::var(MODE_ENV).ok()?),
+        2 => Some(Mode::Feeder),
+        3 => Some(Mode::Native),
+        _ => None,
+    }
+}
+
+/// A DLSS path as `--mode=` and `DLSS5ONECLICK_MODE` spell it.
+pub fn parse_mode(s: &str) -> Option<Mode> {
+    match s.to_ascii_lowercase().as_str() {
         "feeder" | "nodlss" | "no-dlss" => Some(Mode::Feeder),
         "native" | "dlss" => Some(Mode::Native),
         _ => None,
     }
 }
 
-/// GUI dropdown / `--mode=`: same switch as the environment variable.
+/// GUI dropdown / `--mode=`. "Auto" (`None`) is a choice too: it overrides the
+/// variable like the other two.
 pub fn set_mode_override(m: Option<Mode>) {
-    match m {
-        Some(Mode::Feeder) => std::env::set_var(MODE_ENV, "feeder"),
-        Some(Mode::Native) => std::env::set_var(MODE_ENV, "native"),
-        None => std::env::remove_var(MODE_ENV),
-    }
+    let pick = match m {
+        None => 1,
+        Some(Mode::Feeder) => 2,
+        Some(Mode::Native) => 3,
+    };
+    MODE_PICK.store(pick, Relaxed);
 }
 
 pub fn ignore_anticheat() -> bool {
-    std::env::var_os(IGNORE_ANTICHEAT_ENV).is_some()
+    IGNORE_ANTICHEAT.get()
 }
 
 /// Override for the GPU check. Named here rather than spelled out at each use
@@ -983,27 +1037,19 @@ pub fn ignore_anticheat() -> bool {
 pub const SKIP_GPU_CHECK_ENV: &str = "DLSS5ONECLICK_SKIP_GPU_CHECK";
 
 pub fn skip_gpu_check() -> bool {
-    std::env::var_os(SKIP_GPU_CHECK_ENV).is_some()
+    SKIP_GPU_CHECK.get()
 }
 
 /// GUI checkbox: same switch as the environment variable. A GUI user cannot
 /// set an env var for an already-running window, which left the refusal
 /// naming a fix they could not reach (#3).
 pub fn set_skip_gpu_check(on: bool) {
-    if on {
-        std::env::set_var(SKIP_GPU_CHECK_ENV, "1");
-    } else {
-        std::env::remove_var(SKIP_GPU_CHECK_ENV);
-    }
+    SKIP_GPU_CHECK.set(on);
 }
 
 /// GUI checkbox / `--ignore-anticheat`: same switch as the environment variable.
 pub fn set_ignore_anticheat(on: bool) {
-    if on {
-        std::env::set_var(IGNORE_ANTICHEAT_ENV, "1");
-    } else {
-        std::env::remove_var(IGNORE_ANTICHEAT_ENV);
-    }
+    IGNORE_ANTICHEAT.set(on);
 }
 
 pub const BRIDGE_ENV: &str = "DLSS5ONECLICK_BRIDGE";
@@ -2385,16 +2431,33 @@ mod tests {
     /// Remote Desktop hides the real card behind a virtual adapter, so the GPU
     /// check refuses a machine that works locally. The escape hatch has to be
     /// reachable from the GUI, not only from an environment variable a running
-    /// window cannot be given (#3).
+    /// window cannot be given (#3) -- and flipping it must not write the
+    /// process environment. Exercised on a switch of its own: the process-wide
+    /// one is what every other test's variable feeds.
     #[test]
     fn skip_gpu_check_is_the_same_switch_from_either_side() {
-        std::env::remove_var(SKIP_GPU_CHECK_ENV);
-        assert!(!skip_gpu_check());
-        set_skip_gpu_check(true);
-        assert!(skip_gpu_check());
-        assert_eq!(std::env::var(SKIP_GPU_CHECK_ENV).as_deref(), Ok("1"));
-        set_skip_gpu_check(false);
-        assert!(!skip_gpu_check());
+        let env = "DLSS5ONECLICK_TEST_SWITCH_ONLY_HERE";
+        std::env::remove_var(env);
+        let s = Switch::new(env);
+        assert!(!s.get());
+        std::env::set_var(env, "1");
+        assert!(s.get(), "the variable alone turns it on");
+        s.set(false);
+        assert!(!s.get(), "once the GUI has spoken, its choice wins");
+        std::env::remove_var(env);
+        s.set(true);
+        assert!(s.get());
+        assert!(std::env::var_os(env).is_none(), "and the environment was never written");
+        // The real switch reads the real variable.
+        assert_eq!(SKIP_GPU_CHECK.env, SKIP_GPU_CHECK_ENV);
+    }
+
+    #[test]
+    fn mode_names_parse() {
+        assert_eq!(parse_mode("Feeder"), Some(Mode::Feeder));
+        assert_eq!(parse_mode("no-dlss"), Some(Mode::Feeder));
+        assert_eq!(parse_mode("DLSS"), Some(Mode::Native));
+        assert_eq!(parse_mode("banana"), None);
     }
 
     #[test]

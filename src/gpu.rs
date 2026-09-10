@@ -483,20 +483,6 @@ fn parse_compute_caps(s: &str) -> Option<u32> {
         .max()
 }
 
-/// The NVIDIA driver version used for add-on compatibility gating, portable.
-/// Linux reads `/sys/module/nvidia/version`; other platforms return `None`
-/// (the pin then relies on the feeder↔add-on match alone).
-pub fn driver_for_pin() -> Option<String> {
-    #[cfg(target_os = "linux")]
-    {
-        driver_version()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
