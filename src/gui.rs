@@ -2829,7 +2829,7 @@ impl eframe::App for App {
                     let cb = egui::Checkbox::new(
                         &mut on,
                         RichText::new(
-                            "Unlock RTX 40 multi-frame generation (3X/4X/6X) — the game must have frame generation of its own",
+                            "Unlock RTX 40 multi-frame generation (3X and above, up to 6X) — the game must have frame generation of its own",
                         )
                         .font(t::plex(11.5))
                         .color(t::TEXT_SOFT),
