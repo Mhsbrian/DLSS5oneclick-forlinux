@@ -2809,6 +2809,30 @@ impl eframe::App for App {
                         self.renodx_classic = on;
                     }
                 }
+                // RTX 40 multi-frame generation on the ReShade route: a single
+                // MIT add-on, in-memory only. OptiScaler's own built-in unlock
+                // reported "DLSSG not patched: capability not matched" on the
+                // reporter's machine while this one reached 6X (#83).
+                if self.engine == Engine::ReShade
+                    && ok_status.as_ref().is_some_and(|s| !s.is32())
+                    && ok_status
+                        .as_ref()
+                        .and_then(|s| s.gpu.as_ref())
+                        .is_some_and(|(_, t)| *t == crate::gpu::Tier::Rtx40)
+                {
+                    let mut on = self.ada_mfg;
+                    let cb = egui::Checkbox::new(
+                        &mut on,
+                        RichText::new(
+                            "Unlock RTX 40 multi-frame generation (3X/4X/6X) — the game must have frame generation of its own",
+                        )
+                        .font(t::plex(11.5))
+                        .color(t::TEXT_SOFT),
+                    );
+                    if ui.add_enabled(!self.running, cb).changed() {
+                        self.ada_mfg = on;
+                    }
+                }
                 if let Some(ac) = ok_status.as_ref().and_then(|s| s.anticheat) {
                     let mut on = game::ignore_anticheat();
                     let label = format!(

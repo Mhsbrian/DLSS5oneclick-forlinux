@@ -646,6 +646,10 @@ pub const BRIDGE_DOWNLOAD: &str =
 /// RenoDX DLSS 5 add-on rather than joining it.
 const UPSTREAM_DOWNLOAD: &str =
     "https://github.com/matiasLombo/neural-upstream/releases/latest/download/nvngx.dll.addon64";
+/// mavismmg/MFGAdaUnlock-RenoDx: RTX 40 multi-frame generation as a ReShade
+/// add-on. DangerousBerries reached 6X with this where OptiScaler's own
+/// built-in unlock reported "DLSSG not patched: capability not matched" (#83).
+const MFG_DOWNLOAD: &str = "https://github.com/mavismmg/MFGAdaUnlock-RenoDx/releases/latest/download/renodx-mfgunlock.addon64";
 pub const RHI_RELEASES: &str =
     "https://api.github.com/repos/RankFTW/rhi-repo/releases?per_page=100";
 pub const RHI_REPO: &str = "RankFTW/rhi-repo";
@@ -712,6 +716,10 @@ const STEP_DLSSNR_ONLY: Step = Step {
 const STEP_BRIDGE: Step = Step {
     name: "DLSS 5 DX11 bridge",
     run: step_bridge,
+};
+const STEP_MFG: Step = Step {
+    name: "RTX 40 multi-frame generation add-on",
+    run: step_mfg,
 };
 const STEP_UPSTREAM: Step = Step {
     name: "Neural Upstream add-on (experimental)",
@@ -979,6 +987,14 @@ pub fn plan_with(st: &GameStatus, engine: Engine, with_renodx: bool, upstream: b
         }
         v
     };
+    // RTX 40 multi-frame generation. On the OptiScaler route the fork writes
+    // its own ini key; on the ReShade route it is this separate add-on, which
+    // is what actually reached 6X for the reporter in #83. It is an .addon64,
+    // so a 32-bit game's ReShade could not load it.
+    if engine != Engine::Opti && ada_mfg() == "true" && !st.is32() {
+        let at = v.len().saturating_sub(1); // before ReShade config
+        v.insert(at, STEP_MFG);
+    }
     if st.re_engine {
         v.insert(0, STEP_REFRAMEWORK);
     }
@@ -1948,6 +1964,40 @@ fn step_bridge(
     Ok(vec![game::BRIDGE_ADDON.into()])
 }
 
+/// The RTX 40 MFG add-on, fetched only when the tick asked for it.
+///
+/// Like the bridge it carries no version in its file name, so an existing copy
+/// is refreshed whenever the published file differs in size.
+fn step_mfg(
+    client: &Client,
+    st: &GameStatus,
+    _work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    let dest = st.game_dir().join(game::MFG_ADDON);
+    if st.mfg && dest.is_file() {
+        let local = fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+        match net::remote_len(client, MFG_DOWNLOAD) {
+            Ok(Some(remote)) if remote != local => {
+                progress(0, "MFG unlock changed upstream, refreshing");
+            }
+            Ok(_) => {
+                return Ok(vec![format!("{} already current", game::MFG_ADDON)]);
+            }
+            Err(_) => {
+                return Ok(vec![format!(
+                    "{} present (could not check for a newer one)",
+                    game::MFG_ADDON
+                )]);
+            }
+        }
+    } else {
+        progress(0, "Fetching the RTX 40 MFG unlock");
+    }
+    net::download(client, MFG_DOWNLOAD, &dest, game::MFG_ADDON, progress)?;
+    Ok(vec![game::MFG_ADDON.into()])
+}
+
 // ── step 5c: neural-upstream (experimental consumer, native DLSS only) ──
 
 fn step_upstream(
@@ -2384,6 +2434,7 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
         d.join(game::DLSSNR_DLL),
         d.join(game::BRIDGE_ADDON),
         d.join(game::UPSTREAM_ADDON),
+        d.join(game::MFG_ADDON),
         d.join("dlss5-dx11-bridge.addon64"),
         shaders.join(game::FEEDER_FX),
         d.join("reshade-shaders")
@@ -2881,6 +2932,30 @@ mod tests {
     /// RTX 40 MFG is one ini key and no extra files, so it can be offered as
     /// part of an install. The Ampere/Turing key in the same section sideloads
     /// a DLL with no published release and is deliberately never written (#83).
+    /// The OptiScaler route writes an ini key; the ReShade route needs the
+    /// separate add-on, because the fork's built-in unlock reported "DLSSG not
+    /// patched: capability not matched" on the reporter's machine (#83). The
+    /// add-on is an .addon64, so a 32-bit game never gets it.
+    #[test]
+    fn mfg_addon_is_planned_on_the_reshade_route_only() {
+        let st = game::stub_status(game::Mode::Native, game::Api::Dx12);
+        let named = |v: &[Step]| -> Vec<&'static str> { v.iter().map(|s| s.name).collect() };
+
+        std::env::remove_var(ADA_MFG_ENV);
+        assert!(!named(&plan_with(&st, Engine::ReShade, false, false)).contains(&STEP_MFG.name));
+
+        std::env::set_var(ADA_MFG_ENV, "1");
+        let reshade = named(&plan_with(&st, Engine::ReShade, false, false));
+        assert!(reshade.contains(&STEP_MFG.name), "{reshade:?}");
+        // Ahead of ReShade config, which writes the add-on list.
+        let mfg = reshade.iter().position(|n| *n == STEP_MFG.name).unwrap();
+        let cfg = reshade.iter().position(|n| *n == STEP_CONFIG.name).unwrap();
+        assert!(mfg < cfg, "{reshade:?}");
+        // The OptiScaler route has its own ini key and must not fetch it.
+        assert!(!named(&plan_with(&st, Engine::Opti, false, false)).contains(&STEP_MFG.name));
+        std::env::remove_var(ADA_MFG_ENV);
+    }
+
     #[test]
     fn ada_mfg_is_written_and_ampere_is_left_alone() {
         std::env::remove_var(ADA_MFG_ENV);

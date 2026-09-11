@@ -23,6 +23,10 @@ pub const DLSS_DLL: &str = "nvngx_dlss.dll";
 pub const LUMENITE_KERNEL_FX: &str = "lumenite_Kernel.fx";
 pub const LUMENITE_BLUENOISE: &str = "lumenite_bluenoise256.png";
 pub const BRIDGE_ADDON: &str = "dlss5-bridge.addon64";
+/// mavismmg/MFGAdaUnlock-RenoDx: a ReShade add-on that lifts NVIDIA's RTX 50
+/// gate on multi-frame generation and corrects the temporal midpoint, entirely
+/// in mapped memory. One file, MIT, nothing in the game folder modified.
+pub const MFG_ADDON: &str = "renodx-mfgunlock.addon64";
 /// matiasLombo's neural-upstream add-on. The name is not ours to choose: the
 /// NGX snippet gates feature creation on the calling module's path containing
 /// `nvngx.dll`, and under any other name it returns 0xBAD00002 and does nothing.
@@ -796,6 +800,8 @@ pub struct GameStatus {
     pub reframework: bool,
     /// matiasLombo's neural-upstream add-on is in the folder.
     pub upstream: bool,
+    /// The RTX 40 multi-frame-generation add-on is already beside the game.
+    pub mfg: bool,
     /// Unreal-style layout / Shipping exe (heuristic).
     pub unreal_likely: bool,
     /// UnityPlayer.dll present (heuristic).
@@ -841,6 +847,7 @@ pub(crate) fn stub_status(mode: Mode, api: Api) -> GameStatus {
         re_engine: false,
         reframework: false,
         upstream: false,
+        mfg: false,
         unreal_likely: false,
         unity_likely: false,
         rt_likely: false,
@@ -1051,6 +1058,7 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         bridge: d.join(BRIDGE_ADDON).is_file() || d.join("dlss5-dx11-bridge.addon64").is_file(),
         opti: d.join(OPTI_MANIFEST).is_file(),
         upstream: d.join(UPSTREAM_ADDON).is_file(),
+        mfg: d.join(MFG_ADDON).is_file(),
         gpu,
         exe: exe.to_path_buf(),
         bitness,
