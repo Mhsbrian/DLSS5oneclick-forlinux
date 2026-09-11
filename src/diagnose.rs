@@ -514,6 +514,36 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
                 line.trim()
             )));
         }
+        // The host warns when the add-on's version and the driver are a pair it
+        // has measured failing. Every build of that add-on carries the same
+        // embedded FileVersion (0.2026.0828.0517 in 4.55 and 4.70 alike), so
+        // the warning fires on the classic build too — the one the host's own
+        // text calls a way through. Only the tag this tool recorded can say
+        // which build is actually on disk (#69, and upstream DLSS5-Feeder#90).
+        if fd.contains("is a combination measured to fail")
+            || read(&st.consumer_dir(), "dlss5-feed-host.log")
+                .as_deref()
+                .is_some_and(|l| l.contains("is a combination measured to fail"))
+        {
+            let tag = read(&st.consumer_dir(), crate::game::DLSS5_ADDON_MARKER)
+                .map(|t| t.trim().to_owned())
+                .unwrap_or_default();
+            if tag == crate::installer::RENODX_CLASSIC_TAG {
+                out.push(ok(format!(
+                    "The host warns that this add-on build and your driver are a combination it \
+                     measured failing. You are already on the classic build it recommends \
+                     ({tag}) — every build of that add-on reports the same FileVersion, so the \
+                     host cannot tell them apart and warns either way. Nothing to do here."
+                )));
+            } else {
+                out.push(warn(format!(
+                    "The host measured this add-on build failing on your driver. Run Install \
+                     again: it reads that verdict out of this log and pins the classic build \
+                     ({}) by itself.",
+                    crate::installer::RENODX_CLASSIC_TAG
+                )));
+            }
+        }
         // The create faults inside the driver rather than returning a code. The
         // feed catches it, cannot retry (the consumer's own locks were skipped
         // by the unwind), and stops — so the game runs and nothing happens,
@@ -862,6 +892,46 @@ mod tests {
         );
         assert!(
             f.iter().any(|x| x.text.contains("Do NOT do that here")),
+            "{f:?}"
+        );
+    }
+
+    /// The host's warning keys on a FileVersion every build of that add-on
+    /// shares, so it fires on the classic build the host itself recommends.
+    /// Only the tag this tool recorded can tell them apart (#69).
+    #[test]
+    fn the_measured_to_fail_warning_reads_the_recorded_tag() {
+        let (t, exe) = setup(true);
+        fs::write(
+            t.path().join("ReShade.log"),
+            "Initializing crosire's ReShade\nRegistered add-on \"DLSS 5 Neural Rendering\"\n",
+        )
+        .unwrap();
+        fs::write(
+            t.path().join("dlss5-feed.log"),
+            "[feed] WARNING: renodx-dlss5 v4.6 with NVIDIA driver 616.64 is a combination \
+             measured to fail\n",
+        )
+        .unwrap();
+
+        // No tag on disk: the advice is to re-run Install, which pins it.
+        let f = run(&exe).unwrap();
+        assert!(
+            f.iter()
+                .any(|x| x.level == Level::Warn && x.text.contains("pins the classic build")),
+            "{f:?}"
+        );
+
+        // Already pinned: say so instead of sending them round again.
+        fs::write(
+            t.path().join(crate::game::DLSS5_ADDON_MARKER),
+            crate::installer::RENODX_CLASSIC_TAG,
+        )
+        .unwrap();
+        let f = run(&exe).unwrap();
+        assert!(
+            f.iter()
+                .any(|x| x.level == Level::Ok && x.text.contains("cannot tell them apart")),
             "{f:?}"
         );
     }

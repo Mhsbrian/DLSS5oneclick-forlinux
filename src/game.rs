@@ -39,6 +39,11 @@ pub const DLSS_MARKER: &str = "nvngx_dlss.dll.dlss5oneclick";
 /// tool placed, so Install can tell "ours and stale" from "the user's own".
 pub const DLSSNR_MARKER: &str = "nvngx_dlssnr.dll.dlss5oneclick";
 pub const RESHADE_MARKER: &str = "dxgi.dll.dlss5oneclick";
+/// The DLSS 5 add-on release tag this tool placed. Every build carries the same
+/// embedded FileVersion (0.2026.0828.0517 in 4.55 and 4.70 alike), so the
+/// Feeder's host names them all "v4.6 engine" and warns about a combination the
+/// classic build is not part of. The tag is the only way to tell them apart.
+pub const DLSS5_ADDON_MARKER: &str = "renodx-dlss5.addon64.dlss5oneclick";
 /// The DLSS5-Feeder release tag this tool placed, so a stale install can be
 /// spotted without downloading the zip to compare sizes.
 pub const FEEDER_MARKER: &str = "dlss5-feed.dlss5oneclick";

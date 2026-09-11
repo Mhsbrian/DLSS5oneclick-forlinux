@@ -1744,7 +1744,12 @@ fn step_dlss5(
     // two NVIDIA DLLs by the release tag recorded when this tool placed them.
     // A DLL without a marker is the game's or the user's and is left alone.
     let plan = [
-        ("renodx-dlss5-", game::DLSS5_ADDON, false, None),
+        (
+            "renodx-dlss5-",
+            game::DLSS5_ADDON,
+            false,
+            Some(game::DLSS5_ADDON_MARKER),
+        ),
         (
             "dlssnr-",
             game::DLSSNR_DLL,
@@ -1806,6 +1811,12 @@ fn step_dlss5(
                 .find(|n| net::file_name(n).eq_ignore_ascii_case(fname))
                 .map(str::to_owned);
             if hit.is_some_and(|h| same_size(&mut zip, &h, &dest)) {
+                // Record the tag even when nothing is copied: every build of
+                // this add-on carries the same FileVersion, so the tag on disk
+                // is the only way anything afterwards can name the build.
+                if let Some(m) = marker {
+                    let _ = fs::write(cdir.join(m), tag.as_bytes());
+                }
                 installed.push(format!("{fname} already current ({tag})"));
                 continue;
             }
@@ -2431,6 +2442,7 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
         d.join(game::FEEDER_MARKER),
         d.join(game::FEEDER_ADDON),
         d.join(game::DLSS5_ADDON),
+        d.join(game::DLSS5_ADDON_MARKER),
         d.join(game::DLSSNR_DLL),
         d.join(game::BRIDGE_ADDON),
         d.join(game::UPSTREAM_ADDON),
@@ -2462,6 +2474,7 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
         for f in [
             game::HOST_EXE,
             game::DLSS5_ADDON,
+            game::DLSS5_ADDON_MARKER,
             game::DLSSNR_DLL,
             game::DLSSNR_MARKER,
             game::DLSS_MARKER,
