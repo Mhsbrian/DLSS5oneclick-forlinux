@@ -321,11 +321,12 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
         out.push(bad(format!(
             "The effects failed to compile in Wine/Proton's own HLSL compiler: {line} \
              That message comes from vkd3d-shader, which Wine's d3dcompiler_47.dll uses; \
-             ReShade emits attributes it has not implemented. The recipe a reporter measured \
-             working (#76) is Proton 10.0-4, a copy of Microsoft's real d3dcompiler_47.dll in \
-             the game folder, and these launch options: \
-             WINEDLLOVERRIDES=\"version=n,b;winmm=n,b;d3dcompiler_47=n;dxgi=n,b\" %command% \
-             — the override is what makes the prefix load that copy instead of Wine's. \
+             ReShade emits attributes it has not implemented. What a reporter measured working \
+             (#76, Proton 10.0-4, Elden Ring, no launch options at all): put a copy of \
+             Microsoft's real d3dcompiler_47.dll in the game folder, beside the executable. \
+             The feed then reports it as \"not System32, but it accepts cs_5_1 -- fine\" and \
+             the effects compile. If the prefix still loads Wine's copy instead, add \
+             WINEDLLOVERRIDES=\"d3dcompiler_47=n\" %command% to the launch options; \
              protontricks <appid> d3dcompiler_47 (or winetricks d3dcompiler_47) puts the real \
              one in the prefix if you do not have a copy to hand."
         )));
