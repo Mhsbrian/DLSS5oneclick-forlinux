@@ -134,7 +134,9 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
             "The game ships its own d3dcompiler_47.dll ({ver}), which Windows loads instead of \
              System32's. If it predates shader model 5.1 the DLSS 5 pass cannot compile \
              (error X3506). Rename it to d3dcompiler_47.dll.bak and start the game again; \
-             almost every game runs fine on the system copy."
+             almost every game runs fine on the system copy. On Wine/Proton, leave it: a \
+             copy of Microsoft's compiler beside the game, loaded through a WINEDLLOVERRIDES \
+             entry, is what got DLSS 5 compiling there at all (#76)."
         )));
     }
 
@@ -319,11 +321,13 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
         out.push(bad(format!(
             "The effects failed to compile in Wine/Proton's own HLSL compiler: {line} \
              That message comes from vkd3d-shader, which Wine's d3dcompiler_47.dll uses; \
-             ReShade emits attributes it has not implemented. Install Microsoft's real \
-             d3dcompiler_47 into the prefix — protontricks <appid> d3dcompiler_47, or \
-             winetricks d3dcompiler_47 — and start the game again. If the game shipped its \
-             own d3dcompiler_47.dll, leave it in place: under Proton it may be the only \
-             working compiler there is."
+             ReShade emits attributes it has not implemented. The recipe a reporter measured \
+             working (#76) is Proton 10.0-4, a copy of Microsoft's real d3dcompiler_47.dll in \
+             the game folder, and these launch options: \
+             WINEDLLOVERRIDES=\"version=n,b;winmm=n,b;d3dcompiler_47=n;dxgi=n,b\" %command% \
+             — the override is what makes the prefix load that copy instead of Wine's. \
+             protontricks <appid> d3dcompiler_47 (or winetricks d3dcompiler_47) puts the real \
+             one in the prefix if you do not have a copy to hand."
         )));
     }
 
@@ -698,6 +702,11 @@ mod tests {
         );
         assert!(
             !f.iter().any(|x| x.text.contains("d3dcompiler_47.dll.bak")),
+            "{f:?}"
+        );
+        // The recipe a reporter measured working, not just "install a compiler" (#76).
+        assert!(
+            f.iter().any(|x| x.text.contains("WINEDLLOVERRIDES")),
             "{f:?}"
         );
     }
