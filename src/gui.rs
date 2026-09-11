@@ -330,6 +330,11 @@ impl App {
         if self.resolved_exe != self.renodx_for {
             self.renodx_for = self.resolved_exe.clone();
             self.renodx_on = false;
+            // The MFG tick belongs to the game, not to the session: a game that
+            // already has the add-on comes back ticked, so re-running Install
+            // does not silently drop it (#83). Remove takes the file away, and
+            // the tick follows it.
+            self.ada_mfg = matches!(&self.status, Some(Ok(s)) if s.mfg);
             self.start_renodx_lookup();
         }
         self.reload_knobs_and_perf();
