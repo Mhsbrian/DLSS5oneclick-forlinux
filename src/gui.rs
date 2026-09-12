@@ -2805,7 +2805,7 @@ impl eframe::App for App {
                     let cb = egui::Checkbox::new(
                         &mut on,
                         RichText::new(
-                            "Black screen, crash or driver reset with DLSS 5 on? Install the classic add-on build (4.55)",
+                            "Black screen, crash, driver reset, or worse image than before? Install the classic add-on build (4.55)",
                         )
                         .font(t::plex(11.5))
                         .color(t::TEXT_SOFT),
