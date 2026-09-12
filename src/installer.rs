@@ -305,7 +305,8 @@ pub struct Latest {
     pub reshade: Option<String>,
     pub feeder: Option<String>,
     pub opti: Option<String>,
-    /// wilsjo2's pre-SR multipass fork, which numbers its releases on its own.
+    /// wilsjo2's pre-SR fork numbers its releases on its own, so its newest tag
+    /// has to be carried separately from the stable build's.
     pub opti_presr: Option<String>,
     pub dlss: Option<String>,
     pub dlssnr: Option<String>,
@@ -426,9 +427,10 @@ pub fn stale_components(dir: &Path, latest: &Latest) -> Vec<String> {
         &latest.dlssnr,
     );
     if let Ok(m) = fs::read_to_string(dir.join(game::OPTI_MANIFEST)) {
-        // Measured against the newest build of the fork it came from: a pre-SR
-        // multipass install is not out of date because Dagherbou's build is
-        // numbered differently.
+        // Compared against the newest release of the fork it came from: the two
+        // builds number their releases independently, so a pre-SR tag (v0.7.7)
+        // measured against the stable build's (v0.2.0-dlssnr) reported an update
+        // on every run that Install could never clear (#88).
         let want = if manifest_repo(&m) == OPTI_PRESR_REPO {
             &latest.opti_presr
         } else {
@@ -454,15 +456,18 @@ fn manifest_tag(manifest: &str) -> Option<String> {
         .map(|t| t.trim().to_owned())
 }
 
-/// The repository an OptiScaler manifest's build came from, from its `# repo`
-/// header. A manifest without one reads as Dagherbou's, the default build (a
-/// pre-SR install made before the header existed cannot be told apart).
+/// The repository an OptiScaler manifest's build came from: its `# repo`
+/// header, or, in a manifest written before that header existed, the shape of
+/// its tag -- the stable build's tags all end in "-dlssnr" and the pre-SR
+/// fork's do not (#88). No tag at all reads as the stable build, the default.
 fn manifest_repo(manifest: &str) -> &str {
-    manifest
-        .lines()
-        .find_map(|l| l.strip_prefix("# repo "))
-        .map(str::trim)
-        .unwrap_or(OPTI_REPO)
+    if let Some(repo) = manifest.lines().find_map(|l| l.strip_prefix("# repo ")) {
+        return repo.trim();
+    }
+    match manifest_tag(manifest) {
+        Some(t) if !t.ends_with("-dlssnr") => OPTI_PRESR_REPO,
+        _ => OPTI_REPO,
+    }
 }
 
 /// True when the OptiScaler this tool placed in `dir` is the pre-SR fork, so
@@ -612,6 +617,14 @@ fn step_opti(
         if let Some(patched) = set_dlss_nr_enabled(&cur) {
             cur = patched;
         }
+        // RTX 40 multi-frame generation. This one is built into the fork and
+        // memory-only — no file to fetch, nothing to sideload — so it is a
+        // setting we can honestly turn on for someone. The Ampere/Turing
+        // equivalent in the same ini sideloads a DLL that has no published
+        // release, so it is deliberately not offered (#83).
+        if let Some(patched) = set_ini_key(&cur, "FrameGen", "AdaMfgUnlock", ada_mfg()) {
+            cur = patched;
+        }
         // RE Engine trips its own scheduler assertion unless the compute root
         // signature is put back, and fights REFramework over WndProc unless
         // input is polled. The graphics-side restores must stay off there: they
@@ -632,6 +645,8 @@ fn step_opti(
         }
         fs::write(&ini, cur)?;
     }
+    // The repo goes in beside the tag: the two builds number their releases
+    // independently, so a tag alone cannot say whether v0.7.7 is current (#88).
     let header = latest
         .as_deref()
         .map(|t| format!("# tag {t}\n"))
@@ -738,6 +753,10 @@ const REMIX_ORIG: &str = ".dlss5oneclick-orig";
 const REMIX_MOD_MANIFEST: &str = ".dlss5oneclick-remix-mod";
 /// Suffix for a game file the mod install replaced, so removal restores it.
 const REMIX_MOD_ORIG: &str = ".dlss5oneclick-remix-orig";
+/// mavismmg/MFGAdaUnlock-RenoDx: RTX 40 multi-frame generation as a ReShade
+/// add-on. DangerousBerries reached 6X with this where OptiScaler's own
+/// built-in unlock reported "DLSSG not patched: capability not matched" (#83).
+const MFG_DOWNLOAD: &str = "https://github.com/mavismmg/MFGAdaUnlock-RenoDx/releases/latest/download/renodx-mfgunlock.addon64";
 pub const RHI_RELEASES: &str =
     "https://api.github.com/repos/RankFTW/rhi-repo/releases?per_page=100";
 pub const RHI_REPO: &str = "RankFTW/rhi-repo";
@@ -819,6 +838,10 @@ const STEP_REMIX: Step = Step {
 const STEP_REMIX_SWAP: Step = Step {
     name: "Swap in a DLSS 5-capable Remix runtime",
     run: step_remix_swap,
+};
+const STEP_MFG: Step = Step {
+    name: "RTX 40 multi-frame generation add-on",
+    run: step_mfg,
 };
 const STEP_UPSTREAM: Step = Step {
     name: "Neural Upstream add-on (experimental)",
@@ -1158,15 +1181,15 @@ fn step_renodx(
     renodx::install(client, &st.exe, &m, progress)
 }
 
-const STEP_MFG: Step = Step {
+const STEP_MFG_ASI: Step = Step {
     name: "RTX 40 DLSS MFG unlock",
-    run: step_mfg,
+    run: step_mfg_asi,
 };
 
 /// The optional RTX 40 DLSS Multi-Frame-Generation unlock (dashdogy, MIT). Only
 /// runs when the game is eligible; the plan includes it purely so --check can
 /// show it, so a non-eligible game just reports why and places nothing.
-fn step_mfg(
+fn step_mfg_asi(
     client: &Client,
     st: &GameStatus,
     _work: &Path,
@@ -1214,6 +1237,9 @@ pub struct Extras {
     /// Neural Upstream: strength preset to seed into ReShade.ini; 0 leaves the
     /// overlay's own (`reshade_ini::UPSTREAM_PRESETS`).
     pub upstream_preset: u8,
+    /// RTX 40 multi-frame generation (#83): the pre-SR OptiScaler build's own
+    /// `AdaMfgUnlock` on that route, mavismmg's add-on on the ReShade route.
+    pub ada_mfg: bool,
 }
 
 pub fn plan_with(st: &GameStatus, engine: Engine, x: Extras) -> Vec<Step> {
@@ -1249,11 +1275,19 @@ pub fn plan_with(st: &GameStatus, engine: Engine, x: Extras) -> Vec<Step> {
         }
         v
     };
+    // RTX 40 multi-frame generation. On the OptiScaler route the fork writes
+    // its own ini key; on the ReShade route it is this separate add-on, which
+    // is what actually reached 6X for the reporter in #83. It is an .addon64,
+    // so a 32-bit game's ReShade could not load it.
+    if engine != Engine::Opti && x.ada_mfg && !st.is32() {
+        let at = v.len().saturating_sub(1); // before ReShade config
+        v.insert(at, STEP_MFG);
+    }
     if st.re_engine {
         v.insert(0, STEP_REFRAMEWORK);
     }
     if x.with_mfg {
-        v.push(STEP_MFG);
+        v.push(STEP_MFG_ASI);
     }
     // DX9 never loads dxgi.dll; dgVoodoo must sit in the game folder first.
     // Always run on Dx9 (even when the DLL is already present) so Install can
@@ -1772,11 +1806,18 @@ pub fn install_dgvoodoo_from_zip(
             "a d3d9.dll that is not dgVoodoo is already present; remove or replace it, then Install again"
         );
     }
+    let had_conf = game_dir.join(game::DGVOODOO_CONF).is_file();
     net::extract_member(&mut zip, &member, &dest)?;
     write_dgvoodoo_conf(game_dir)?;
     if !game::is_dgvoodoo(game_dir) {
         bail!("wrote d3d9.dll + dgVoodoo.conf but dgVoodoo was not detected afterward");
     }
+    // Record what this tool put there so Remove can take it away again (#91).
+    let mut marker = format!("{DGVOODOO_TAG}\n");
+    if !had_conf {
+        marker.push_str("conf-ours\n");
+    }
+    fs::write(game_dir.join(game::DGVOODOO_MARKER), marker)?;
     Ok(vec!["d3d9.dll".into(), "dgVoodoo.conf".into()])
 }
 
@@ -2117,7 +2158,12 @@ fn step_dlss5(
     // two NVIDIA DLLs by the release tag recorded when this tool placed them.
     // A DLL without a marker is the game's or the user's and is left alone.
     let plan = [
-        ("renodx-dlss5-", game::DLSS5_ADDON, false, None),
+        (
+            "renodx-dlss5-",
+            game::DLSS5_ADDON,
+            false,
+            Some(game::DLSS5_ADDON_MARKER),
+        ),
         (
             "dlssnr-",
             game::DLSSNR_DLL,
@@ -2199,6 +2245,12 @@ fn step_dlss5(
                 .find(|n| net::file_name(n).eq_ignore_ascii_case(fname))
                 .map(str::to_owned);
             if hit.is_some_and(|h| same_size(&mut zip, &h, &dest)) {
+                // Record the tag even when nothing is copied: every build of
+                // this add-on carries the same FileVersion, so the tag on disk
+                // is the only way anything afterwards can name the build.
+                if let Some(m) = marker {
+                    let _ = fs::write(cdir.join(m), tag.as_bytes());
+                }
                 installed.push(format!("{fname} already current ({tag})"));
                 continue;
             }
@@ -2362,6 +2414,78 @@ fn step_bridge(
     Ok(vec![game::BRIDGE_ADDON.into()])
 }
 
+/// The RTX 40 MFG add-on, fetched only when the tick asked for it.
+///
+/// Like the bridge it carries no version in its file name, so an existing copy
+/// is refreshed whenever the published file differs in size.
+fn step_mfg(
+    client: &Client,
+    st: &GameStatus,
+    work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    let dest = st.game_dir().join(game::MFG_ADDON);
+    if st.mfg && dest.is_file() {
+        let local = fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+        match net::remote_len(client, MFG_DOWNLOAD) {
+            Ok(Some(remote)) if remote != local => {
+                progress(0, "MFG unlock changed upstream, refreshing");
+            }
+            Ok(_) => {
+                return Ok(vec![format!("{} already current", game::MFG_ADDON)]);
+            }
+            Err(_) => {
+                return Ok(vec![format!(
+                    "{} present (could not check for a newer one)",
+                    game::MFG_ADDON
+                )]);
+            }
+        }
+    } else {
+        progress(0, "Fetching the RTX 40 MFG unlock");
+    }
+    net::download(client, MFG_DOWNLOAD, &dest, game::MFG_ADDON, progress)?;
+    let mut done = vec![game::MFG_ADDON.to_owned()];
+    done.extend(mfg_provider(client, st, work, progress)?);
+    Ok(done)
+}
+
+/// The frame-generation provider the MFG add-on will accept.
+///
+/// Version 0.9 validates the provider by build and refuses the rest: a reporter
+/// with an RTX 4060 got "Validated provider result: unsupported/unknown" and no
+/// effect at all, on a game whose own menu offered 2X-6X (#90). The add-on's
+/// README says to use the newest `nvngx_dlssg.dll`; rhi-repo publishes it, the
+/// same place this tool already takes `nvngx_dlss.dll` and the neural model
+/// from, so Install can place it without asking anyone to fetch a DLL.
+///
+/// A provider the game shipped is moved to `.original` rather than overwritten,
+/// and Remove puts it back.
+fn mfg_provider(
+    client: &Client,
+    st: &GameStatus,
+    work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    let d = st.game_dir();
+    let dest = d.join(game::DLSSG_DLL);
+    let marker = d.join(game::DLSSG_MARKER);
+    progress(0, "Looking up frame-generation runtime releases");
+    let (tag, url) = rhi_latest(client, "dlssg-")?;
+    if fs::read_to_string(&marker).is_ok_and(|t| t.trim() == tag) {
+        return Ok(vec![format!("{} already current ({tag})", game::DLSSG_DLL)]);
+    }
+    let backup = d.join(game::DLSSG_BACKUP);
+    if dest.is_file() && !marker.is_file() && !backup.is_file() {
+        fs::rename(&dest, &backup)?;
+    }
+    let z = work.join(format!("{tag}.zip"));
+    net::download(client, &url, &z, game::DLSSG_DLL, progress)?;
+    install_single_from_zip(&z, game::DLSSG_DLL, &dest)?;
+    fs::write(&marker, tag.as_bytes())?;
+    Ok(vec![format!("{} ({tag})", game::DLSSG_DLL)])
+}
+
 // ── step 5c: neural-upstream (experimental consumer, native DLSS only) ──
 
 fn step_upstream(
@@ -2413,6 +2537,30 @@ fn step_upstream(
         }
     }
     Ok(done)
+}
+
+/// RTX 40 multi-frame generation, for a scripted install: read once by the CLI
+/// into `Extras::ada_mfg` -- nothing writes it at runtime.
+pub const ADA_MFG_ENV: &str = "DLSS5ONECLICK_ADA_MFG";
+
+/// True when `DLSS5ONECLICK_ADA_MFG` asks for the RTX 40 MFG unlock.
+pub fn ada_mfg_from_env() -> bool {
+    std::env::var_os(ADA_MFG_ENV).is_some()
+}
+
+/// `"true"` when the install running on this thread asked for the RTX 40 MFG
+/// unlock, else `"false"`: the value `[FrameGen] AdaMfgUnlock` takes.
+///
+/// The fork's own note: "Optional built-in y4my4my4m RTX 40 MFG unlock.
+/// Memory-only, supported runtimes only." Memory-only is what makes it
+/// offerable here — there is no second download and nothing for the user to
+/// place by hand.
+fn ada_mfg() -> &'static str {
+    if install_extras().ada_mfg {
+        "true"
+    } else {
+        "false"
+    }
 }
 
 /// Which neural-upstream strength preset a scripted install seeds; read once
@@ -3082,9 +3230,11 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
         game::join_ci(d, &[game::FEEDER_MARKER]),
         game::join_ci(d, &[game::FEEDER_ADDON]),
         game::join_ci(d, &[game::DLSS5_ADDON]),
+        game::join_ci(d, &[game::DLSS5_ADDON_MARKER]),
         game::join_ci(d, &[game::DLSSNR_DLL]),
         game::join_ci(d, &[game::BRIDGE_ADDON]),
         game::join_ci(d, &[game::UPSTREAM_ADDON]),
+        game::join_ci(d, &[game::MFG_ADDON]),
         game::join_ci(d, &["dlss5-dx11-bridge.addon64"]),
         game::join_ci(&shaders, &[game::FEEDER_FX]),
         game::join_ci(d, &["reshade-shaders", "Textures", game::LUMENITE_BLUENOISE]),
@@ -3107,6 +3257,27 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
     if game::join_ci(d, &[game::DLSS_MARKER]).is_file() {
         targets.push(game::join_ci(d, &[game::DLSS_DLL]));
     }
+    // The frame-generation provider: ours goes, and the game's own comes back
+    // from .original if we moved it aside (#90). The restore happens below,
+    // once `removed` exists, so it can be reported.
+    // dgVoodoo: only a copy this tool downloaded goes, and its conf only when
+    // this tool created it rather than merging into the user's own. Leaving it
+    // behind meant a DX9 game that would not start still would not start after
+    // Remove, with nothing naming the file responsible (#91).
+    if let Ok(m) = fs::read_to_string(d.join(game::DGVOODOO_MARKER)) {
+        targets.push(d.join("d3d9.dll"));
+        targets.push(d.join(game::DGVOODOO_MARKER));
+        if m.lines().any(|l| l.trim() == "conf-ours") {
+            targets.push(d.join(game::DGVOODOO_CONF));
+        }
+    }
+    let restore_dlssg = d.join(game::DLSSG_MARKER).is_file();
+    if restore_dlssg {
+        targets.push(d.join(game::DLSSG_MARKER));
+        if !d.join(game::DLSSG_BACKUP).is_file() {
+            targets.push(d.join(game::DLSSG_DLL));
+        }
+    }
     // 32-bit layout: the in-game addon32 and everything in host64\.
     targets.push(game::join_ci(d, &[game::FEEDER_ADDON32]));
     let host = game::join_ci(d, &[game::HOST_DIR]);
@@ -3114,6 +3285,7 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
         for f in [
             game::HOST_EXE,
             game::DLSS5_ADDON,
+            game::DLSS5_ADDON_MARKER,
             game::DLSSNR_DLL,
             game::DLSSNR_MARKER,
             game::DLSS_MARKER,
@@ -3157,6 +3329,16 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
                     .to_string_lossy()
                     .replace('\\', "/"),
             );
+        }
+    }
+    if restore_dlssg {
+        let backup = d.join(game::DLSSG_BACKUP);
+        let dll = d.join(game::DLSSG_DLL);
+        if backup.is_file() {
+            let _ = fs::remove_file(&dll);
+            if fs::rename(&backup, &dll).is_ok() {
+                removed.push(format!("{} (the game's own restored)", game::DLSSG_DLL));
+            }
         }
     }
     if include.is_dir() && fs::read_dir(&include)?.next().is_none() {
@@ -3637,6 +3819,122 @@ mod tests {
             !agree("v0.16.0"),
             "a half-updated pair must not look current"
         );
+    }
+
+    /// RTX 40 MFG is one ini key and no extra files, so it can be offered as
+    /// part of an install. The Ampere/Turing key in the same section sideloads
+    /// a DLL with no published release and is deliberately never written (#83).
+    /// Remove left dgVoodoo's d3d9.dll in every DX9 game it had been installed
+    /// into, so a game that would not start still would not start afterwards,
+    /// and nothing said which file to delete (#91). Only a copy this tool
+    /// downloaded goes, and the conf only when this tool created it.
+    #[test]
+    fn removing_takes_our_dgvoodoo_out_and_leaves_a_user_s_alone() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe(&d.join("game.exe"), game::PE_X64);
+
+        // Ours, conf included.
+        fs::write(d.join("d3d9.dll"), b"dgVoodoo").unwrap();
+        fs::write(d.join(game::DGVOODOO_CONF), b"[General]\n").unwrap();
+        fs::write(
+            d.join(game::DGVOODOO_MARKER),
+            format!("{DGVOODOO_TAG}\nconf-ours\n"),
+        )
+        .unwrap();
+        uninstall(&exe).unwrap();
+        assert!(!d.join("d3d9.dll").exists());
+        assert!(!d.join(game::DGVOODOO_CONF).exists());
+        assert!(!d.join(game::DGVOODOO_MARKER).exists());
+
+        // Ours, but the conf was the user's before we merged into it.
+        fs::write(d.join("d3d9.dll"), b"dgVoodoo").unwrap();
+        fs::write(d.join(game::DGVOODOO_CONF), b"[General]\n").unwrap();
+        fs::write(d.join(game::DGVOODOO_MARKER), format!("{DGVOODOO_TAG}\n")).unwrap();
+        uninstall(&exe).unwrap();
+        assert!(!d.join("d3d9.dll").exists());
+        assert!(d.join(game::DGVOODOO_CONF).is_file(), "their conf stays");
+
+        // Someone else's d3d9.dll, no marker: untouched.
+        fs::write(d.join("d3d9.dll"), b"theirs").unwrap();
+        uninstall(&exe).unwrap();
+        assert_eq!(fs::read(d.join("d3d9.dll")).unwrap(), b"theirs");
+    }
+
+    /// The MFG add-on validates the frame-generation provider by build and
+    /// refuses anything else, so ours goes in and the game's own is kept as
+    /// .original — Remove has to put that back, not delete it (#90).
+    #[test]
+    fn removing_the_mfg_provider_restores_the_game_s_own() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe(&d.join("game.exe"), game::PE_X64);
+        fs::write(d.join(game::DLSSG_DLL), b"ours").unwrap();
+        fs::write(d.join(game::DLSSG_BACKUP), b"the game's").unwrap();
+        fs::write(d.join(game::DLSSG_MARKER), b"dlssg-310.9.1").unwrap();
+
+        uninstall(&exe).unwrap();
+        assert_eq!(
+            fs::read(d.join(game::DLSSG_DLL)).unwrap(),
+            b"the game's",
+            "the game's provider must come back"
+        );
+        assert!(!d.join(game::DLSSG_BACKUP).exists());
+        assert!(!d.join(game::DLSSG_MARKER).exists());
+
+        // With no backup, ours is simply removed.
+        fs::write(d.join(game::DLSSG_DLL), b"ours").unwrap();
+        fs::write(d.join(game::DLSSG_MARKER), b"dlssg-310.9.1").unwrap();
+        uninstall(&exe).unwrap();
+        assert!(!d.join(game::DLSSG_DLL).exists());
+    }
+
+    /// The OptiScaler route writes an ini key; the ReShade route needs the
+    /// separate add-on, because the fork's built-in unlock reported "DLSSG not
+    /// patched: capability not matched" on the reporter's machine (#83). The
+    /// add-on is an .addon64, so a 32-bit game never gets it.
+    #[test]
+    fn mfg_addon_is_planned_on_the_reshade_route_only() {
+        let st = game::stub_status(game::Mode::Native, game::Api::Dx12);
+        let named = |v: &[Step]| -> Vec<&'static str> { v.iter().map(|s| s.name).collect() };
+        let mfg = Extras {
+            ada_mfg: true,
+            ..Default::default()
+        };
+
+        assert!(!named(&plan_with(&st, Engine::ReShade, Extras::default())).contains(&STEP_MFG.name));
+
+        let reshade = named(&plan_with(&st, Engine::ReShade, mfg));
+        assert!(reshade.contains(&STEP_MFG.name), "{reshade:?}");
+        // Ahead of ReShade config, which writes the add-on list.
+        let at = reshade.iter().position(|n| *n == STEP_MFG.name).unwrap();
+        let cfg = reshade.iter().position(|n| *n == STEP_CONFIG.name).unwrap();
+        assert!(at < cfg, "{reshade:?}");
+        // The OptiScaler route has its own ini key and must not fetch it.
+        assert!(!named(&plan_with(&st, Engine::Opti, mfg)).contains(&STEP_MFG.name));
+    }
+
+    #[test]
+    fn ada_mfg_is_written_and_ampere_is_left_alone() {
+        assert_eq!(ada_mfg(), "false");
+        {
+            let _run = InstallScope::enter(
+                quality_preset::fallback_medium(),
+                Extras {
+                    ada_mfg: true,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(ada_mfg(), "true");
+        }
+        assert_eq!(ada_mfg(), "false");
+
+        let ini = "[FrameGen]\nAdaMfgUnlock=false\nAmpereMfgUnlock=false\n";
+        let out = set_ini_key(ini, "FrameGen", "AdaMfgUnlock", "true").unwrap();
+        assert!(out.contains("AdaMfgUnlock=true"), "{out}");
+        // The two are mutually exclusive upstream: "Never combine with
+        // AdaMfgUnlock or an external MFG unlocker."
+        assert!(out.contains("AmpereMfgUnlock=false"), "{out}");
     }
 
     #[test]
@@ -4456,6 +4754,53 @@ RestoreComputeSignature=true
             .iter()
             .any(|s| s == "OptiScaler v1.0.0 → v1.1.0"));
         assert!(installed_opti_presr(d));
+    }
+
+    /// The two builds number their releases independently, so the pre-SR fork's
+    /// v0.7.7 was compared against the stable build's v0.2.0-dlssnr and reported
+    /// an update on every single run, which Install could never clear (#88).
+    #[test]
+    fn the_presr_fork_is_compared_against_its_own_releases() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let latest = Latest {
+            reshade: None,
+            feeder: None,
+            opti: Some("v0.2.0-dlssnr".into()),
+            opti_presr: Some("v0.7.7".into()),
+            dlss: None,
+            dlssnr: None,
+        };
+
+        // Current pre-SR install: the repo line settles it.
+        fs::write(
+            d.join(game::OPTI_MANIFEST),
+            "# tag v0.7.7\n# repo wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass\ndxgi.dll\n",
+        )
+        .unwrap();
+        assert!(stale_components(d, &latest).is_empty());
+
+        // Behind on the pre-SR fork: named against that fork's newest.
+        fs::write(
+            d.join(game::OPTI_MANIFEST),
+            "# tag v0.7.6\n# repo wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass\ndxgi.dll\n",
+        )
+        .unwrap();
+        assert_eq!(
+            stale_components(d, &latest),
+            vec!["OptiScaler v0.7.6 → v0.7.7".to_string()]
+        );
+
+        // A manifest from before the repo line: the stable build's tags all end
+        // in "-dlssnr", so the shape of the tag says which build it is.
+        fs::write(d.join(game::OPTI_MANIFEST), "# tag v0.7.7\ndxgi.dll\n").unwrap();
+        assert!(stale_components(d, &latest).is_empty());
+        fs::write(
+            d.join(game::OPTI_MANIFEST),
+            "# tag v0.2.0-dlssnr\ndxgi.dll\n",
+        )
+        .unwrap();
+        assert!(stale_components(d, &latest).is_empty());
     }
 
     /// The manifest carries the tag on a comment line, and older manifests

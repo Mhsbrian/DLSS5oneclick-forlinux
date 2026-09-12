@@ -174,7 +174,9 @@ fn diagnose_with(st: &GameStatus, proton: bool) -> Vec<Finding> {
             "The game ships its own d3dcompiler_47.dll ({ver}), which Windows loads instead of \
              System32's. If it predates shader model 5.1 the DLSS 5 pass cannot compile \
              (error X3506). Rename it to d3dcompiler_47.dll.bak and start the game again; \
-             almost every game runs fine on the system copy."
+             almost every game runs fine on the system copy. On Wine/Proton, leave it: a \
+             copy of Microsoft's compiler beside the game, loaded through a WINEDLLOVERRIDES \
+             entry, is what got DLSS 5 compiling there at all (#76)."
         )));
     }
 
@@ -441,12 +443,15 @@ fn diagnose_with(st: &GameStatus, proton: bool) -> Vec<Finding> {
         let mut t = format!(
             "The effects failed to compile in Wine/Proton's own HLSL compiler: {line} \
              That message comes from vkd3d-shader, which Wine's d3dcompiler_47.dll uses; \
-             ReShade emits attributes it has not implemented. Install Microsoft's real \
-             d3dcompiler_47 into the prefix — protontricks <appid> d3dcompiler_47, or \
-             winetricks d3dcompiler_47 (Install does this itself for a Steam game when \
-             either is installed) — and start the game again. If the game shipped its \
-             own d3dcompiler_47.dll, leave it in place: under Proton it may be the only \
-             working compiler there is."
+             ReShade emits attributes it has not implemented. What a reporter measured working \
+             (#76, Proton 10.0-4, Elden Ring, no launch options at all): put a copy of \
+             Microsoft's real d3dcompiler_47.dll in the game folder, beside the executable. \
+             The feed then reports it as \"not System32, but it accepts cs_5_1 -- fine\" and \
+             the effects compile. If the prefix still loads Wine's copy instead, add \
+             WINEDLLOVERRIDES=\"d3dcompiler_47=n\" %command% to the launch options; \
+             protontricks <appid> d3dcompiler_47 (or winetricks d3dcompiler_47) puts the real \
+             one in the prefix if you do not have a copy to hand (Install does this itself for \
+             a Steam game when either is installed)."
         );
         if let Some(nr) = nr_pass_failed {
             t.push_str(&format!(
@@ -677,6 +682,36 @@ fn diagnose_with(st: &GameStatus, proton: bool) -> Vec<Finding> {
                  the release it came from, so this cannot happen silently.",
                 line.trim()
             )));
+        }
+        // The host warns when the add-on's version and the driver are a pair it
+        // has measured failing. Every build of that add-on carries the same
+        // embedded FileVersion (0.2026.0828.0517 in 4.55 and 4.70 alike), so
+        // the warning fires on the classic build too — the one the host's own
+        // text calls a way through. Only the tag this tool recorded can say
+        // which build is actually on disk (#69, and upstream DLSS5-Feeder#90).
+        if fd.contains("is a combination measured to fail")
+            || read(&st.consumer_dir(), "dlss5-feed-host.log")
+                .as_deref()
+                .is_some_and(|l| l.contains("is a combination measured to fail"))
+        {
+            let tag = read(&st.consumer_dir(), crate::game::DLSS5_ADDON_MARKER)
+                .map(|t| t.trim().to_owned())
+                .unwrap_or_default();
+            if tag == crate::installer::RENODX_CLASSIC_TAG {
+                out.push(ok(format!(
+                    "The host warns that this add-on build and your driver are a combination it \
+                     measured failing. You are already on the classic build it recommends \
+                     ({tag}) — every build of that add-on reports the same FileVersion, so the \
+                     host cannot tell them apart and warns either way. Nothing to do here."
+                )));
+            } else {
+                out.push(warn(format!(
+                    "The host measured this add-on build failing on your driver. Run Install \
+                     again: it reads that verdict out of this log and pins the classic build \
+                     ({}) by itself.",
+                    crate::installer::RENODX_CLASSIC_TAG
+                )));
+            }
         }
         // The create faults inside the driver rather than returning a code. The
         // feed catches it, cannot retry (the consumer's own locks were skipped
@@ -1312,6 +1347,11 @@ mod tests {
             !f.iter().any(|x| x.text.contains("d3dcompiler_47.dll.bak")),
             "{f:?}"
         );
+        // The recipe a reporter measured working, not just "install a compiler" (#76).
+        assert!(
+            f.iter().any(|x| x.text.contains("WINEDLLOVERRIDES")),
+            "{f:?}"
+        );
     }
 
     /// Dying Light refuses the reduced work-resolution path. The user sees a
@@ -1515,6 +1555,46 @@ mod tests {
         let f = diagnose_with(&game::inspect(&exe).unwrap(), true);
         assert!(!f.iter().any(|x| x.text.contains("nvngx_dlss.dll.off")), "{f:?}");
         assert!(f.iter().any(|x| x.text.contains("Do NOT do that here")), "{f:?}");
+    }
+
+    /// The host's warning keys on a FileVersion every build of that add-on
+    /// shares, so it fires on the classic build the host itself recommends.
+    /// Only the tag this tool recorded can tell them apart (#69).
+    #[test]
+    fn the_measured_to_fail_warning_reads_the_recorded_tag() {
+        let (t, exe) = setup(true);
+        fs::write(
+            t.path().join("ReShade.log"),
+            "Initializing crosire's ReShade\nRegistered add-on \"DLSS 5 Neural Rendering\"\n",
+        )
+        .unwrap();
+        fs::write(
+            t.path().join("dlss5-feed.log"),
+            "[feed] WARNING: renodx-dlss5 v4.6 with NVIDIA driver 616.64 is a combination \
+             measured to fail\n",
+        )
+        .unwrap();
+
+        // No tag on disk: the advice is to re-run Install, which pins it.
+        let f = run(&exe).unwrap();
+        assert!(
+            f.iter()
+                .any(|x| x.level == Level::Warn && x.text.contains("pins the classic build")),
+            "{f:?}"
+        );
+
+        // Already pinned: say so instead of sending them round again.
+        fs::write(
+            t.path().join(crate::game::DLSS5_ADDON_MARKER),
+            crate::installer::RENODX_CLASSIC_TAG,
+        )
+        .unwrap();
+        let f = run(&exe).unwrap();
+        assert!(
+            f.iter()
+                .any(|x| x.level == Level::Ok && x.text.contains("cannot tell them apart")),
+            "{f:?}"
+        );
     }
 
     #[test]

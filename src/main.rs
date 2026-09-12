@@ -549,6 +549,7 @@ fn cli(
         // (DLSS5ONECLICK_RENODX_TAG names an add-on build directly.)
         opti_presr: installer::opti_presr_from_env(),
         classic_addon: false,
+        ada_mfg: installer::ada_mfg_from_env(),
         upstream_preset: if upstream {
             installer::upstream_preset_from_env()
         } else {

@@ -380,7 +380,7 @@ pub fn host_context(st: &crate::game::GameStatus) -> crate::diagnose::HostContex
         nvngx_wine_dir: nvngx_wine_dir(),
         driver_version: crate::gpu::driver_version(),
         steam_running: steam::is_running(),
-        mfg_installed: st.mfg,
+        mfg_installed: st.mfg_asi,
         ..HostContext::default()
     };
     let proton = entry.as_ref().and_then(|e| {
@@ -422,7 +422,7 @@ pub fn host_context(st: &crate::game::GameStatus) -> crate::diagnose::HostContex
             if let Some(cd) = steam::compatdata(&g) {
                 ctx.prefix_nvngx =
                     Some(cd.join("pfx/drive_c/windows/system32/nvngx.dll").is_file());
-                if st.mfg {
+                if st.mfg_asi {
                     ctx.mfg_log_tail = newest_mfg_log_tail(&cd);
                 }
                 // Only relevant while the NR add-on is installed: a crash left

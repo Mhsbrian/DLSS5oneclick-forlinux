@@ -154,6 +154,8 @@ pub struct App {
     /// ReShade route: pin the classic DLSS 5 add-on build, which the Feeder's
     /// host measured to work on NVIDIA 616.64 where the current one faults (#69).
     renodx_classic: bool,
+    /// OptiScaler route, RTX 40 only: the fork's built-in MFG unlock (#83).
+    ada_mfg: bool,
     renodx: RenodxLookup,
     renodx_rx: Option<Receiver<RenodxLookup>>,
     /// Exe the current lookup belongs to, so a refresh does not re-fetch.
@@ -309,6 +311,7 @@ impl App {
             upstream_preset: 3,
             opti_presr: false,
             renodx_classic: false,
+            ada_mfg: false,
             renodx: RenodxLookup::Idle,
             renodx_rx: None,
             renodx_for: None,
@@ -401,6 +404,11 @@ impl App {
             self.working_scale = dir.and_then(installer::opti_working_scale).unwrap_or(1.0);
             self.opti_presr = dir.is_some_and(installer::installed_opti_presr);
             self.remix_swap_on = false;
+            // The MFG tick belongs to the game, not to the session: a game that
+            // already has the add-on comes back ticked, so re-running Install
+            // does not silently drop it (#83). Remove takes the file away, and
+            // the tick follows it.
+            self.ada_mfg = matches!(&self.status, Some(Ok(s)) if s.mfg);
             self.start_renodx_lookup();
         }
         self.reload_knobs_and_perf();
@@ -500,6 +508,7 @@ impl App {
             remix_swap: self.remix_swap_on,
             opti_presr: self.opti_presr,
             classic_addon: self.renodx_classic,
+            ada_mfg: self.ada_mfg,
             upstream_preset: if self.upstream_on {
                 self.upstream_preset
             } else {
@@ -1292,7 +1301,7 @@ const TILE_RENODX: Tile = Tile {
 const TILE_MFG: Tile = Tile {
     title: "RTX 40 DLSS MFG unlock",
     detail: "multi-frame-gen 2X–6X · ReShade → DLSS MFG · experimental under Proton",
-    ok: |s| s.mfg,
+    ok: |s| s.mfg_asi,
     optional: true,
 };
 
@@ -1348,7 +1357,7 @@ fn tiles_for(
     if renodx_on || st.is_some_and(|s| s.renodx_mod.is_some()) {
         v.push(&TILE_RENODX);
     }
-    if mfg_on || st.is_some_and(|s| s.mfg) {
+    if mfg_on || st.is_some_and(|s| s.mfg_asi) {
         v.push(&TILE_MFG);
     }
     v
@@ -3202,13 +3211,37 @@ impl eframe::App for App {
                     let cb = egui::Checkbox::new(
                         &mut on,
                         RichText::new(
-                            "Black screen, crash or driver reset with DLSS 5 on? Install the classic add-on build (4.55)",
+                            "Black screen, crash, driver reset, or worse image than before? Install the classic add-on build (4.55)",
                         )
                         .font(t::plex(11.5))
                         .color(t::TEXT_SOFT),
                     );
                     if ui.add_enabled(!self.running, cb).changed() {
                         self.renodx_classic = on;
+                    }
+                }
+                // RTX 40 multi-frame generation on the ReShade route: a single
+                // MIT add-on, in-memory only. OptiScaler's own built-in unlock
+                // reported "DLSSG not patched: capability not matched" on the
+                // reporter's machine while this one reached 6X (#83).
+                if self.engine == Engine::ReShade
+                    && ok_status.as_ref().is_some_and(|s| !s.is32())
+                    && ok_status
+                        .as_ref()
+                        .and_then(|s| s.gpu.as_ref())
+                        .is_some_and(|(_, t)| *t == crate::gpu::Tier::Rtx40)
+                {
+                    let mut on = self.ada_mfg;
+                    let cb = egui::Checkbox::new(
+                        &mut on,
+                        RichText::new(
+                            "Unlock RTX 40 multi-frame generation (3X and above, up to 6X) — the game must have frame generation of its own",
+                        )
+                        .font(t::plex(11.5))
+                        .color(t::TEXT_SOFT),
+                    );
+                    if ui.add_enabled(!self.running, cb).changed() {
+                        self.ada_mfg = on;
                     }
                 }
                 if let Some(ac) = ok_status.as_ref().and_then(|s| s.anticheat) {
@@ -3371,6 +3404,29 @@ impl eframe::App for App {
                         .font(t::plex(11.0))
                         .color(t::TEXT_DIM),
                     );
+                    // RTX 40 only: the 50 series has multi-frame generation of
+                    // its own, and the Ampere/Turing unlock in the same ini
+                    // needs a DLL nobody publishes, so it is not offered (#83).
+                    if self.opti_presr
+                        && ok_status
+                            .as_ref()
+                            .and_then(|s| s.gpu.as_ref())
+                            .is_some_and(|(_, t)| *t == crate::gpu::Tier::Rtx40)
+                    {
+                        ui.add_space(6.0);
+                        let mut on = self.ada_mfg;
+                        let cb = egui::Checkbox::new(
+                            &mut on,
+                            RichText::new(
+                                "RTX 40 multi-frame generation \u{2014} built into this build, no extra files. The game must have frame generation of its own.",
+                            )
+                            .font(t::plex(11.5))
+                            .color(t::TEXT_SOFT),
+                        );
+                        if ui.add_enabled(!self.running, cb).changed() {
+                            self.ada_mfg = on;
+                        }
+                    }
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
@@ -3643,7 +3699,7 @@ impl eframe::App for App {
                         let dim = |ui: &mut egui::Ui, text: String| {
                             ui.label(RichText::new(text).font(t::plex(11.0)).color(t::TEXT_DIM));
                         };
-                        if s.mfg {
+                        if s.mfg_asi {
                             dim(ui, "— installed (Remove takes it out too)".into());
                         } else {
                             match crate::mfg::eligible(s) {
@@ -3802,11 +3858,17 @@ impl eframe::App for App {
                             }
                         }
                     }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let missing = ok_status
-                            .as_ref()
-                            .map(installer::missing_install_files)
-                            .unwrap_or_default();
+                });
+                // The status line used to sit in a right-to-left layout on the
+                // button row. "Incomplete: missing <every file>" does not wrap
+                // there: it ran leftwards straight over Install, Remove and
+                // Diagnose, took the clicks, and pushed a horizontal scrollbar
+                // onto the page (#77). Its own row, wrapped, cannot do that.
+                {
+                    let missing = ok_status
+                        .as_ref()
+                        .map(installer::missing_install_files)
+                        .unwrap_or_default();
                         let stale = self
                             .exe()
                             .and_then(|e| {
@@ -3836,12 +3898,19 @@ impl eframe::App for App {
                         } else {
                             t::ACCENT
                         };
-                        ui.label(RichText::new(msg).font(t::plex_medium(12.0)).color(color));
-                    });
-                });
+                    if !msg.is_empty() {
+                        ui.add_space(6.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(msg).font(t::plex_medium(12.0)).color(color),
+                            )
+                            .wrap(),
+                        );
+                    }
+                }
                 // Tools that read or explain an install rather than change it,
-                // on a row of their own: with the status line they do not fit
-                // beside Install / Remove / Diagnose at the minimum width.
+                // on a row of their own: seven buttons do not fit one row at the
+                // window's minimum width.
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;

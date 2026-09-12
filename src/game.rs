@@ -24,6 +24,25 @@ pub const DLSS_DLL: &str = "nvngx_dlss.dll";
 pub const LUMENITE_KERNEL_FX: &str = "lumenite_Kernel.fx";
 pub const LUMENITE_BLUENOISE: &str = "lumenite_bluenoise256.png";
 pub const BRIDGE_ADDON: &str = "dlss5-bridge.addon64";
+/// mavismmg/MFGAdaUnlock-RenoDx: a ReShade add-on that lifts NVIDIA's RTX 50
+/// gate on multi-frame generation and corrects the temporal midpoint, entirely
+/// in mapped memory. One file, MIT, nothing in the game folder modified.
+pub const MFG_ADDON: &str = "renodx-mfgunlock.addon64";
+/// NVIDIA's frame-generation runtime. The MFG add-on validates this provider by
+/// build and refuses anything it does not know, so the version beside the game
+/// decides whether the unlock does anything at all.
+pub const DLSSG_DLL: &str = "nvngx_dlssg.dll";
+pub const DLSSG_MARKER: &str = "nvngx_dlssg.dll.dlss5oneclick";
+/// The game's own provider, moved aside before ours goes in. Never deleted:
+/// Remove puts it back.
+pub const DLSSG_BACKUP: &str = "nvngx_dlssg.dll.original";
+/// Sidecar for a dgVoodoo `d3d9.dll` this tool downloaded. Remove used to leave
+/// dgVoodoo behind on every DX9 game, so a game that would not start kept not
+/// starting after Remove and there was nothing saying which file to delete (#91).
+/// A second line, `conf-ours`, marks a `dgVoodoo.conf` this tool created rather
+/// than merged into someone's existing one.
+pub const DGVOODOO_MARKER: &str = "d3d9.dll.dlss5oneclick";
+pub const DGVOODOO_CONF: &str = "dgVoodoo.conf";
 /// matiasLombo's neural-upstream add-on. The name is not ours to choose: the
 /// NGX snippet gates feature creation on the calling module's path containing
 /// `nvngx.dll`, and under any other name it returns 0xBAD00002 and does nothing.
@@ -36,6 +55,11 @@ pub const DLSS_MARKER: &str = "nvngx_dlss.dll.dlss5oneclick";
 /// tool placed, so Install can tell "ours and stale" from "the user's own".
 pub const DLSSNR_MARKER: &str = "nvngx_dlssnr.dll.dlss5oneclick";
 pub const RESHADE_MARKER: &str = "dxgi.dll.dlss5oneclick";
+/// The DLSS 5 add-on release tag this tool placed. Every build carries the same
+/// embedded FileVersion (0.2026.0828.0517 in 4.55 and 4.70 alike), so the
+/// Feeder's host names them all "v4.6 engine" and warns about a combination the
+/// classic build is not part of. The tag is the only way to tell them apart.
+pub const DLSS5_ADDON_MARKER: &str = "renodx-dlss5.addon64.dlss5oneclick";
 /// The DLSS5-Feeder release tag this tool placed, so a stale install can be
 /// spotted without downloading the zip to compare sizes.
 pub const FEEDER_MARKER: &str = "dlss5-feed.dlss5oneclick";
@@ -886,6 +910,8 @@ pub struct GameStatus {
     pub reframework: bool,
     /// matiasLombo's neural-upstream add-on is in the folder.
     pub upstream: bool,
+    /// The RTX 40 multi-frame-generation add-on is already beside the game.
+    pub mfg: bool,
     /// Unreal-style layout / Shipping exe (heuristic).
     pub unreal_likely: bool,
     /// UnityPlayer.dll present (heuristic).
@@ -896,8 +922,9 @@ pub struct GameStatus {
     pub renodx_mod: Option<String>,
     /// Other RenoDX game mods found in the folder (not ours, not the DLSS 5 add-on).
     pub foreign_renodx: Vec<String>,
-    /// RTX 40 DLSS MFG unlock installed by this tool (its manifest is present).
-    pub mfg: bool,
+    /// dashdogy's RTX 40 MFG unlock (ASI loader under a proxy DLL) installed by
+    /// this tool: its manifest is present.
+    pub mfg_asi: bool,
     /// Game ships Streamline DLSS Frame Generation (what MFG multiplies).
     pub has_fg: bool,
     /// Anti-cheat found (files or exe name), whether or not the refusal is overridden.
@@ -942,13 +969,14 @@ pub(crate) fn stub_status(mode: Mode, api: Api) -> GameStatus {
         re_engine: false,
         reframework: false,
         upstream: false,
+        mfg: false,
         unreal_likely: false,
         unity_likely: false,
         rt_likely: false,
         renodx_mod: None,
         foreign_renodx: vec![],
         anticheat: None,
-        mfg: false,
+        mfg_asi: false,
         has_fg: false,
         remix: None,
         remix_model: false,
@@ -1232,6 +1260,7 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         bridge: file_ci(d, BRIDGE_ADDON) || file_ci(d, "dlss5-dx11-bridge.addon64"),
         opti: file_ci(d, OPTI_MANIFEST),
         upstream: file_ci(d, UPSTREAM_ADDON),
+        mfg: file_ci(d, MFG_ADDON),
         gpu,
         exe: exe.to_path_buf(),
         bitness,
@@ -1252,7 +1281,7 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         rt_likely: rt_likely(d),
         renodx_mod: renodx_mod.clone(),
         foreign_renodx: crate::renodx::foreign_mods(d, renodx_mod.as_deref()),
-        mfg: file_ci(d, crate::mfg::MFG_MANIFEST),
+        mfg_asi: file_ci(d, crate::mfg::MFG_MANIFEST),
         has_fg: crate::mfg::has_streamline_fg(d),
         anticheat,
         remix,
@@ -1413,15 +1442,18 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
                 score += 500_000_000;
             }
             score += size.min(400_000_000);
+            // A 32-bit exe sitting beside a 64-bit one is usually a tool, so a
+            // 64-bit candidate still outranks every 32-bit one. It used to
+            // *delete* them, which hid the real game: Prince of Persia: The Two
+            // Thrones keeps a 64-bit launcher named after the folder next to the
+            // 32-bit game, and the game could not be chosen at all (#89). They
+            // are ranked, not discarded, so the exe picker still offers them.
+            if bits == 64 {
+                score += 8_000_000_000;
+            }
             Some((bits, score, p))
         })
         .collect();
-    // A 32-bit exe sitting beside a 64-bit one is a tool, not the game, so
-    // 64-bit wins whenever one exists. Only a folder with nothing 64-bit in it
-    // (Max Payne, #17) falls back to 32-bit.
-    if scored.iter().any(|s| s.0 == 64) {
-        scored.retain(|s| s.0 == 64);
-    }
     scored.sort_by_key(|s| std::cmp::Reverse(s.1));
     scored.into_iter().map(|(_, _, p)| p).collect()
 }
@@ -1882,6 +1914,23 @@ mod tests {
         assert_eq!(find_game_exes(&d), vec![d.join("maxpayne.exe")]);
     }
 
+    /// Prince of Persia: The Two Thrones ships a 64-bit launcher named after
+    /// the folder beside the 32-bit game. The 64-bit one still wins by default,
+    /// but the game must stay in the list or it cannot be chosen at all (#89).
+    #[test]
+    fn a_thirty_two_bit_game_stays_listed_behind_a_64_bit_launcher() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("Prince of Persia Two Thrones");
+        fs::create_dir_all(&d).unwrap();
+        let launcher = d.join("PrinceOfPersia.exe");
+        let game = d.join("PoP3.exe");
+        make_pe(&launcher, PE_X64);
+        make_pe(&game, PE_X86);
+        let found = find_game_exes(&d);
+        assert_eq!(found.first(), Some(&launcher), "{found:?}");
+        assert!(found.contains(&game), "{found:?}");
+    }
+
     /// A named .exe is an instruction. Searching outward from it and picking a
     /// "better" candidate installed into a different game entirely — the tool
     /// wrote to a sibling folder's exe when handed one under a shared parent.
@@ -1985,10 +2034,12 @@ mod tests {
         make_pe(&d.join("tool32.exe"), PE_X86);
         make_pe(&d.join("Fell & Sell.exe"), PE_X64);
         let c = find_game_exes(&d);
-        assert_eq!(c, vec![d.join("Fell & Sell.exe")]);
-        let (exe, all) = resolve_target(&d).unwrap();
+        // The helper is dropped by name; the 32-bit tool is ranked last rather
+        // than hidden, because hiding every 32-bit exe hid real games (#89).
+        assert_eq!(c.first(), Some(&d.join("Fell & Sell.exe")), "{c:?}");
+        assert!(!c.contains(&d.join("UnityCrashHandler64.exe")), "{c:?}");
+        let (exe, _all) = resolve_target(&d).unwrap();
         assert_eq!(exe, d.join("Fell & Sell.exe"));
-        assert_eq!(all.len(), 1);
     }
 
     /// Satisfactory (Epic): the launcher names FactoryGameEGS.exe in the root,
