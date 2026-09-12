@@ -300,6 +300,9 @@ pub struct Latest {
     pub reshade: Option<String>,
     pub feeder: Option<String>,
     pub opti: Option<String>,
+    /// wilsjo2's pre-SR fork numbers its releases on its own, so its newest tag
+    /// has to be carried separately from the stable build's.
+    pub opti_presr: Option<String>,
     pub dlss: Option<String>,
     pub dlssnr: Option<String>,
 }
@@ -310,6 +313,7 @@ impl Latest {
             reshade: resolve_reshade_setup(client).ok().map(|(v, _)| v),
             feeder: net::latest_tag(client, FEEDER_REPO).ok(),
             opti: net::latest_tag(client, OPTI_REPO).ok(),
+            opti_presr: net::latest_tag(client, OPTI_PRESR_REPO).ok(),
             dlss: rhi_latest(client, "dlss-").ok().map(|(t, _)| t),
             dlssnr: rhi_latest(client, "dlssnr-").ok().map(|(t, _)| t),
         }
@@ -403,7 +407,18 @@ pub fn stale_components(dir: &Path, latest: &Latest) -> Vec<String> {
         &latest.dlssnr,
     );
     if let Ok(m) = fs::read_to_string(dir.join(game::OPTI_MANIFEST)) {
-        match (manifest_tag(&m), &latest.opti) {
+        // Compare against the repo this install came from. Comparing a pre-SR
+        // tag (v0.7.7) with the stable build's (v0.2.0-dlssnr) reported an
+        // update on every run, and Install wrote the same tag back, so the
+        // notice never cleared (#88). Older manifests carry no repo line; the
+        // stable build's tags all end in "-dlssnr", which tells them apart.
+        let want = match manifest_repo(&m) {
+            Some(r) if r == OPTI_PRESR_REPO => &latest.opti_presr,
+            Some(_) => &latest.opti,
+            None if manifest_tag(&m).is_some_and(|t| !t.ends_with("-dlssnr")) => &latest.opti_presr,
+            None => &latest.opti,
+        };
+        match (manifest_tag(&m), want) {
             (Some(have), Some(want)) if have.trim() != want.trim() => {
                 out.push(format!("OptiScaler {} → {want}", have.trim()))
             }
@@ -420,6 +435,15 @@ fn manifest_tag(manifest: &str) -> Option<String> {
     manifest
         .lines()
         .find_map(|l| l.strip_prefix("# tag "))
+        .map(|t| t.trim().to_owned())
+}
+
+/// The repo an OptiScaler manifest was installed from, from its `# repo …`
+/// header. Absent in manifests written before 0.13.15.
+fn manifest_repo(manifest: &str) -> Option<String> {
+    manifest
+        .lines()
+        .find_map(|l| l.strip_prefix("# repo "))
         .map(|t| t.trim().to_owned())
 }
 
@@ -593,9 +617,11 @@ fn step_opti(
         }
         fs::write(&ini, cur)?;
     }
+    // The repo goes in beside the tag: the two builds number their releases
+    // independently, so a tag alone cannot say whether v0.7.7 is current (#88).
     let header = latest
         .as_deref()
-        .map(|t| format!("# tag {t}\n"))
+        .map(|t| format!("# tag {t}\n# repo {}\n", opti_repo()))
         .unwrap_or_default();
     fs::write(
         d.join(game::OPTI_MANIFEST),
@@ -3522,6 +3548,7 @@ RestoreComputeSignature=true
             reshade: Some("6.8.0".into()),
             feeder: Some("v0.13.1-beta.1".into()),
             opti: Some("v0.2.0-dlssnr".into()),
+            opti_presr: Some("v0.7.7".into()),
             dlss: Some("dlss-310.9.0".into()),
             dlssnr: Some("dlssnr-310.8.SF-v2".into()),
         };
@@ -3549,6 +3576,53 @@ RestoreComputeSignature=true
         assert!(stale_components(d, &latest)
             .iter()
             .any(|s| s == "OptiScaler unknown version → v0.2.0-dlssnr"));
+    }
+
+    /// The two builds number their releases independently, so the pre-SR fork's
+    /// v0.7.7 was compared against the stable build's v0.2.0-dlssnr and reported
+    /// an update on every single run, which Install could never clear (#88).
+    #[test]
+    fn the_presr_fork_is_compared_against_its_own_releases() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let latest = Latest {
+            reshade: None,
+            feeder: None,
+            opti: Some("v0.2.0-dlssnr".into()),
+            opti_presr: Some("v0.7.7".into()),
+            dlss: None,
+            dlssnr: None,
+        };
+
+        // Current pre-SR install: the repo line settles it.
+        fs::write(
+            d.join(game::OPTI_MANIFEST),
+            "# tag v0.7.7\n# repo wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass\ndxgi.dll\n",
+        )
+        .unwrap();
+        assert!(stale_components(d, &latest).is_empty());
+
+        // Behind on the pre-SR fork: named against that fork's newest.
+        fs::write(
+            d.join(game::OPTI_MANIFEST),
+            "# tag v0.7.6\n# repo wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass\ndxgi.dll\n",
+        )
+        .unwrap();
+        assert_eq!(
+            stale_components(d, &latest),
+            vec!["OptiScaler v0.7.6 → v0.7.7".to_string()]
+        );
+
+        // A manifest from before the repo line: the stable build's tags all end
+        // in "-dlssnr", so the shape of the tag says which build it is.
+        fs::write(d.join(game::OPTI_MANIFEST), "# tag v0.7.7\ndxgi.dll\n").unwrap();
+        assert!(stale_components(d, &latest).is_empty());
+        fs::write(
+            d.join(game::OPTI_MANIFEST),
+            "# tag v0.2.0-dlssnr\ndxgi.dll\n",
+        )
+        .unwrap();
+        assert!(stale_components(d, &latest).is_empty());
     }
 
     /// The manifest carries the tag on a comment line, and older manifests
