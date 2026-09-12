@@ -622,8 +622,17 @@ fn step_opti(
         // setting we can honestly turn on for someone. The Ampere/Turing
         // equivalent in the same ini sideloads a DLL that has no published
         // release, so it is deliberately not offered (#83).
-        if let Some(patched) = set_ini_key(&cur, "FrameGen", "AdaMfgUnlock", ada_mfg()) {
-            cur = patched;
+        // Only the pre-SR build knows the key, and only where the gate lets
+        // the unlock do anything; in Dagherbou's ini it would be a stray line.
+        if install_extras().opti_presr {
+            let value = if mfg_unavailable(st, Engine::Opti, true).is_none() {
+                ada_mfg()
+            } else {
+                "false"
+            };
+            if let Some(patched) = set_ini_key(&cur, "FrameGen", "AdaMfgUnlock", value) {
+                cur = patched;
+            }
         }
         // RE Engine trips its own scheduler assertion unless the compute root
         // signature is put back, and fights REFramework over WndProc unless
@@ -1064,6 +1073,17 @@ pub fn opti_working_scale(game_dir: &Path) -> Option<f32> {
         .filter(|f| (0.25..=2.0).contains(f))
 }
 
+/// Whether this game's OptiScaler.ini already has the pre-SR build's RTX 40
+/// MFG unlock on, so the tick opens on it and a reinstall keeps it.
+pub fn opti_ada_mfg(game_dir: &Path) -> bool {
+    fs::read_to_string(game::join_ci(game_dir, &[OPTI_INI]))
+        .ok()
+        .and_then(|t| {
+            get_ini_key(&t, "FrameGen", "AdaMfgUnlock").map(|v| v.eq_ignore_ascii_case("true"))
+        })
+        .unwrap_or(false)
+}
+
 /// `key`'s value in `[section]`, matched the way `set_ini_key` matches it.
 fn get_ini_key<'a>(ini: &'a str, section: &str, key: &str) -> Option<&'a str> {
     let header = format!("[{section}]");
@@ -1181,29 +1201,50 @@ fn step_renodx(
     renodx::install(client, &st.exe, &m, progress)
 }
 
-const STEP_MFG_ASI: Step = Step {
-    name: "RTX 40 DLSS MFG unlock",
-    run: step_mfg_asi,
+const STEP_MFG_ASI_CLEANUP: Step = Step {
+    name: "Take out the older RTX 40 MFG unlock",
+    run: step_mfg_asi_cleanup,
 };
 
-/// The optional RTX 40 DLSS Multi-Frame-Generation unlock (dashdogy, MIT). Only
-/// runs when the game is eligible; the plan includes it purely so --check can
-/// show it, so a non-eligible game just reports why and places nothing.
-fn step_mfg_asi(
-    client: &Client,
+/// dashdogy's unlock, which this fork shipped before adopting upstream's, must
+/// never run beside it: both patch frame generation in memory. Its manifest
+/// says exactly what to take out.
+fn step_mfg_asi_cleanup(
+    _c: &Client,
     st: &GameStatus,
-    _work: &Path,
+    _w: &Path,
     progress: Progress,
 ) -> Result<Vec<String>> {
-    match crate::mfg::eligible(st) {
-        crate::mfg::Eligibility::Ready(proxy) => {
-            crate::mfg::install(client, &st.exe, proxy, progress)
-        }
-        other => {
-            progress(100, other.reason());
-            Ok(vec![format!("MFG unlock skipped: {}", other.reason())])
-        }
+    progress(0, "Taking out the older RTX 40 MFG unlock");
+    let mut removed = Vec::new();
+    crate::mfg::uninstall(st.game_dir(), &mut removed)?;
+    Ok(removed)
+}
+
+/// Why RTX 40 multi-frame generation cannot be offered for this game on this
+/// route, or `None` when it can. The GUI shows it beside a disabled tick,
+/// `--check` prints it, and the plan will not place the unlock without it.
+pub fn mfg_unavailable(st: &GameStatus, engine: Engine, opti_presr: bool) -> Option<&'static str> {
+    use crate::gpu::Tier;
+    if st.remix.is_some() {
+        return Some("not on the RTX Remix route");
     }
+    match st.gpu.as_ref().map(|(_, t)| *t) {
+        Some(Tier::Rtx40) => {}
+        Some(Tier::Rtx50) => return Some("the RTX 50 series has multi-frame generation of its own"),
+        _ => return Some("it unlocks RTX 40 cards only"),
+    }
+    if !st.has_fg {
+        return Some("this game has no DLSS Frame Generation of its own to multiply");
+    }
+    if engine == Engine::Opti {
+        if !opti_presr {
+            return Some("on OptiScaler it is built into the experimental pre-SR build only");
+        }
+    } else if st.is32() {
+        return Some("the add-on is 64-bit and this is a 32-bit game");
+    }
+    None
 }
 
 /// `with_renodx` adds the game's RenoDX HDR mod after the DLSS 5 add-on. On
@@ -1216,8 +1257,6 @@ fn step_mfg_asi(
 pub struct Extras {
     /// Also install the game's RenoDX HDR mod after the DLSS 5 add-on.
     pub with_renodx: bool,
-    /// RTX 40 DLSS Multi-Frame-Generation unlock (ReShade routes).
-    pub with_mfg: bool,
     /// ReShade engine: run the experimental Neural Upstream consumer.
     pub upstream: bool,
     /// OptiScaler engine: turn on FSR 3.1 frame generation (any RTX card, D3D12).
@@ -1275,19 +1314,22 @@ pub fn plan_with(st: &GameStatus, engine: Engine, x: Extras) -> Vec<Step> {
         }
         v
     };
-    // RTX 40 multi-frame generation. On the OptiScaler route the fork writes
-    // its own ini key; on the ReShade route it is this separate add-on, which
-    // is what actually reached 6X for the reporter in #83. It is an .addon64,
-    // so a 32-bit game's ReShade could not load it.
-    if engine != Engine::Opti && x.ada_mfg && !st.is32() {
-        let at = v.len().saturating_sub(1); // before ReShade config
-        v.insert(at, STEP_MFG);
+    // RTX 40 multi-frame generation. On the OptiScaler route the pre-SR build
+    // writes its own ini key (step_opti); on the ReShade route it is this
+    // separate add-on, which is what actually reached 6X for the reporter in
+    // #83. The older dashdogy unlock comes out first on either route: the two
+    // patch the same thing in memory and must never run together.
+    if x.ada_mfg && mfg_unavailable(st, engine, x.opti_presr).is_none() {
+        if engine != Engine::Opti {
+            let at = v.len().saturating_sub(1); // before ReShade config
+            v.insert(at, STEP_MFG);
+        }
+        if st.mfg_asi {
+            v.insert(0, STEP_MFG_ASI_CLEANUP);
+        }
     }
     if st.re_engine {
         v.insert(0, STEP_REFRAMEWORK);
-    }
-    if x.with_mfg {
-        v.push(STEP_MFG_ASI);
     }
     // DX9 never loads dxgi.dll; dgVoodoo must sit in the game folder first.
     // Always run on Dx9 (even when the DLL is already present) so Install can
@@ -3895,7 +3937,9 @@ mod tests {
     /// add-on is an .addon64, so a 32-bit game never gets it.
     #[test]
     fn mfg_addon_is_planned_on_the_reshade_route_only() {
-        let st = game::stub_status(game::Mode::Native, game::Api::Dx12);
+        let mut st = game::stub_status(game::Mode::Native, game::Api::Dx12);
+        st.gpu = Some((rtx("RTX 4070"), crate::gpu::Tier::Rtx40));
+        st.has_fg = true;
         let named = |v: &[Step]| -> Vec<&'static str> { v.iter().map(|s| s.name).collect() };
         let mfg = Extras {
             ada_mfg: true,
@@ -3912,6 +3956,58 @@ mod tests {
         assert!(at < cfg, "{reshade:?}");
         // The OptiScaler route has its own ini key and must not fetch it.
         assert!(!named(&plan_with(&st, Engine::Opti, mfg)).contains(&STEP_MFG.name));
+    }
+
+    fn rtx(name: &str) -> crate::gpu::Gpu {
+        crate::gpu::Gpu {
+            name: name.into(),
+            vendor: "NVIDIA".into(),
+        }
+    }
+
+    /// Multi-frame generation is offered where it can do something: an RTX 40,
+    /// a game with frame generation of its own, a 64-bit ReShade route or the
+    /// pre-SR OptiScaler build. Planned, it takes the older dashdogy unlock out
+    /// first, since the two must never run together.
+    #[test]
+    fn mfg_is_offered_only_where_it_can_work() {
+        use crate::gpu::Tier;
+        let mut st = game::stub_status(game::Mode::Native, game::Api::Dx12);
+        st.gpu = Some((rtx("RTX 4090"), Tier::Rtx40));
+        assert!(mfg_unavailable(&st, Engine::ReShade, false).is_some(), "no FG of its own");
+        st.has_fg = true;
+        assert_eq!(mfg_unavailable(&st, Engine::ReShade, false), None);
+        assert!(mfg_unavailable(&st, Engine::Opti, false).is_some(), "stable OptiScaler has none");
+        assert_eq!(mfg_unavailable(&st, Engine::Opti, true), None);
+        st.bitness = 32;
+        assert!(mfg_unavailable(&st, Engine::ReShade, false).is_some(), "the add-on is 64-bit");
+        st.bitness = 64;
+        st.gpu = Some((rtx("RTX 5090"), Tier::Rtx50));
+        assert!(mfg_unavailable(&st, Engine::ReShade, false).is_some());
+        let x = Extras {
+            ada_mfg: true,
+            ..Default::default()
+        };
+        assert!(!plan_with(&st, Engine::ReShade, x).iter().any(|s| s.name == STEP_MFG.name));
+
+        st.gpu = Some((rtx("RTX 4090"), Tier::Rtx40));
+        st.mfg_asi = true;
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, x).iter().map(|s| s.name).collect();
+        let cleanup = names.iter().position(|n| *n == STEP_MFG_ASI_CLEANUP.name);
+        let mfg = names.iter().position(|n| *n == STEP_MFG.name);
+        assert!(cleanup.is_some() && mfg.is_some() && cleanup < mfg, "{names:?}");
+    }
+
+    /// The pre-SR build's unlock lives in OptiScaler.ini; the tick reads it back.
+    #[test]
+    fn opti_ada_mfg_reads_the_framegen_key() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        assert!(!opti_ada_mfg(d));
+        fs::write(d.join(OPTI_INI), "[FrameGen]\nAdaMfgUnlock=false\n").unwrap();
+        assert!(!opti_ada_mfg(d));
+        fs::write(d.join(OPTI_INI), "[FrameGen]\nAdaMfgUnlock=True\n").unwrap();
+        assert!(opti_ada_mfg(d));
     }
 
     #[test]

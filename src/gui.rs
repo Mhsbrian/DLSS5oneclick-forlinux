@@ -132,8 +132,6 @@ pub struct App {
     last_update_check: std::time::Instant,
     /// "Also install the RenoDX HDR mod" checkbox.
     renodx_on: bool,
-    /// "Also unlock RTX 40 DLSS MFG" checkbox.
-    mfg_on: bool,
     /// ReShade engine: run the experimental neural-upstream consumer instead of
     /// the stable RenoDX DLSS 5 add-on.
     upstream_on: bool,
@@ -154,7 +152,9 @@ pub struct App {
     /// ReShade route: pin the classic DLSS 5 add-on build, which the Feeder's
     /// host measured to work on NVIDIA 616.64 where the current one faults (#69).
     renodx_classic: bool,
-    /// OptiScaler route, RTX 40 only: the fork's built-in MFG unlock (#83).
+    /// RTX 40 multi-frame generation (#83): mavismmg's add-on on the ReShade
+    /// route, the pre-SR OptiScaler build's own unlock there. Opens on what the
+    /// game already has.
     ada_mfg: bool,
     renodx: RenodxLookup,
     renodx_rx: Option<Receiver<RenodxLookup>>,
@@ -303,7 +303,6 @@ impl App {
             compare: None,
             finishing_install: false,
             renodx_on: false,
-            mfg_on: false,
             upstream_on: false,
             fg_on: false,
             remix_swap_on: false,
@@ -396,7 +395,6 @@ impl App {
         if self.resolved_exe != self.renodx_for {
             self.renodx_for = self.resolved_exe.clone();
             self.renodx_on = false;
-            self.mfg_on = false;
             self.fg_on = false;
             // The dial and the OptiScaler build open on what this game already
             // has, so a reinstall keeps hand tuning and the fork it runs.
@@ -408,7 +406,11 @@ impl App {
             // already has the add-on comes back ticked, so re-running Install
             // does not silently drop it (#83). Remove takes the file away, and
             // the tick follows it.
-            self.ada_mfg = matches!(&self.status, Some(Ok(s)) if s.mfg);
+            // The older dashdogy unlock counts too, so re-running Install
+            // replaces it rather than dropping MFG; so does the pre-SR build's
+            // own switch in OptiScaler.ini.
+            self.ada_mfg = matches!(&self.status, Some(Ok(s)) if s.mfg || s.mfg_asi)
+                || dir.is_some_and(installer::opti_ada_mfg);
             self.start_renodx_lookup();
         }
         self.reload_knobs_and_perf();
@@ -501,7 +503,6 @@ impl App {
     fn extras(&self) -> installer::Extras {
         installer::Extras {
             with_renodx: self.renodx_on,
-            with_mfg: self.mfg_on,
             upstream: self.upstream_on,
             with_fg: self.fg_on,
             model_scale: Some(self.working_scale),
@@ -1299,9 +1300,9 @@ const TILE_RENODX: Tile = Tile {
 };
 
 const TILE_MFG: Tile = Tile {
-    title: "RTX 40 DLSS MFG unlock",
-    detail: "multi-frame-gen 2X–6X · ReShade → DLSS MFG · experimental under Proton",
-    ok: |s| s.mfg_asi,
+    title: "RTX 40 multi-frame generation",
+    detail: "MFG unlock add-on + newest frame-gen runtime · experimental under Proton",
+    ok: |s| s.mfg,
     optional: true,
 };
 
@@ -1357,7 +1358,7 @@ fn tiles_for(
     if renodx_on || st.is_some_and(|s| s.renodx_mod.is_some()) {
         v.push(&TILE_RENODX);
     }
-    if mfg_on || st.is_some_and(|s| s.mfg_asi) {
+    if mfg_on || st.is_some_and(|s| s.mfg || s.mfg_asi) {
         v.push(&TILE_MFG);
     }
     v
@@ -3223,15 +3224,15 @@ impl eframe::App for App {
                 // RTX 40 multi-frame generation on the ReShade route: a single
                 // MIT add-on, in-memory only. OptiScaler's own built-in unlock
                 // reported "DLSSG not patched: capability not matched" on the
-                // reporter's machine while this one reached 6X (#83).
-                if self.engine == Engine::ReShade
-                    && ok_status.as_ref().is_some_and(|s| !s.is32())
-                    && ok_status
-                        .as_ref()
-                        .and_then(|s| s.gpu.as_ref())
-                        .is_some_and(|(_, t)| *t == crate::gpu::Tier::Rtx40)
-                {
-                    let mut on = self.ada_mfg;
+                // reporter's machine while this one reached 6X (#83). Offered to
+                // an RTX 40; disabled, with the reason, where it cannot work.
+                if let Some(s) = ok_status.as_ref().filter(|s| {
+                    self.engine == Engine::ReShade
+                        && s.remix.is_none()
+                        && s.gpu.as_ref().is_some_and(|(_, t)| *t == crate::gpu::Tier::Rtx40)
+                }) {
+                    let why = installer::mfg_unavailable(s, self.engine, self.opti_presr);
+                    let mut on = self.ada_mfg && why.is_none();
                     let cb = egui::Checkbox::new(
                         &mut on,
                         RichText::new(
@@ -3240,8 +3241,24 @@ impl eframe::App for App {
                         .font(t::plex(11.5))
                         .color(t::TEXT_SOFT),
                     );
-                    if ui.add_enabled(!self.running, cb).changed() {
+                    let r = ui.add_enabled(!self.running && why.is_none(), cb);
+                    let r = match why {
+                        Some(why) => r.on_disabled_hover_text(why),
+                        None => r.on_hover_text(
+                            "mavismmg/MFGAdaUnlock-RenoDx (MIT): one ReShade add-on that patches frame generation in memory, plus the newest nvngx_dlssg.dll it validates against (the game's own is kept and put back on Remove). EXPERIMENTAL under Proton.",
+                        ),
+                    };
+                    if r.changed() {
                         self.ada_mfg = on;
+                    }
+                    if s.mfg_asi {
+                        ui.label(
+                            RichText::new(
+                                "The older RTX 40 MFG unlock this tool used to install is here; Install with this ticked replaces it.",
+                            )
+                            .font(t::plex(11.0))
+                            .color(t::TEXT_DIM),
+                        );
                     }
                 }
                 if let Some(ac) = ok_status.as_ref().and_then(|s| s.anticheat) {
@@ -3407,14 +3424,13 @@ impl eframe::App for App {
                     // RTX 40 only: the 50 series has multi-frame generation of
                     // its own, and the Ampere/Turing unlock in the same ini
                     // needs a DLL nobody publishes, so it is not offered (#83).
-                    if self.opti_presr
-                        && ok_status
-                            .as_ref()
-                            .and_then(|s| s.gpu.as_ref())
-                            .is_some_and(|(_, t)| *t == crate::gpu::Tier::Rtx40)
-                    {
+                    if let Some(s) = ok_status.as_ref().filter(|s| {
+                        self.opti_presr
+                            && s.gpu.as_ref().is_some_and(|(_, t)| *t == crate::gpu::Tier::Rtx40)
+                    }) {
                         ui.add_space(6.0);
-                        let mut on = self.ada_mfg;
+                        let why = installer::mfg_unavailable(s, Engine::Opti, true);
+                        let mut on = self.ada_mfg && why.is_none();
                         let cb = egui::Checkbox::new(
                             &mut on,
                             RichText::new(
@@ -3423,7 +3439,12 @@ impl eframe::App for App {
                             .font(t::plex(11.5))
                             .color(t::TEXT_SOFT),
                         );
-                        if ui.add_enabled(!self.running, cb).changed() {
+                        let r = ui.add_enabled(!self.running && why.is_none(), cb);
+                        let r = match why {
+                            Some(why) => r.on_disabled_hover_text(why),
+                            None => r,
+                        };
+                        if r.changed() {
                             self.ada_mfg = on;
                         }
                     }
@@ -3628,7 +3649,7 @@ impl eframe::App for App {
                     self.engine,
                     self.renodx_on,
                     self.upstream_on,
-                    self.mfg_on,
+                    self.ada_mfg && self.engine == Engine::ReShade,
                 );
                 for row in tiles.chunks(2) {
                     let (row_rect, _) =
@@ -3682,40 +3703,6 @@ impl eframe::App for App {
                                         dim(ui, format!("— {}", m.note));
                                     }
                                 }
-                            }
-                        }
-                    });
-                }
-
-                // ── RTX 40 DLSS MFG unlock ────────────────────────
-                if let Some(s) = &ok_status {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        ui.label(
-                            RichText::new("DLSS MFG UNLOCK")
-                                .font(t::plex_semibold(11.0))
-                                .color(t::TEXT_MUTED),
-                        );
-                        let dim = |ui: &mut egui::Ui, text: String| {
-                            ui.label(RichText::new(text).font(t::plex(11.0)).color(t::TEXT_DIM));
-                        };
-                        if s.mfg_asi {
-                            dim(ui, "— installed (Remove takes it out too)".into());
-                        } else {
-                            match crate::mfg::eligible(s) {
-                                crate::mfg::Eligibility::Ready(proxy) => {
-                                    let cb = egui::Checkbox::new(
-                                        &mut self.mfg_on,
-                                        RichText::new("Also unlock RTX 40 DLSS Multi-Frame-Generation (2X–6X)")
-                                            .font(t::plex(12.0))
-                                            .color(t::TEXT_SOFT),
-                                    );
-                                    ui.add_enabled(!self.running, cb).on_hover_text(
-                                        "dashdogy/RTX40MFG-Unlock (MIT): raises the DLSS Frame-Generation multiplier for games that already have it. Adds Ultimate ASI Loader and its ReShade menu. EXPERIMENTAL under Proton — it may fail closed if the Streamline FG wrapper differs; --diagnose reads its log.",
-                                    );
-                                    dim(ui, format!("— loads via {proxy}.dll (added to launch options)"));
-                                }
-                                other => dim(ui, format!("— {}", other.reason())),
                             }
                         }
                     });

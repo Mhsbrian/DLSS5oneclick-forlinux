@@ -190,7 +190,7 @@ error: {e:#}"
                     installer::Engine::ReShade
                 },
                 with_renodx: args.iter().any(|a| a == "--renodx"),
-                with_mfg: args.iter().any(|a| a == "--mfg"),
+                ada_mfg: args.iter().any(|a| a == "--mfg"),
                 upstream: args.iter().any(|a| a == "--upstream"),
                 with_fg: args.iter().any(|a| a == "--fg"),
                 model_scale: args
@@ -505,7 +505,7 @@ fn print_advice(advice: &platform::LaunchAdvice) -> i32 {
 struct Choice {
     engine: installer::Engine,
     with_renodx: bool,
-    with_mfg: bool,
+    ada_mfg: bool,
     upstream: bool,
     with_fg: bool,
     model_scale: Option<f32>,
@@ -531,7 +531,7 @@ fn cli(
     let Choice {
         engine,
         with_renodx,
-        with_mfg,
+        ada_mfg,
         upstream,
         with_fg,
         model_scale,
@@ -539,7 +539,6 @@ fn cli(
     } = choice;
     let extras = installer::Extras {
         with_renodx,
-        with_mfg,
         upstream,
         with_fg,
         model_scale,
@@ -549,7 +548,7 @@ fn cli(
         // (DLSS5ONECLICK_RENODX_TAG names an add-on build directly.)
         opti_presr: installer::opti_presr_from_env(),
         classic_addon: false,
-        ada_mfg: installer::ada_mfg_from_env(),
+        ada_mfg: ada_mfg || installer::ada_mfg_from_env(),
         upstream_preset: if upstream {
             installer::upstream_preset_from_env()
         } else {
@@ -715,11 +714,16 @@ fn cli(
                     Ok(None) => println!("  RenoDX HDR mod: none for this game"),
                     Err(e) => println!("  RenoDX lookup failed: {e:#}"),
                 }
-                match mfg::eligible(&st) {
-                    mfg::Eligibility::Ready(proxy) => println!(
-                        "  RTX 40 DLSS MFG unlock: eligible (loads via {proxy}.dll; --mfg to install; experimental under Proton)"
+                match installer::mfg_unavailable(&st, engine, installer::opti_presr_from_env()) {
+                    None => println!(
+                        "  RTX 40 multi-frame generation: available (--mfg to install; experimental under Proton)"
                     ),
-                    other => println!("  RTX 40 DLSS MFG unlock: not offered ({})", other.reason()),
+                    Some(why) => println!("  RTX 40 multi-frame generation: not offered ({why})"),
+                }
+                if st.mfg_asi {
+                    println!(
+                        "  the older RTX 40 MFG unlock (dashdogy) is installed: --mfg replaces it, --remove takes it out"
+                    );
                 }
                 0
             }
