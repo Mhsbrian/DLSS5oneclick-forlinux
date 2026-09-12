@@ -35,6 +35,13 @@ pub const DLSSG_MARKER: &str = "nvngx_dlssg.dll.dlss5oneclick";
 /// The game's own provider, moved aside before ours goes in. Never deleted:
 /// Remove puts it back.
 pub const DLSSG_BACKUP: &str = "nvngx_dlssg.dll.original";
+/// Sidecar for a dgVoodoo `d3d9.dll` this tool downloaded. Remove used to leave
+/// dgVoodoo behind on every DX9 game, so a game that would not start kept not
+/// starting after Remove and there was nothing saying which file to delete (#91).
+/// A second line, `conf-ours`, marks a `dgVoodoo.conf` this tool created rather
+/// than merged into someone's existing one.
+pub const DGVOODOO_MARKER: &str = "d3d9.dll.dlss5oneclick";
+pub const DGVOODOO_CONF: &str = "dgVoodoo.conf";
 /// matiasLombo's neural-upstream add-on. The name is not ours to choose: the
 /// NGX snippet gates feature creation on the calling module's path containing
 /// `nvngx.dll`, and under any other name it returns 0xBAD00002 and does nothing.

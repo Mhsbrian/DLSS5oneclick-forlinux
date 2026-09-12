@@ -1420,11 +1420,18 @@ pub fn install_dgvoodoo_from_zip(
             "a d3d9.dll that is not dgVoodoo is already present; remove or replace it, then Install again"
         );
     }
+    let had_conf = game_dir.join(game::DGVOODOO_CONF).is_file();
     net::extract_member(&mut zip, &member, &dest)?;
     write_dgvoodoo_conf(game_dir)?;
     if !game::is_dgvoodoo(game_dir) {
         bail!("wrote d3d9.dll + dgVoodoo.conf but dgVoodoo was not detected afterward");
     }
+    // Record what this tool put there so Remove can take it away again (#91).
+    let mut marker = format!("{DGVOODOO_TAG}\n");
+    if !had_conf {
+        marker.push_str("conf-ours\n");
+    }
+    fs::write(game_dir.join(game::DGVOODOO_MARKER), marker)?;
     Ok(vec!["d3d9.dll".into(), "dgVoodoo.conf".into()])
 }
 
@@ -2534,6 +2541,17 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
     // The frame-generation provider: ours goes, and the game's own comes back
     // from .original if we moved it aside (#90). The restore happens below,
     // once `removed` exists, so it can be reported.
+    // dgVoodoo: only a copy this tool downloaded goes, and its conf only when
+    // this tool created it rather than merging into the user's own. Leaving it
+    // behind meant a DX9 game that would not start still would not start after
+    // Remove, with nothing naming the file responsible (#91).
+    if let Ok(m) = fs::read_to_string(d.join(game::DGVOODOO_MARKER)) {
+        targets.push(d.join("d3d9.dll"));
+        targets.push(d.join(game::DGVOODOO_MARKER));
+        if m.lines().any(|l| l.trim() == "conf-ours") {
+            targets.push(d.join(game::DGVOODOO_CONF));
+        }
+    }
     let restore_dlssg = d.join(game::DLSSG_MARKER).is_file();
     if restore_dlssg {
         targets.push(d.join(game::DLSSG_MARKER));
@@ -3029,6 +3047,43 @@ mod tests {
     /// RTX 40 MFG is one ini key and no extra files, so it can be offered as
     /// part of an install. The Ampere/Turing key in the same section sideloads
     /// a DLL with no published release and is deliberately never written (#83).
+    /// Remove left dgVoodoo's d3d9.dll in every DX9 game it had been installed
+    /// into, so a game that would not start still would not start afterwards,
+    /// and nothing said which file to delete (#91). Only a copy this tool
+    /// downloaded goes, and the conf only when this tool created it.
+    #[test]
+    fn removing_takes_our_dgvoodoo_out_and_leaves_a_user_s_alone() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe(&d.join("game.exe"), game::PE_X64);
+
+        // Ours, conf included.
+        fs::write(d.join("d3d9.dll"), b"dgVoodoo").unwrap();
+        fs::write(d.join(game::DGVOODOO_CONF), b"[General]\n").unwrap();
+        fs::write(
+            d.join(game::DGVOODOO_MARKER),
+            format!("{DGVOODOO_TAG}\nconf-ours\n"),
+        )
+        .unwrap();
+        uninstall(&exe).unwrap();
+        assert!(!d.join("d3d9.dll").exists());
+        assert!(!d.join(game::DGVOODOO_CONF).exists());
+        assert!(!d.join(game::DGVOODOO_MARKER).exists());
+
+        // Ours, but the conf was the user's before we merged into it.
+        fs::write(d.join("d3d9.dll"), b"dgVoodoo").unwrap();
+        fs::write(d.join(game::DGVOODOO_CONF), b"[General]\n").unwrap();
+        fs::write(d.join(game::DGVOODOO_MARKER), format!("{DGVOODOO_TAG}\n")).unwrap();
+        uninstall(&exe).unwrap();
+        assert!(!d.join("d3d9.dll").exists());
+        assert!(d.join(game::DGVOODOO_CONF).is_file(), "their conf stays");
+
+        // Someone else's d3d9.dll, no marker: untouched.
+        fs::write(d.join("d3d9.dll"), b"theirs").unwrap();
+        uninstall(&exe).unwrap();
+        assert_eq!(fs::read(d.join("d3d9.dll")).unwrap(), b"theirs");
+    }
+
     /// The MFG add-on validates the frame-generation provider by build and
     /// refuses anything else, so ours goes in and the game's own is kept as
     /// .original — Remove has to put that back, not delete it (#90).
