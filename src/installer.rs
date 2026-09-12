@@ -2008,7 +2008,7 @@ fn step_bridge(
 fn step_mfg(
     client: &Client,
     st: &GameStatus,
-    _work: &Path,
+    work: &Path,
     progress: Progress,
 ) -> Result<Vec<String>> {
     let dest = st.game_dir().join(game::MFG_ADDON);
@@ -2032,7 +2032,45 @@ fn step_mfg(
         progress(0, "Fetching the RTX 40 MFG unlock");
     }
     net::download(client, MFG_DOWNLOAD, &dest, game::MFG_ADDON, progress)?;
-    Ok(vec![game::MFG_ADDON.into()])
+    let mut done = vec![game::MFG_ADDON.to_owned()];
+    done.extend(mfg_provider(client, st, work, progress)?);
+    Ok(done)
+}
+
+/// The frame-generation provider the MFG add-on will accept.
+///
+/// Version 0.9 validates the provider by build and refuses the rest: a reporter
+/// with an RTX 4060 got "Validated provider result: unsupported/unknown" and no
+/// effect at all, on a game whose own menu offered 2X-6X (#90). The add-on's
+/// README says to use the newest `nvngx_dlssg.dll`; rhi-repo publishes it, the
+/// same place this tool already takes `nvngx_dlss.dll` and the neural model
+/// from, so Install can place it without asking anyone to fetch a DLL.
+///
+/// A provider the game shipped is moved to `.original` rather than overwritten,
+/// and Remove puts it back.
+fn mfg_provider(
+    client: &Client,
+    st: &GameStatus,
+    work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    let d = st.game_dir();
+    let dest = d.join(game::DLSSG_DLL);
+    let marker = d.join(game::DLSSG_MARKER);
+    progress(0, "Looking up frame-generation runtime releases");
+    let (tag, url) = rhi_latest(client, "dlssg-")?;
+    if fs::read_to_string(&marker).is_ok_and(|t| t.trim() == tag) {
+        return Ok(vec![format!("{} already current ({tag})", game::DLSSG_DLL)]);
+    }
+    let backup = d.join(game::DLSSG_BACKUP);
+    if dest.is_file() && !marker.is_file() && !backup.is_file() {
+        fs::rename(&dest, &backup)?;
+    }
+    let z = work.join(format!("{tag}.zip"));
+    net::download(client, &url, &z, game::DLSSG_DLL, progress)?;
+    install_single_from_zip(&z, game::DLSSG_DLL, &dest)?;
+    fs::write(&marker, tag.as_bytes())?;
+    Ok(vec![format!("{} ({tag})", game::DLSSG_DLL)])
 }
 
 // ── step 5c: neural-upstream (experimental consumer, native DLSS only) ──
@@ -2493,6 +2531,16 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
     if d.join(game::DLSS_MARKER).is_file() {
         targets.push(d.join(game::DLSS_DLL));
     }
+    // The frame-generation provider: ours goes, and the game's own comes back
+    // from .original if we moved it aside (#90). The restore happens below,
+    // once `removed` exists, so it can be reported.
+    let restore_dlssg = d.join(game::DLSSG_MARKER).is_file();
+    if restore_dlssg {
+        targets.push(d.join(game::DLSSG_MARKER));
+        if !d.join(game::DLSSG_BACKUP).is_file() {
+            targets.push(d.join(game::DLSSG_DLL));
+        }
+    }
     // 32-bit layout: the in-game addon32 and everything in host64\.
     targets.push(d.join(game::FEEDER_ADDON32));
     let host = d.join(game::HOST_DIR);
@@ -2543,6 +2591,16 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
                     .to_string_lossy()
                     .replace('\\', "/"),
             );
+        }
+    }
+    if restore_dlssg {
+        let backup = d.join(game::DLSSG_BACKUP);
+        let dll = d.join(game::DLSSG_DLL);
+        if backup.is_file() {
+            let _ = fs::remove_file(&dll);
+            if fs::rename(&backup, &dll).is_ok() {
+                removed.push(format!("{} (the game's own restored)", game::DLSSG_DLL));
+            }
         }
     }
     if include.is_dir() && fs::read_dir(&include)?.next().is_none() {
@@ -2971,6 +3029,34 @@ mod tests {
     /// RTX 40 MFG is one ini key and no extra files, so it can be offered as
     /// part of an install. The Ampere/Turing key in the same section sideloads
     /// a DLL with no published release and is deliberately never written (#83).
+    /// The MFG add-on validates the frame-generation provider by build and
+    /// refuses anything else, so ours goes in and the game's own is kept as
+    /// .original — Remove has to put that back, not delete it (#90).
+    #[test]
+    fn removing_the_mfg_provider_restores_the_game_s_own() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe(&d.join("game.exe"), game::PE_X64);
+        fs::write(d.join(game::DLSSG_DLL), b"ours").unwrap();
+        fs::write(d.join(game::DLSSG_BACKUP), b"the game's").unwrap();
+        fs::write(d.join(game::DLSSG_MARKER), b"dlssg-310.9.1").unwrap();
+
+        uninstall(&exe).unwrap();
+        assert_eq!(
+            fs::read(d.join(game::DLSSG_DLL)).unwrap(),
+            b"the game's",
+            "the game's provider must come back"
+        );
+        assert!(!d.join(game::DLSSG_BACKUP).exists());
+        assert!(!d.join(game::DLSSG_MARKER).exists());
+
+        // With no backup, ours is simply removed.
+        fs::write(d.join(game::DLSSG_DLL), b"ours").unwrap();
+        fs::write(d.join(game::DLSSG_MARKER), b"dlssg-310.9.1").unwrap();
+        uninstall(&exe).unwrap();
+        assert!(!d.join(game::DLSSG_DLL).exists());
+    }
+
     /// The OptiScaler route writes an ini key; the ReShade route needs the
     /// separate add-on, because the fork's built-in unlock reported "DLSSG not
     /// patched: capability not matched" on the reporter's machine (#83). The

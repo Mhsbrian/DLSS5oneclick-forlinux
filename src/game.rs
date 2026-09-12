@@ -27,6 +27,14 @@ pub const BRIDGE_ADDON: &str = "dlss5-bridge.addon64";
 /// gate on multi-frame generation and corrects the temporal midpoint, entirely
 /// in mapped memory. One file, MIT, nothing in the game folder modified.
 pub const MFG_ADDON: &str = "renodx-mfgunlock.addon64";
+/// NVIDIA's frame-generation runtime. The MFG add-on validates this provider by
+/// build and refuses anything it does not know, so the version beside the game
+/// decides whether the unlock does anything at all.
+pub const DLSSG_DLL: &str = "nvngx_dlssg.dll";
+pub const DLSSG_MARKER: &str = "nvngx_dlssg.dll.dlss5oneclick";
+/// The game's own provider, moved aside before ours goes in. Never deleted:
+/// Remove puts it back.
+pub const DLSSG_BACKUP: &str = "nvngx_dlssg.dll.original";
 /// matiasLombo's neural-upstream add-on. The name is not ours to choose: the
 /// NGX snippet gates feature creation on the calling module's path containing
 /// `nvngx.dll`, and under any other name it returns 0xBAD00002 and does nothing.
