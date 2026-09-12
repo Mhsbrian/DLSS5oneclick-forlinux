@@ -3303,11 +3303,17 @@ impl eframe::App for App {
                             }
                         }
                     }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let missing = ok_status
-                            .as_ref()
-                            .map(installer::missing_install_files)
-                            .unwrap_or_default();
+                });
+                // The status line used to sit in a right-to-left layout on the
+                // button row. "Incomplete: missing <every file>" does not wrap
+                // there: it ran leftwards straight over Install, Remove and
+                // Diagnose, took the clicks, and pushed a horizontal scrollbar
+                // onto the page (#77). Its own row, wrapped, cannot do that.
+                {
+                    let missing = ok_status
+                        .as_ref()
+                        .map(installer::missing_install_files)
+                        .unwrap_or_default();
                         let stale = self
                             .exe()
                             .and_then(|e| {
@@ -3337,9 +3343,16 @@ impl eframe::App for App {
                         } else {
                             t::ACCENT
                         };
-                        ui.label(RichText::new(msg).font(t::plex_medium(12.0)).color(color));
-                    });
-                });
+                    if !msg.is_empty() {
+                        ui.add_space(6.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(msg).font(t::plex_medium(12.0)).color(color),
+                            )
+                            .wrap(),
+                        );
+                    }
+                }
 
                 // Offline knobs / expected FPS from Feeder perf log.
                 self.knobs_panel(ui);

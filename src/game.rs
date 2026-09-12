@@ -1229,15 +1229,18 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
                 score += 1_000_000_000;
             }
             score += size.min(400_000_000);
+            // A 32-bit exe sitting beside a 64-bit one is usually a tool, so a
+            // 64-bit candidate still outranks every 32-bit one. It used to
+            // *delete* them, which hid the real game: Prince of Persia: The Two
+            // Thrones keeps a 64-bit launcher named after the folder next to the
+            // 32-bit game, and the game could not be chosen at all (#89). They
+            // are ranked, not discarded, so the exe picker still offers them.
+            if bits == 64 {
+                score += 8_000_000_000;
+            }
             Some((bits, score, p))
         })
         .collect();
-    // A 32-bit exe sitting beside a 64-bit one is a tool, not the game, so
-    // 64-bit wins whenever one exists. Only a folder with nothing 64-bit in it
-    // (Max Payne, #17) falls back to 32-bit.
-    if scored.iter().any(|s| s.0 == 64) {
-        scored.retain(|s| s.0 == 64);
-    }
     scored.sort_by_key(|s| std::cmp::Reverse(s.1));
     scored.into_iter().map(|(_, _, p)| p).collect()
 }
@@ -1612,6 +1615,23 @@ mod tests {
         assert_eq!(find_game_exes(&d), vec![d.join("maxpayne.exe")]);
     }
 
+    /// Prince of Persia: The Two Thrones ships a 64-bit launcher named after
+    /// the folder beside the 32-bit game. The 64-bit one still wins by default,
+    /// but the game must stay in the list or it cannot be chosen at all (#89).
+    #[test]
+    fn a_thirty_two_bit_game_stays_listed_behind_a_64_bit_launcher() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("Prince of Persia Two Thrones");
+        fs::create_dir_all(&d).unwrap();
+        let launcher = d.join("PrinceOfPersia.exe");
+        let game = d.join("PoP3.exe");
+        make_pe(&launcher, PE_X64);
+        make_pe(&game, PE_X86);
+        let found = find_game_exes(&d);
+        assert_eq!(found.first(), Some(&launcher), "{found:?}");
+        assert!(found.contains(&game), "{found:?}");
+    }
+
     /// A named .exe is an instruction. Searching outward from it and picking a
     /// "better" candidate installed into a different game entirely — the tool
     /// wrote to a sibling folder's exe when handed one under a shared parent.
@@ -1715,10 +1735,12 @@ mod tests {
         make_pe(&d.join("tool32.exe"), PE_X86);
         make_pe(&d.join("Fell & Sell.exe"), PE_X64);
         let c = find_game_exes(&d);
-        assert_eq!(c, vec![d.join("Fell & Sell.exe")]);
-        let (exe, all) = resolve_target(&d).unwrap();
+        // The helper is dropped by name; the 32-bit tool is ranked last rather
+        // than hidden, because hiding every 32-bit exe hid real games (#89).
+        assert_eq!(c.first(), Some(&d.join("Fell & Sell.exe")), "{c:?}");
+        assert!(!c.contains(&d.join("UnityCrashHandler64.exe")), "{c:?}");
+        let (exe, _all) = resolve_target(&d).unwrap();
         assert_eq!(exe, d.join("Fell & Sell.exe"));
-        assert_eq!(all.len(), 1);
     }
 
     /// Satisfactory (Epic): the launcher names FactoryGameEGS.exe in the root,
