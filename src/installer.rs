@@ -1128,10 +1128,15 @@ fn fg_ini(ini: &str) -> (String, Vec<String>) {
 /// OptiScaler.ini repeats names like `Enabled` under many headings.
 pub fn set_ini_key(ini: &str, section: &str, key: &str, value: &str) -> Option<String> {
     let header = format!("[{section}]");
+    let eol = if ini.contains("\r\n") { "\r\n" } else { "\n" };
     let mut out = String::with_capacity(ini.len() + 32);
     let mut in_section = false;
     let mut seen = false;
     let mut changed = false;
+    // Where a key the section lacks goes: after the section's last non-blank
+    // line, so the file keeps one [section] instead of growing a second one at
+    // the end (an older pre-SR ini without AdaMfgUnlock did exactly that).
+    let mut section_end: Option<usize> = None;
     for line in ini.split_inclusive('\n') {
         let raw = line.trim_end_matches(['\r', '\n']);
         let t = raw.trim();
@@ -1143,16 +1148,32 @@ pub fn set_ini_key(ini: &str, section: &str, key: &str, value: &str) -> Option<S
                 out.push_str(&format!("{key}={value}"));
                 out.push_str(&line[raw.len()..]);
                 changed = true;
+                section_end = Some(out.len());
                 continue;
             }
         }
         out.push_str(line);
+        if in_section && !t.is_empty() {
+            section_end = Some(out.len());
+        }
     }
     if !seen {
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push('\n');
+        match section_end {
+            Some(at) => {
+                let mut add = String::new();
+                if !out[..at].ends_with('\n') {
+                    add.push_str(eol);
+                }
+                add.push_str(&format!("{key}={value}{eol}"));
+                out.insert_str(at, &add);
+            }
+            None => {
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push_str(eol);
+                }
+                out.push_str(&format!("{eol}{header}{eol}{key}={value}{eol}"));
+            }
         }
-        out.push_str(&format!("\n{header}\n{key}={value}\n"));
         changed = true;
     }
     changed.then_some(out)
@@ -1333,8 +1354,9 @@ pub fn plan_with(st: &GameStatus, engine: Engine, x: Extras) -> Vec<Step> {
     }
     // DX9 never loads dxgi.dll; dgVoodoo must sit in the game folder first.
     // Always run on Dx9 (even when the DLL is already present) so Install can
-    // refresh dgVoodoo.conf — Uninstall never removes dgVoodoo, and a bare
-    // OutputAPI-only conf leaves stock VRAM=256 (Gothic 3 texture failures).
+    // refresh dgVoodoo.conf: a bare OutputAPI-only conf leaves stock VRAM=256
+    // (Gothic 3 texture failures). Remove takes out a copy this tool downloaded
+    // (#91).
     if st.api == game::Api::Dx9 {
         v.insert(0, STEP_DGVOODOO);
     }
@@ -1444,6 +1466,11 @@ pub const RENODX_CLASSIC_TAG: &str = "renodx-dlss5-4.55";
 
 /// `RENODX_CLASSIC_TAG`'s line as `rhi_pinned` matches it: 4.55 and any 4.55.x.
 const CLASSIC_LINE: &str = "4.55";
+
+/// True for any add-on build on the classic line, which is what this tool pins.
+pub fn is_classic_tag(tag: &str) -> bool {
+    label_is(tag, "renodx-dlss5-", CLASSIC_LINE)
+}
 
 /// A pinned add-on build, when one was asked for: `(tag, url)`.
 fn rhi_env_pinned(client: &Client, prefix: &str) -> Option<Result<(String, String)>> {
@@ -1848,7 +1875,7 @@ pub fn install_dgvoodoo_from_zip(
             "a d3d9.dll that is not dgVoodoo is already present; remove or replace it, then Install again"
         );
     }
-    let had_conf = game_dir.join(game::DGVOODOO_CONF).is_file();
+    let had_conf = game::join_ci(game_dir, &[game::DGVOODOO_CONF]).is_file();
     net::extract_member(&mut zip, &member, &dest)?;
     write_dgvoodoo_conf(game_dir)?;
     if !game::is_dgvoodoo(game_dir) {
@@ -1859,7 +1886,7 @@ pub fn install_dgvoodoo_from_zip(
     if !had_conf {
         marker.push_str("conf-ours\n");
     }
-    fs::write(game_dir.join(game::DGVOODOO_MARKER), marker)?;
+    fs::write(game::join_ci(game_dir, &[game::DGVOODOO_MARKER]), marker)?;
     Ok(vec!["d3d9.dll".into(), "dgVoodoo.conf".into()])
 }
 
@@ -2466,7 +2493,7 @@ fn step_mfg(
     work: &Path,
     progress: Progress,
 ) -> Result<Vec<String>> {
-    let dest = st.game_dir().join(game::MFG_ADDON);
+    let dest = game::join_ci(st.game_dir(), &[game::MFG_ADDON]);
     if st.mfg && dest.is_file() {
         let local = fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
         match net::remote_len(client, MFG_DOWNLOAD) {
@@ -2510,14 +2537,14 @@ fn mfg_provider(
     progress: Progress,
 ) -> Result<Vec<String>> {
     let d = st.game_dir();
-    let dest = d.join(game::DLSSG_DLL);
-    let marker = d.join(game::DLSSG_MARKER);
+    let dest = game::join_ci(d, &[game::DLSSG_DLL]);
+    let marker = game::join_ci(d, &[game::DLSSG_MARKER]);
     progress(0, "Looking up frame-generation runtime releases");
     let (tag, url) = rhi_latest(client, "dlssg-")?;
     if fs::read_to_string(&marker).is_ok_and(|t| t.trim() == tag) {
         return Ok(vec![format!("{} already current ({tag})", game::DLSSG_DLL)]);
     }
-    let backup = d.join(game::DLSSG_BACKUP);
+    let backup = game::join_ci(d, &[game::DLSSG_BACKUP]);
     if dest.is_file() && !marker.is_file() && !backup.is_file() {
         fs::rename(&dest, &backup)?;
     }
@@ -3299,25 +3326,29 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
     if game::join_ci(d, &[game::DLSS_MARKER]).is_file() {
         targets.push(game::join_ci(d, &[game::DLSS_DLL]));
     }
-    // The frame-generation provider: ours goes, and the game's own comes back
-    // from .original if we moved it aside (#90). The restore happens below,
-    // once `removed` exists, so it can be reported.
     // dgVoodoo: only a copy this tool downloaded goes, and its conf only when
     // this tool created it rather than merging into the user's own. Leaving it
     // behind meant a DX9 game that would not start still would not start after
-    // Remove, with nothing naming the file responsible (#91).
-    if let Ok(m) = fs::read_to_string(d.join(game::DGVOODOO_MARKER)) {
-        targets.push(d.join("d3d9.dll"));
-        targets.push(d.join(game::DGVOODOO_MARKER));
+    // Remove, with nothing naming the file responsible (#91). The DLL goes only
+    // while it is still dgVoodoo: one put there since is someone else's.
+    if let Ok(m) = fs::read_to_string(game::join_ci(d, &[game::DGVOODOO_MARKER])) {
+        let dll = game::join_ci(d, &["d3d9.dll"]);
+        if fs::read(&dll).is_ok_and(|b| game::dll_mentions_dgvoodoo(&b)) {
+            targets.push(dll);
+        }
+        targets.push(game::join_ci(d, &[game::DGVOODOO_MARKER]));
         if m.lines().any(|l| l.trim() == "conf-ours") {
-            targets.push(d.join(game::DGVOODOO_CONF));
+            targets.push(game::join_ci(d, &[game::DGVOODOO_CONF]));
         }
     }
-    let restore_dlssg = d.join(game::DLSSG_MARKER).is_file();
+    // The frame-generation provider: ours goes, and the game's own comes back
+    // from .original if we moved it aside (#90). The restore happens below,
+    // once `removed` exists, so it can be reported.
+    let restore_dlssg = game::join_ci(d, &[game::DLSSG_MARKER]).is_file();
     if restore_dlssg {
-        targets.push(d.join(game::DLSSG_MARKER));
-        if !d.join(game::DLSSG_BACKUP).is_file() {
-            targets.push(d.join(game::DLSSG_DLL));
+        targets.push(game::join_ci(d, &[game::DLSSG_MARKER]));
+        if !game::join_ci(d, &[game::DLSSG_BACKUP]).is_file() {
+            targets.push(game::join_ci(d, &[game::DLSSG_DLL]));
         }
     }
     // 32-bit layout: the in-game addon32 and everything in host64\.
@@ -3374,8 +3405,8 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
         }
     }
     if restore_dlssg {
-        let backup = d.join(game::DLSSG_BACKUP);
-        let dll = d.join(game::DLSSG_DLL);
+        let backup = game::join_ci(d, &[game::DLSSG_BACKUP]);
+        let dll = game::join_ci(d, &[game::DLSSG_DLL]);
         if backup.is_file() {
             let _ = fs::remove_file(&dll);
             if fs::rename(&backup, &dll).is_ok() {
@@ -3863,9 +3894,6 @@ mod tests {
         );
     }
 
-    /// RTX 40 MFG is one ini key and no extra files, so it can be offered as
-    /// part of an install. The Ampere/Turing key in the same section sideloads
-    /// a DLL with no published release and is deliberately never written (#83).
     /// Remove left dgVoodoo's d3d9.dll in every DX9 game it had been installed
     /// into, so a game that would not start still would not start afterwards,
     /// and nothing said which file to delete (#91). Only a copy this tool
@@ -4010,6 +4038,9 @@ mod tests {
         assert!(opti_ada_mfg(d));
     }
 
+    /// RTX 40 MFG is one ini key and no extra files, so it can be offered as
+    /// part of an install. The Ampere/Turing key in the same section sideloads
+    /// a DLL with no published release and is deliberately never written (#83).
     #[test]
     fn ada_mfg_is_written_and_ampere_is_left_alone() {
         assert_eq!(ada_mfg(), "false");
@@ -4066,6 +4097,21 @@ mod tests {
         assert_eq!(opti_working_scale(d), Some(0.75));
         fs::write(&ini, "[DlssNr]\nWorkingScale=9\n").unwrap();
         assert_eq!(opti_working_scale(d), None);
+    }
+
+    /// A key missing from a section that exists goes into that section, not
+    /// into a second [section] appended at the end of the file.
+    #[test]
+    fn set_ini_key_adds_a_missing_key_inside_its_section() {
+        let ini = "[FrameGen]\nEnabled=true\n\n[DlssNr]\nEnabled=true\n";
+        let out = set_ini_key(ini, "FrameGen", "AdaMfgUnlock", "true").unwrap();
+        assert_eq!(out, "[FrameGen]\nEnabled=true\nAdaMfgUnlock=true\n\n[DlssNr]\nEnabled=true\n");
+        // A section that is not there at all is still added at the end.
+        let out = set_ini_key(ini, "OptiFG", "HUDFix", "true").unwrap();
+        assert!(out.ends_with("\n[OptiFG]\nHUDFix=true\n"), "{out}");
+        // The last section, with no newline after it, and CRLF kept as CRLF.
+        assert_eq!(set_ini_key("[A]\nx=1", "A", "y", "2").unwrap(), "[A]\nx=1\ny=2\n");
+        assert_eq!(set_ini_key("[A]\r\nx=1\r\n", "A", "y", "2").unwrap(), "[A]\r\nx=1\r\ny=2\r\n");
     }
 
     #[test]
@@ -4265,6 +4311,9 @@ mod tests {
         assert!(!feeder_needs_classic(None));
         // The line held to is the classic build upstream names.
         assert_eq!(RENODX_CLASSIC_TAG, format!("renodx-dlss5-{CLASSIC_LINE}"));
+        // Diagnose reads any build on the pinned line as the classic one.
+        assert!(is_classic_tag(RENODX_CLASSIC_TAG) && is_classic_tag("renodx-dlss5-4.55.1"));
+        assert!(!is_classic_tag("renodx-dlss5-4.7"));
     }
 
     #[test]

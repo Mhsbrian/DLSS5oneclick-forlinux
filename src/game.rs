@@ -630,7 +630,7 @@ fn anticheat_marker(n: &str, is_dir: bool) -> Option<&'static str> {
 
 /// Official dgVoodoo builds embed the product name as UTF-16LE in the PE
 /// resources; older / debug builds may use ASCII. Either counts.
-fn dll_mentions_dgvoodoo(b: &[u8]) -> bool {
+pub(crate) fn dll_mentions_dgvoodoo(b: &[u8]) -> bool {
     const NEEDLE: &[u8] = b"dgVoodoo";
     if b.windows(NEEDLE.len())
         .any(|w| w.eq_ignore_ascii_case(NEEDLE))

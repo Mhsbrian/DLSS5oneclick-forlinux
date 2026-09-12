@@ -697,7 +697,7 @@ fn diagnose_with(st: &GameStatus, proton: bool) -> Vec<Finding> {
             let tag = read(&st.consumer_dir(), crate::game::DLSS5_ADDON_MARKER)
                 .map(|t| t.trim().to_owned())
                 .unwrap_or_default();
-            if tag == crate::installer::RENODX_CLASSIC_TAG {
+            if crate::installer::is_classic_tag(&tag) {
                 out.push(ok(format!(
                     "The host warns that this add-on build and your driver are a combination it \
                      measured failing. You are already on the classic build it recommends \
