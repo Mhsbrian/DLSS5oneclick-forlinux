@@ -264,7 +264,7 @@ pub fn ensure_d3dcompiler(
     // protontricks knows the Steam layout and points Wine at the right prefix.
     if which("protontricks") {
         progress("Installing d3dcompiler_47 into the Proton prefix (this can take a minute)");
-        match run_winetricks_d3dcompiler(WinetricksKind::Protontricks(&entry.id)) {
+        match run_winetricks_d3dcompiler(WinetricksKind::Protontricks(&entry.id, &entry.root)) {
             Ok(()) if std::fs::metadata(&sys32).map(|m| m.len() >= D3DCOMPILER_REAL_MIN).unwrap_or(false) => {
                 A::Installed { via: "protontricks".into() }
             }
@@ -294,7 +294,8 @@ pub fn ensure_d3dcompiler(
 
 #[cfg(target_os = "linux")]
 enum WinetricksKind<'a> {
-    Protontricks(&'a str),
+    /// Appid and the Steam root it belongs to.
+    Protontricks(&'a str, &'a Path),
     Winetricks(&'a Path),
 }
 
@@ -303,9 +304,14 @@ enum WinetricksKind<'a> {
 fn run_winetricks_d3dcompiler(kind: WinetricksKind) -> Result<(), String> {
     use std::process::Command;
     let mut cmd = match kind {
-        WinetricksKind::Protontricks(appid) => {
+        WinetricksKind::Protontricks(appid, root) => {
             let mut c = Command::new("protontricks");
-            c.arg(appid).arg("-q").arg("d3dcompiler_47");
+            // With more than one Steam install on disk protontricks asks which
+            // to use in a GUI dialog, and an unattended run waits on it forever.
+            c.env("STEAM_DIR", root)
+                .arg(appid)
+                .arg("-q")
+                .arg("d3dcompiler_47");
             c
         }
         WinetricksKind::Winetricks(pfx) => {
