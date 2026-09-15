@@ -21,3 +21,6 @@ gothic_check*.txt
 # Common local logs
 *.log
 cargo-timing*.html
+
+# Release builds (packaging/release-build.sh)
+/dist

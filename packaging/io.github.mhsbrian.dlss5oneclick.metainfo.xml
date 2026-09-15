@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata: what software centres and AppImage managers show. -->
+<component type="desktop-application">
+  <id>io.github.mhsbrian.dlss5oneclick</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>DLSS5oneclick</name>
+  <summary>One-click DLSS 5 for Proton games</summary>
+  <description>
+    <p>
+      Sets up the leaked DLSS 5 neural-rendering build in DirectX 11 and 12 games
+      running under Steam and Proton: it lists your games, installs the right
+      pieces, checks the model against your card, sets the Proton launch options,
+      and takes it all back out cleanly.
+    </p>
+    <p>
+      An unofficial, experimental feature. It needs an NVIDIA RTX card, and some
+      game and Proton combinations are unstable.
+    </p>
+  </description>
+  <launchable type="desktop-id">dlss5oneclick.desktop</launchable>
+  <url type="homepage">https://github.com/Mhsbrian/DLSS5oneclick-forlinux</url>
+  <url type="bugtracker">https://github.com/Mhsbrian/DLSS5oneclick-forlinux/issues</url>
+  <developer id="io.github.mhsbrian">
+    <name>Mhsbrian</name>
+  </developer>
+  <content_rating type="oars-1.1" />
+  <provides>
+    <binary>dlss5oneclick</binary>
+  </provides>
+</component>

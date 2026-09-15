@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 /// --check | --diagnose | --engine=opti | --renodx | --mfg | --upstream | --fg |
 /// --model-res=25..100 | --remix-swap | --install-remix-mod | --remove-remix-mod | --imports |
 /// --ignore-anticheat | --mode=feeder|native | --bridge |
-/// --launch-options | --revert-launch-options] | --list-games | --remix-list | --update` runs headless;
+/// --launch-options | --revert-launch-options] | --list-games | --remix-list | --update | --version` runs headless;
 /// no args opens the GUI.
 /// Read by the NVIDIA and AMD drivers from this exe's export table to choose
 /// the discrete GPU for the whole process. Exported by the linker flags in
@@ -51,6 +51,13 @@ fn main() {
     install_panic_handler();
     update::cleanup_old();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // The same words the window title carries and the self-updater looks for;
+    // the release build checks them on the binary and inside the AppImage.
+    if matches!(args.first().map(String::as_str), Some("--version" | "-V")) {
+        attach_parent_console();
+        println!("DLSS5oneclick {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if args.first().map(String::as_str) == Some("--fetch") {
         attach_parent_console();
         let (Some(url), Some(dest)) = (args.get(1), args.get(2)) else {

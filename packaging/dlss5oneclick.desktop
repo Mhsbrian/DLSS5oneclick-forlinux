@@ -1,8 +1,11 @@
 [Desktop Entry]
 Type=Application
 Name=DLSS5oneclick
-Comment=One-click DLSS 5 neural rendering setup for Proton games
+GenericName=DLSS 5 Installer
+Comment=One-click DLSS 5 neural rendering for Steam and Proton games
 Exec=dlss5oneclick
 Icon=dlss5oneclick
 Terminal=false
-Categories=Game;Utility;
+Categories=Game;
+Keywords=DLSS;NVIDIA;RTX;ReShade;OptiScaler;Proton;Steam;
+StartupWMClass=dlss5oneclick

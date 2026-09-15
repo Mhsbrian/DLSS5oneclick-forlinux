@@ -4185,7 +4185,12 @@ pub fn run() -> eframe::Result {
         // and the buttons unreachable (#64). Everything scrolls now, so this can go
         // as small as the layout itself needs.
         .with_min_inner_size([640.0, 420.0])
-        .with_title(TITLE);
+        .with_title(TITLE)
+        // A stable id (the Wayland app_id / X11 class), so the desktop entry's
+        // StartupWMClass matches the window and docks show its icon. The name
+        // passed to run_native below carries the version and keys eframe's
+        // saved state, so it stays as it is.
+        .with_app_id("dlss5oneclick");
     if let Some(icon) = logo::icon_data() {
         viewport = viewport.with_icon(icon);
     }

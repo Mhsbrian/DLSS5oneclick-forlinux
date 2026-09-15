@@ -16,13 +16,14 @@ cargo build --release                       # target/release/dlss5oneclick
 cargo run -- --list-games                   # enumerate Steam/Heroic/Lutris games
 cargo run -- "<folder | name | appid>" --check   # detect mode/API/plan without installing
 packaging/build-appimage.sh                 # AppImage from a release build
+packaging/release-build.sh [vX.Y.Z]        # the release build job: clippy, tests, glibc floor, AppImage, smoke test
 ```
 
-CI (`.github/workflows/ci.yml`): clippy + test matrix on ubuntu-latest and windows-latest; a `v*` tag builds `dlss5oneclick-linux-x86_64` + the AppImage on ubuntu-22.04 (glibc 2.35 floor) and attaches both to the release. Version lives in `Cargo.toml` and flows into the user agent, self-update comparison, and GUI title.
+CI (`.github/workflows/ci.yml`): clippy + test matrix on ubuntu-latest and windows-latest for pushes to main and pull requests. Releases (`.github/workflows/release.yml`): a `v*` tag runs `packaging/release-build.sh` inside an `ubuntu:22.04` container (the glibc 2.35 floor, independent of runner images; `packaging/container-setup.sh` installs the tools and Rust) — the tag must equal the `Cargo.toml` version, then clippy + tests, a glibc-floor assertion, `packaging/build-appimage.sh` (appimagetool and the type2 runtime pinned by version and SHA-256, AppStream metainfo, zsync update information), and a smoke test that the binary and the AppImage both print `DLSS5oneclick <version>` (the self-updater cannot look inside an AppImage) — and publishes the binary, the AppImage, its `.zsync` and `SHA256SUMS` with `gh release create` (suffixed tags become pre-releases). A manual run builds the artifacts without publishing. Version lives in `Cargo.toml` and flows into the user agent, self-update comparison, GUI title and `--version`; the window's app id is the stable `dlss5oneclick`, which the desktop entry's `StartupWMClass` matches.
 
 ## Architecture
 
-Single crate, no workspace. `main.rs` dispatches on argv: a path argument runs headless CLI (flags `--check`, `--diagnose`, `--remove`, `--remove-all`, `--engine=opti`); `--update` self-updates; `--fetch <url> <file>` is a download diagnostic; no args opens the egui GUI.
+Single crate, no workspace. `main.rs` dispatches on argv: a path argument runs headless CLI (flags `--check`, `--diagnose`, `--remove`, `--remove-all`, `--engine=opti`); `--update` self-updates; `--version` prints `DLSS5oneclick <version>`; `--fetch <url> <file>` is a download diagnostic; no args opens the egui GUI.
 
 The core pipeline, shared by CLI and GUI:
 

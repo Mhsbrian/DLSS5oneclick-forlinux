@@ -1,0 +1,81 @@
+# The Linux release. On a v* tag: build the portable binary and the AppImage
+# inside ubuntu:22.04 (the glibc 2.35 floor), test and check them, and publish
+# them to the tag's GitHub release. Run it by hand (Actions > Release > Run
+# workflow) to build and download the files without publishing anything.
+#
+# The build job is packaging/release-build.sh, so a release build can be
+# reproduced locally with the command in that script's header.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # A container rather than an ubuntu-22.04 runner, so the glibc floor does
+    # not move when GitHub updates or retires its runner images.
+    container: ubuntu:22.04
+    timeout-minutes: 45
+    steps:
+      # actions/checkout needs git inside the container to make a real clone.
+      - name: Install git
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates git
+      - uses: actions/checkout@v7
+      - name: Build tools and Rust
+        run: packaging/container-setup.sh
+      - name: Build, test and package
+        env:
+          TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+        run: packaging/release-build.sh "$TAG"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dlss5oneclick-linux-x86_64
+          path: |
+            dist/dlss5oneclick-linux-x86_64
+            dist/dlss5oneclick-x86_64.AppImage
+            dist/dlss5oneclick-x86_64.AppImage.zsync
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dlss5oneclick-linux-x86_64
+          path: dist
+      - name: Publish to the tag's release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          files=(dlss5oneclick-linux-x86_64 dlss5oneclick-x86_64.AppImage
+                 dlss5oneclick-x86_64.AppImage.zsync SHA256SUMS)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Re-running a tag's workflow replaces its assets instead of failing.
+            gh release upload "$TAG" "${files[@]}" --clobber
+          else
+            # A suffixed tag (v1.2.0-rc.1) is a pre-release, which the
+            # self-updater's releases/latest never offers to anyone.
+            pre=()
+            if [[ "$TAG" == *-* ]]; then pre=(--prerelease); fi
+            gh release create "$TAG" "${files[@]}" --verify-tag \
+              --title "DLSS5oneclick ${TAG#v}" --generate-notes "${pre[@]}"
+          fi
