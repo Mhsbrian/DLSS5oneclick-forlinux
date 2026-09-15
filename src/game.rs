@@ -1132,7 +1132,14 @@ impl GameStatus {
         }
     }
     pub fn needs_bridge(&self) -> bool {
-        self.mode == Mode::Native && (self.api == Api::Dx11 || bridge_override())
+        self.needs_bridge_with(bridge_override())
+    }
+
+    /// `needs_bridge` with the `--bridge` override given rather than read, so
+    /// a test can exercise it without setting the process-wide variable that
+    /// every test running alongside would see.
+    fn needs_bridge_with(&self, forced: bool) -> bool {
+        self.mode == Mode::Native && (self.api == Api::Dx11 || forced)
     }
     pub fn complete(&self) -> bool {
         // The Remix route is its own thing: the model inside `.trex/` and the
@@ -2199,6 +2206,10 @@ mod tests {
         assert_eq!(detect_api(&dx11), Api::Dx11);
     }
 
+    /// `--bridge` forces the DX11 bridge onto a native game whose renderer
+    /// cannot be proven. Tested through `needs_bridge_with`: setting
+    /// DLSS5ONECLICK_BRIDGE here reached every test running alongside, where
+    /// a native DX12 install then read as incomplete for want of a bridge.
     #[test]
     fn bridge_override_forces_needs_bridge() {
         std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
@@ -2208,11 +2219,8 @@ mod tests {
         let st = inspect(&exe).unwrap();
         assert_eq!(st.mode, Mode::Native);
         assert_ne!(st.api, Api::Dx11);
-        assert!(!st.needs_bridge());
-        std::env::set_var(BRIDGE_ENV, "1");
-        let forced = inspect(&exe).unwrap().needs_bridge();
-        std::env::remove_var(BRIDGE_ENV);
-        assert!(forced);
+        assert!(!st.needs_bridge_with(false));
+        assert!(st.needs_bridge_with(true));
     }
 
     #[test]
