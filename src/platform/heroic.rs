@@ -196,17 +196,17 @@ mod tests {
         fs::create_dir_all(&gog_dir).unwrap();
         write(
             &root.join("legendaryConfig/legendary/installed.json"),
-            &format!(
-                r#"{{"AlphaApp": {{"title": "Alpha Game", "install_path": "{}"}}}}"#,
-                epic_dir.display()
-            ),
+            &serde_json::json!({
+                "AlphaApp": {"title": "Alpha Game", "install_path": epic_dir}
+            })
+            .to_string(),
         );
         write(
             &root.join("gog_store/installed.json"),
-            &format!(
-                r#"{{"installed": [{{"appName": "123", "install_path": "{}"}}]}}"#,
-                gog_dir.display()
-            ),
+            &serde_json::json!({
+                "installed": [{"appName": "123", "install_path": gog_dir}]
+            })
+            .to_string(),
         );
         let got = games(&root);
         assert_eq!(got.len(), 2);

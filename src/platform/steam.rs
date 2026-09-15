@@ -60,19 +60,39 @@ pub fn roots_from(home: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// All library folders of a root, the root's own steamapps included.
+/// `p` with symlinks resolved, so two spellings of one folder compare equal.
+/// Windows hands canonical paths back with a `\\?\` prefix nothing else
+/// carries, so a drive-letter one is returned without it. A path that cannot
+/// be resolved is compared as written.
+fn canon(p: &Path) -> PathBuf {
+    let c = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    #[cfg(windows)]
+    {
+        if let Some(rest) = c.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+            if rest.as_bytes().get(1) == Some(&b':') {
+                return PathBuf::from(rest);
+            }
+        }
+    }
+    c
+}
+
+/// All library folders of a root, the root's own steamapps included. Every
+/// entry is canonical, the root too: libraryfolders.vdf lists the root again
+/// under "0", and comparing a canonical entry against the root as passed in
+/// counted it twice wherever the two spellings differ (a symlinked root, or
+/// Windows' verbatim prefix and short names).
 pub fn libraries(root: &Path) -> Vec<PathBuf> {
-    let mut out = vec![root.to_path_buf()];
+    let mut out = vec![canon(root)];
     if let Ok(text) = fs::read_to_string(root.join("steamapps/libraryfolders.vdf")) {
         if let Ok(tree) = vdf::parse(&text) {
             if let Some(vdf::Value::Block(folders)) = tree.get_ci("libraryfolders") {
                 for (_, v) in &folders.0 {
                     if let vdf::Value::Block(b) = v {
                         if let Some(p) = b.string_at(&["path"]) {
-                            let p = PathBuf::from(p);
-                            let canon = p.canonicalize().unwrap_or(p);
-                            if canon.join("steamapps").is_dir() && !out.contains(&canon) {
-                                out.push(canon);
+                            let lib = canon(Path::new(p));
+                            if lib.join("steamapps").is_dir() && !out.contains(&lib) {
+                                out.push(lib);
                             }
                         }
                     }
@@ -453,8 +473,8 @@ mod tests {
             &root.join("steamapps/libraryfolders.vdf"),
             &format!(
                 "\"libraryfolders\"\n{{\n\t\"0\"\n\t{{\n\t\t\"path\"\t\t\"{}\"\n\t}}\n\t\"1\"\n\t{{\n\t\t\"path\"\t\t\"{}\"\n\t}}\n}}\n",
-                root.display(),
-                lib2.display()
+                root.display().to_string().replace('\\', "\\\\"),
+                lib2.display().to_string().replace('\\', "\\\\")
             ),
         );
         write(
@@ -476,7 +496,7 @@ mod tests {
         let games = games(&root);
         assert_eq!(games.len(), 1);
         assert_eq!(games[0].appid, "42");
-        assert_eq!(games[0].dir, lib2.join("steamapps/common/Foo Game"));
+        assert_eq!(canon(&games[0].dir), canon(&lib2.join("steamapps/common/Foo Game")));
     }
 
     #[test]

@@ -1808,12 +1808,19 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let d = t.path();
         fs::create_dir_all(d.join("Reshade-Shaders").join("SHADERS")).unwrap();
-        assert!(existing_ci(d, "RESHADE-shaders")
-            .unwrap()
-            .ends_with("Reshade-Shaders"));
+        let found = existing_ci(d, "RESHADE-shaders").unwrap();
         assert!(existing_ci(d, "nope").is_none());
         let j = join_ci(d, &["reshade-shaders", "Shaders", "New.fx"]);
-        assert_eq!(j, d.join("Reshade-Shaders").join("SHADERS").join("New.fx"));
+        if d.join("RESHADE-SHADERS").exists() {
+            // A case-insensitive filesystem (Windows) finds the name as given,
+            // and that already is the same folder.
+            assert!(found.is_dir());
+            assert!(j.parent().is_some_and(Path::is_dir));
+        } else {
+            // A case-sensitive one (Linux) needs the casing on disk back.
+            assert!(found.ends_with("Reshade-Shaders"));
+            assert_eq!(j, d.join("Reshade-Shaders").join("SHADERS").join("New.fx"));
+        }
     }
 
     #[test]

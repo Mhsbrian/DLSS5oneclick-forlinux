@@ -198,7 +198,7 @@ fn config_base() -> PathBuf {
 /// `$XDG_CONFIG_HOME` when it is absolute (the spec says relative values are
 /// invalid and must be ignored), else `$HOME/.config`. Pure, so it is tested
 /// without touching the process environment.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(target_os = "linux")]
 fn xdg_config_base(
     xdg: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
@@ -250,6 +250,7 @@ pub fn apply_overlay_to_cfg(cfg: &str, s: &Settings) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     #[test]
     fn xdg_config_base_prefers_absolute_xdg_then_home() {
         use super::xdg_config_base;
