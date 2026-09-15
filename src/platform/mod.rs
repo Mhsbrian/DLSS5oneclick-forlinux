@@ -11,6 +11,8 @@ pub mod vdf;
 
 use std::path::{Path, PathBuf};
 
+// Heroic and Lutris rows are only ever built by the Linux scan.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Launcher {
     Steam,
@@ -177,6 +179,7 @@ pub fn ensure_launch_options(
 /// vkd3d-shader's still-incomplete HLSL compiler and does not implement every
 /// intrinsic it uses (`isnan`), so the shader fails to compile and neural
 /// rendering never binds. Microsoft's real DLL knows the intrinsic.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub enum D3dcompilerAdvice {
     /// Not a Steam/Proton game, or the add-on is not installed: nothing to do.
@@ -330,15 +333,6 @@ fn which(bin: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|paths| {
         std::env::split_paths(&paths).any(|p| p.join(bin).is_file())
     })
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn ensure_d3dcompiler(
-    _game_dir: &Path,
-    _engine: crate::installer::Engine,
-    _progress: &dyn Fn(&str),
-) -> D3dcompilerAdvice {
-    D3dcompilerAdvice::NotApplicable
 }
 
 /// Candidate locations for the NVIDIA driver's Wine NGX DLLs across distros.

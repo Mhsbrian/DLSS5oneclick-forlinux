@@ -10,6 +10,10 @@
 //! two-space indent under a zero-indent `game:` line — verified against real
 //! Lutris output; anything else is ignored.
 
+// Linux is the only caller of this launcher layer; on other platforms just its
+// tests use it, so unused items there are expected rather than dead.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

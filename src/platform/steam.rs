@@ -8,6 +8,10 @@
 //! platform-neutral (fixture-tested everywhere); only the probes for real
 //! system paths are Linux-gated.
 
+// Linux is the only caller of this launcher layer; on other platforms just its
+// tests use it, so unused items there are expected rather than dead.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use super::launch_options::{self, LaunchReq};
 use super::vdf;
 use anyhow::{bail, Context, Result};
@@ -421,6 +425,8 @@ mod tests {
     fn roots_from_probes_and_dedupes() {
         let t = tempfile::tempdir().unwrap();
         let home = t.path();
+        // Made on every platform (roots_from must find it); only unix links to it.
+        #[cfg_attr(not(unix), allow(unused_variables))]
         let native = fake_root(home);
         // ~/.steam/steam as symlink to the native root must collapse to one.
         #[cfg(unix)]

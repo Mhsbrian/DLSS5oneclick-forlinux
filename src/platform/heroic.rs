@@ -11,6 +11,10 @@
 //! touched. Marked experimental in the README until verified against a live
 //! Heroic install.
 
+// Linux is the only caller of this launcher layer; on other platforms just its
+// tests use it, so unused items there are expected rather than dead.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use super::launch_options::LaunchReq;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
