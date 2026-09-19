@@ -6,6 +6,9 @@
 pub mod heroic;
 pub mod launch_options;
 pub mod lutris;
+// Only the Linux-gated scans reach parts of it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub mod shortcuts;
 pub mod steam;
 pub mod vdf;
 
@@ -18,15 +21,25 @@ pub enum Launcher {
     Steam,
     Heroic,
     Lutris,
+    /// A non-Steam game added to the Steam library (`shortcuts.vdf`).
+    SteamShortcut,
 }
 
 impl Launcher {
     pub fn label(self) -> &'static str {
         match self {
-            Launcher::Steam => "Steam",
+            // A shortcut is configured through Steam's own Properties dialog,
+            // so users (and diagnose's advice) know it as Steam.
+            Launcher::Steam | Launcher::SteamShortcut => "Steam",
             Launcher::Heroic => "Heroic",
             Launcher::Lutris => "Lutris",
         }
+    }
+
+    /// Steam proper or a non-Steam shortcut: both have a CompatToolMapping
+    /// entry, a compatdata prefix and Steam launch options.
+    pub fn is_steam(self) -> bool {
+        matches!(self, Launcher::Steam | Launcher::SteamShortcut)
     }
 }
 
@@ -35,7 +48,7 @@ impl Launcher {
 pub struct GameEntry {
     pub launcher: Launcher,
     pub name: String,
-    /// Steam appid / Heroic app_name / Lutris slug.
+    /// Steam appid (a shortcut's too) / Heroic app_name / Lutris slug.
     pub id: String,
     /// The game's install folder — what feeds `game::resolve_target`.
     pub dir: PathBuf,
@@ -55,6 +68,15 @@ pub fn scan_all() -> Vec<GameEntry> {
                 id: g.appid,
                 dir: g.dir,
                 root: g.root,
+            });
+        }
+        for s in shortcuts::games(&root) {
+            out.push(GameEntry {
+                launcher: Launcher::SteamShortcut,
+                name: s.name,
+                id: s.appid,
+                dir: s.dir,
+                root: root.clone(),
             });
         }
     }
@@ -124,7 +146,7 @@ pub fn ensure_launch_options(
     use launch_options as lo;
     let entry = entry_for_path(game_dir);
     let proton = entry.as_ref().and_then(|e| {
-        (e.launcher == Launcher::Steam).then(|| steam::proton_for(&e.root, &e.id))?
+        e.launcher.is_steam().then(|| steam::proton_for(&e.root, &e.id))?
     });
     let req = lo::required(game_dir, engine, proton.as_ref());
     let Some(entry) = entry else {
@@ -133,11 +155,13 @@ pub fn ensure_launch_options(
         };
     };
     match entry.launcher {
-        Launcher::Steam => {
-            let r = if revert {
-                steam::revert_launch_options(&entry.root, &entry.id, &req)
-            } else {
-                steam::apply_launch_options(&entry.root, &entry.id, &req)
+        Launcher::Steam | Launcher::SteamShortcut => {
+            let (root, id) = (&entry.root, &entry.id);
+            let r = match (entry.launcher, revert) {
+                (Launcher::Steam, false) => steam::apply_launch_options(root, id, &req),
+                (Launcher::Steam, true) => steam::revert_launch_options(root, id, &req),
+                (_, false) => shortcuts::apply_launch_options(root, id, &req),
+                (_, true) => shortcuts::revert_launch_options(root, id, &req),
             };
             match r {
                 Ok(outcomes) if outcomes.is_empty() => LaunchAdvice::AlreadySet,
@@ -222,27 +246,14 @@ pub fn ensure_d3dcompiler(
     let Some(entry) = entry_for_path(game_dir) else {
         return A::NotApplicable;
     };
-    if entry.launcher != Launcher::Steam {
+    if !entry.launcher.is_steam() {
         return A::NotApplicable;
     }
     // A game not mapped to Proton needs no Wine d3dcompiler at all.
     if steam::proton_for(&entry.root, &entry.id).is_none() {
         return A::NotApplicable;
     }
-    let g = steam::SteamGame {
-        appid: entry.id.clone(),
-        name: entry.name.clone(),
-        dir: entry.dir.clone(),
-        library: entry
-            .dir
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .unwrap_or(&entry.root)
-            .to_path_buf(),
-        root: entry.root.clone(),
-    };
-    let Some(cd) = steam::compatdata(&g) else {
+    let Some(cd) = steam::compatdata(&steam_game(&entry)) else {
         return A::NotApplicable;
     };
     let sys32 = cd.join("pfx/drive_c/windows/system32/d3dcompiler_47.dll");
@@ -256,7 +267,7 @@ pub fn ensure_d3dcompiler(
     // protontricks knows the Steam layout and points Wine at the right prefix.
     if which("protontricks") {
         progress("Installing d3dcompiler_47 into the Proton prefix (this can take a minute)");
-        match run_winetricks_d3dcompiler(WinetricksKind::Protontricks(&entry.id)) {
+        match run_winetricks_d3dcompiler(WinetricksKind::Protontricks(&entry.id, &entry.root)) {
             Ok(()) if std::fs::metadata(&sys32).map(|m| m.len() >= D3DCOMPILER_REAL_MIN).unwrap_or(false) => {
                 A::Installed { via: "protontricks".into() }
             }
@@ -286,7 +297,8 @@ pub fn ensure_d3dcompiler(
 
 #[cfg(target_os = "linux")]
 enum WinetricksKind<'a> {
-    Protontricks(&'a str),
+    /// Appid and the Steam root it belongs to.
+    Protontricks(&'a str, &'a Path),
     Winetricks(&'a Path),
 }
 
@@ -295,9 +307,14 @@ enum WinetricksKind<'a> {
 fn run_winetricks_d3dcompiler(kind: WinetricksKind) -> Result<(), String> {
     use std::process::Command;
     let mut cmd = match kind {
-        WinetricksKind::Protontricks(appid) => {
+        WinetricksKind::Protontricks(appid, root) => {
             let mut c = Command::new("protontricks");
-            c.arg(appid).arg("-q").arg("d3dcompiler_47");
+            // With more than one Steam install on disk protontricks asks which
+            // to use in a GUI dialog, and an unattended run waits on it forever.
+            c.env("STEAM_DIR", root)
+                .arg(appid)
+                .arg("-q")
+                .arg("d3dcompiler_47");
             c
         }
         WinetricksKind::Winetricks(pfx) => {
@@ -333,6 +350,30 @@ fn which(bin: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|paths| {
         std::env::split_paths(&paths).any(|p| p.join(bin).is_file())
     })
+}
+
+/// The `SteamGame` view of a Steam entry, for its Proton prefix. A store game's
+/// library sits three levels above its folder (`<library>/steamapps/common/<dir>`);
+/// a non-Steam shortcut's prefix is always in the Steam root's own library.
+#[cfg(target_os = "linux")]
+fn steam_game(e: &GameEntry) -> steam::SteamGame {
+    let library = match e.launcher {
+        Launcher::SteamShortcut => e.root.clone(),
+        _ => e
+            .dir
+            .parent() // common/
+            .and_then(|p| p.parent()) // steamapps/
+            .and_then(|p| p.parent()) // library
+            .unwrap_or(&e.root)
+            .to_path_buf(),
+    };
+    steam::SteamGame {
+        appid: e.id.clone(),
+        name: e.name.clone(),
+        dir: e.dir.clone(),
+        library,
+        root: e.root.clone(),
+    }
 }
 
 /// Candidate locations for the NVIDIA driver's Wine NGX DLLs across distros.
@@ -378,7 +419,7 @@ pub fn host_context(st: &crate::game::GameStatus) -> crate::diagnose::HostContex
         ..HostContext::default()
     };
     let proton = entry.as_ref().and_then(|e| {
-        (e.launcher == Launcher::Steam).then(|| steam::proton_for(&e.root, &e.id))?
+        e.launcher.is_steam().then(|| steam::proton_for(&e.root, &e.id))?
     });
     let req = lo::required(game_dir, engine, proton.as_ref());
     ctx.required_display = lo::display(&req);
@@ -386,8 +427,13 @@ pub fn host_context(st: &crate::game::GameStatus) -> crate::diagnose::HostContex
     ctx.proton_needs_nvapi_env = proton.is_some() && steam::nvapi_env_needed(proton.as_ref());
     ctx.d3dcompiler_missing_feeder = !lo::d3dcompiler_present(game_dir);
     if let Some(e) = &entry {
-        if e.launcher == Launcher::Steam {
-            ctx.steam_options = steam::read_launch_options(&e.root, &e.id)
+        if e.launcher.is_steam() {
+            let options = if e.launcher == Launcher::SteamShortcut {
+                shortcuts::read_launch_options(&e.root, &e.id)
+            } else {
+                steam::read_launch_options(&e.root, &e.id)
+            };
+            ctx.steam_options = options
                 .into_iter()
                 .map(|(file, cur)| {
                     let cur = cur.unwrap_or_default();
@@ -400,20 +446,7 @@ pub fn host_context(st: &crate::game::GameStatus) -> crate::diagnose::HostContex
                     (label, lo::merge(&cur, &req) == cur)
                 })
                 .collect();
-            let g = steam::SteamGame {
-                appid: e.id.clone(),
-                name: e.name.clone(),
-                dir: e.dir.clone(),
-                library: e
-                    .dir
-                    .parent() // common/
-                    .and_then(|p| p.parent()) // steamapps/
-                    .and_then(|p| p.parent()) // library
-                    .unwrap_or(&e.root)
-                    .to_path_buf(),
-                root: e.root.clone(),
-            };
-            if let Some(cd) = steam::compatdata(&g) {
+            if let Some(cd) = steam::compatdata(&steam_game(e)) {
                 ctx.prefix_nvngx =
                     Some(cd.join("pfx/drive_c/windows/system32/nvngx.dll").is_file());
                 if st.mfg_asi {
@@ -542,6 +575,23 @@ mod tests {
         // `sh` is on PATH on every Linux box the tool runs on; a random name is not.
         assert!(which("sh"));
         assert!(!which("dlss5oneclick-no-such-binary-42"));
+    }
+
+    #[test]
+    fn shortcut_prefixes_live_in_the_steam_root() {
+        let entry = |launcher, dir: &str| GameEntry {
+            launcher,
+            name: "G".into(),
+            id: "3466011274".into(),
+            dir: PathBuf::from(dir),
+            root: PathBuf::from("/steam"),
+        };
+        let shortcut = entry(Launcher::SteamShortcut, "/games/G");
+        assert_eq!(steam_game(&shortcut).library, PathBuf::from("/steam"));
+        let store = entry(Launcher::Steam, "/lib/steamapps/common/G");
+        assert_eq!(steam_game(&store).library, PathBuf::from("/lib"));
+        assert!(Launcher::SteamShortcut.is_steam() && !Launcher::Lutris.is_steam());
+        assert_eq!(Launcher::SteamShortcut.label(), "Steam");
     }
 
     #[test]

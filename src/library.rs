@@ -409,6 +409,21 @@ fn created(p: &Path) -> SystemTime {
 /// Linux: Heroic covers Epic and GOG installs; Lutris is its own store row.
 #[cfg(target_os = "linux")]
 fn scan_linux_launchers(out: &mut Vec<Game>) {
+    // Non-Steam shortcuts are Steam rows too: same Proton prefixes, same
+    // launch options, and Steam's grid artwork for the poster.
+    for root in crate::platform::steam::roots() {
+        for s in crate::platform::shortcuts::games(&root) {
+            out.push(Game {
+                title: s.name,
+                store: Store::Steam,
+                installed: created(&s.dir),
+                poster: crate::platform::shortcuts::poster(&root, &s.appid)
+                    .map_or_else(|| Poster::ExeIcon(s.dir.clone()), Poster::File),
+                exe_hint: None,
+                dir: s.dir,
+            });
+        }
+    }
     for root in crate::platform::heroic::roots() {
         for g in crate::platform::heroic::games(&root) {
             out.push(Game {
