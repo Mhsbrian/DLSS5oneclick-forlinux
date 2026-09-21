@@ -1,167 +1,288 @@
-//! "Report a bug": open a GitHub issue for this fork with the facts already
-//! filled in — tool version, card, driver, game, route, the last diagnosis and
-//! log tails — so a report is useful without the user assembling any of it.
-//! Nothing is sent on its own: the browser opens the prefilled page and the
-//! user decides. All of it is editable before they submit.
+//! One zip with everything a bug report needs: the logs and inis this tool and
+//! its components write, Diagnose's findings, a listing of the game folder,
+//! and what the machine is. Half the tracker was three replies of "please
+//! attach X" before the file that mattered showed up.
 
-use std::path::Path;
+use crate::{diagnose, game, gpu, settings};
+use anyhow::{Context, Result};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
-/// This fork's issue tracker.
-pub const REPORT_REPO: &str = "Mhsbrian/DLSS5oneclick-forlinux";
+/// Files worth carrying, relative to the game folder. Absent ones are skipped.
+const FILES: [&str; 19] = [
+    "ReShade.log",
+    "ReShade.log1",
+    "ReShade.log2",
+    "ReShade.ini",
+    "ReShadePreset.ini",
+    "ReShadeVR.ini",
+    "dlss5-feed.log",
+    "dlss5-feed.cfg",
+    "OptiScaler.log",
+    "OptiScaler.ini",
+    "re2_framework_log.txt",
+    "nrpre-ring.txt",
+    "dgVoodoo.conf",
+    "host64/ReShade.log",
+    "host64/ReShade.ini",
+    "host64/dlss5-feed-host.log",
+    "host64/ReShadePreset.ini",
+    ".dlss5oneclick-optiscaler-manifest",
+    ".dlss5oneclick-aio-manifest",
+];
 
-/// The facts a report carries. The GUI fills these from the current game.
-#[derive(Default)]
-pub struct Report {
-    pub version: String,
-    pub game: String,
-    pub gpu: String,
-    pub driver: String,
-    pub api: String,
-    pub route: String,
-    pub diagnosis: Vec<String>,
-    /// `(filename, tail)` for each log found beside the game.
-    pub logs: Vec<(String, String)>,
+/// A log can run to hundreds of megabytes; the end is where the answer is.
+const TAIL_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Where the zip lands: somewhere the user will actually find it.
+///
+/// Windows keeps it on the Desktop. Linux desktops may have no `~/Desktop` at
+/// all (and localise its name), so the XDG setting decides, then a real
+/// `~/Desktop`, then the home folder — anywhere but `/tmp`, which a reboot
+/// clears before the user has attached the file.
+#[cfg(target_os = "linux")]
+fn bundle_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("XDG_DESKTOP_DIR").map(PathBuf::from) {
+        if d.is_dir() {
+            return d;
+        }
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let desktop = home.as_ref().map(|h| h.join("Desktop"));
+    match (desktop, home) {
+        (Some(d), _) if d.is_dir() => d,
+        (_, Some(h)) if h.is_dir() => h,
+        _ => std::env::temp_dir(),
+    }
 }
 
-impl Report {
-    /// The issue title — short, the user edits it.
-    pub fn title(&self) -> String {
-        let game = if self.game.is_empty() {
-            "a game".to_string()
-        } else {
-            self.game.clone()
-        };
-        format!("[bug] {game}: ")
-    }
+#[cfg(not(target_os = "linux"))]
+fn bundle_dir() -> PathBuf {
+    std::env::var_os("USERPROFILE")
+        .map(|u| PathBuf::from(u).join("Desktop"))
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(std::env::temp_dir)
+}
 
-    /// The issue body, GitHub-flavoured Markdown.
-    pub fn body(&self) -> String {
-        let mut b = String::new();
-        b.push_str("_Describe what happened here._\n\n");
-        b.push_str(&format!("**Tool:** dlss5oneclick {} (Linux)\n", self.version));
-        b.push_str(&format!("**GPU:** {}\n", nonempty(&self.gpu, "?")));
-        b.push_str(&format!("**Driver:** {}\n", nonempty(&self.driver, "?")));
-        b.push_str(&format!("**Game:** {}\n", nonempty(&self.game, "?")));
-        b.push_str(&format!("**API:** {}\n", nonempty(&self.api, "?")));
-        b.push_str(&format!("**Route:** {}\n", nonempty(&self.route, "?")));
-        if !self.diagnosis.is_empty() {
-            b.push_str("\n### Diagnosis\n");
-            for f in &self.diagnosis {
-                b.push_str(&format!("- {f}\n"));
+/// Write the bundle where `bundle_dir` says and return its path.
+pub fn write_bundle(exe: &Path) -> Result<PathBuf> {
+    write_bundle_in(&bundle_dir(), exe)
+}
+
+/// The bundle, written into `out_dir`. Split out so tests name their own
+/// folder instead of dropping a zip on the machine running them.
+pub fn write_bundle_in(out_dir: &Path, exe: &Path) -> Result<PathBuf> {
+    let d = exe.parent().context("exe has no parent")?;
+    let stem = exe
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "game".into());
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|t| t.as_secs())
+        .unwrap_or(0);
+    let out = out_dir.join(format!("dlss5oneclick-report-{stem}-{stamp}.zip"));
+
+    let file = fs::File::create(&out).with_context(|| format!("creating {}", out.display()))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    zip.start_file("summary.txt", opts)?;
+    zip.write_all(summary(exe).as_bytes())?;
+
+    zip.start_file("folder.txt", opts)?;
+    zip.write_all(listing(d).as_bytes())?;
+
+    for rel in FILES {
+        let p = d.join(rel);
+        if let Some(bytes) = tail(&p) {
+            zip.start_file(format!("game/{rel}"), opts)?;
+            zip.write_all(&bytes)?;
+        }
+    }
+    // The sidecars: which release of each piece this tool placed.
+    if let Ok(rd) = fs::read_dir(d) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.ends_with(".dlss5oneclick") {
+                if let Ok(t) = fs::read_to_string(e.path()) {
+                    zip.start_file(format!("game/{n}"), opts)?;
+                    zip.write_all(t.as_bytes())?;
+                }
             }
         }
-        for (name, tail) in &self.logs {
-            b.push_str(&format!(
-                "\n<details><summary>{name} (tail)</summary>\n\n```\n{}\n```\n</details>\n",
-                tail.trim_end()
+    }
+    if let Some(bytes) = tail(&settings::Settings::path()) {
+        zip.start_file("settings.json", opts)?;
+        zip.write_all(&bytes)?;
+    }
+    zip.finish()?;
+    Ok(out)
+}
+
+fn summary(exe: &Path) -> String {
+    let mut s = format!(
+        "dlss5oneclick {}\nexe: {}\n",
+        env!("CARGO_PKG_VERSION"),
+        exe.display()
+    );
+    if let Some(v) = gpu::nvidia_driver() {
+        s.push_str(&format!("nvidia driver: {v}\n"));
+    }
+    match game::inspect(exe) {
+        Ok(st) => {
+            s.push_str(&format!(
+                "{}-bit | {} (detected {}) | mode={:?} (detected {:?}) | reshade={} headers={} feeder={} lumenite={} dlss5={} upstream={} aio={} dlssnr={} dlss={} bridge={} opti={} mfg={} reframework={} | gpu={} | complete={}\n",
+                st.bitness,
+                st.api.label(),
+                st.api_detected.label(),
+                st.mode,
+                st.mode_detected,
+                st.reshade,
+                st.headers,
+                st.feeder,
+                st.lumenite,
+                st.dlss5_addon,
+                st.upstream,
+                st.aio,
+                st.dlssnr,
+                st.dlss,
+                st.bridge,
+                st.opti,
+                st.mfg,
+                st.reframework,
+                st.gpu
+                    .as_ref()
+                    .map(|(g, t)| format!("{} [{}]", g.name, t.label()))
+                    .unwrap_or_else(|| "unknown".into()),
+                st.complete()
             ));
-        }
-        b.push_str("\n---\n_Filled in by dlss5oneclick — edit anything before submitting._\n");
-        b
-    }
-
-    /// The GitHub "new issue" URL with title and body prefilled.
-    pub fn url(&self) -> String {
-        issue_url(&self.title(), &self.body())
-    }
-}
-
-fn nonempty<'a>(s: &'a str, fallback: &'a str) -> &'a str {
-    if s.trim().is_empty() {
-        fallback
-    } else {
-        s
-    }
-}
-
-/// Build the prefilled issue URL, clamping the body so the URL stays within what
-/// browsers accept (GitHub truncates very long ones anyway).
-pub fn issue_url(title: &str, body: &str) -> String {
-    format!(
-        "https://github.com/{REPORT_REPO}/issues/new?title={}&body={}",
-        urlencode(title),
-        urlencode(&clamp(body, 6000))
-    )
-}
-
-/// Percent-encode for a URL query value: everything but the unreserved set.
-pub fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 2);
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(b as char)
+            for p in &st.problems {
+                s.push_str(&format!("! {p}\n"));
             }
-            _ => out.push_str(&format!("%{b:02X}")),
+            s.push_str("\n--diagnose:\n");
+            for f in diagnose::diagnose(&st) {
+                let tag = match f.level {
+                    diagnose::Level::Ok => "ok  ",
+                    diagnose::Level::Warn => "warn",
+                    diagnose::Level::Bad => "FAIL",
+                };
+                s.push_str(&format!("[{tag}] {}\n", f.text));
+            }
+        }
+        Err(e) => s.push_str(&format!("inspect failed: {e:#}\n")),
+    }
+    s
+}
+
+/// Name and size of everything in the game folder, plus `host64\` and the
+/// shader folders, one level each. Enough to see which proxy DLLs are there.
+fn listing(d: &Path) -> String {
+    let mut s = String::new();
+    for sub in [
+        "",
+        "host64",
+        "reshade-shaders/Shaders",
+        "reshade-shaders/Shaders/include",
+        "reshade-shaders/Textures",
+    ] {
+        let p = if sub.is_empty() {
+            d.to_path_buf()
+        } else {
+            d.join(sub)
+        };
+        let Ok(rd) = fs::read_dir(&p) else { continue };
+        s.push_str(&format!("[{}]\n", if sub.is_empty() { "." } else { sub }));
+        let mut rows: Vec<(String, u64, bool)> = rd
+            .flatten()
+            .map(|e| {
+                let m = e.metadata().ok();
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    m.as_ref().map(|m| m.len()).unwrap_or(0),
+                    m.is_some_and(|m| m.is_dir()),
+                )
+            })
+            .collect();
+        rows.sort();
+        for (n, len, dir) in rows {
+            if dir {
+                s.push_str(&format!("  {n}/\n"));
+            } else {
+                s.push_str(&format!("  {n}  {len}\n"));
+            }
         }
     }
-    out
+    s
 }
 
-/// Truncate to at most `max` bytes on a char boundary, noting the cut.
-fn clamp(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
+/// The last `TAIL_BYTES` of a file, or all of it when smaller; `None` when it
+/// does not exist or cannot be read.
+fn tail(p: &Path) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = fs::File::open(p).ok()?;
+    let len = f.metadata().ok()?.len();
+    let mut out = Vec::new();
+    if len > TAIL_BYTES {
+        f.seek(SeekFrom::Start(len - TAIL_BYTES)).ok()?;
+        out.extend_from_slice(
+            format!("[... first {} bytes omitted ...]\n", len - TAIL_BYTES).as_bytes(),
+        );
     }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}\n\n…(truncated)", &s[..end])
-}
-
-/// The last `lines` lines of a text file, or `None` when it is not there.
-pub fn tail(path: &Path, lines: usize) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let all: Vec<&str> = text.lines().collect();
-    let start = all.len().saturating_sub(lines);
-    Some(all[start..].join("\n"))
+    f.read_to_end(&mut out).ok()?;
+    Some(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::testutil::make_pe;
 
     #[test]
-    fn urlencode_encodes_reserved_and_keeps_unreserved() {
-        assert_eq!(urlencode("a-b_c.~"), "a-b_c.~");
-        assert_eq!(urlencode("hello world"), "hello%20world");
-        assert_eq!(urlencode("a\nb"), "a%0Ab");
-        assert_eq!(urlencode("100%"), "100%25");
-        assert_eq!(urlencode("#&="), "%23%26%3D");
+    fn bundle_carries_logs_markers_listing_and_summary() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe(&d.join("game.exe"), game::PE_X64);
+        fs::create_dir_all(d.join("host64")).unwrap();
+        fs::write(d.join("ReShade.log"), "Initializing crosire's ReShade").unwrap();
+        fs::write(d.join("host64").join("ReShade.log"), "host").unwrap();
+        fs::write(d.join("nvngx_dlss.dll.dlss5oneclick"), "v310.9.1").unwrap();
+        // Into the tempdir, never this machine's Desktop.
+        let out = write_bundle_in(d, &exe).unwrap();
+        let f = fs::File::open(&out).unwrap();
+        let mut z = zip::ZipArchive::new(f).unwrap();
+        let names: Vec<String> = z.file_names().map(str::to_owned).collect();
+        for want in [
+            "summary.txt",
+            "folder.txt",
+            "game/ReShade.log",
+            "game/host64/ReShade.log",
+            "game/nvngx_dlss.dll.dlss5oneclick",
+        ] {
+            assert!(
+                names.iter().any(|n| n == want),
+                "{want} missing from {names:?}"
+            );
+        }
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut z.by_name("summary.txt").unwrap(), &mut s).unwrap();
+        assert!(s.contains("--diagnose:"), "{s}");
+        assert!(s.contains("64-bit"), "{s}");
+        fs::remove_file(out).unwrap();
     }
 
     #[test]
-    fn clamp_is_char_boundary_safe() {
-        let s = "é".repeat(10); // 2 bytes each = 20 bytes
-        let out = clamp(&s, 5);
-        assert!(out.starts_with("éé")); // never splits a char
-        assert!(out.contains("truncated"));
-        assert_eq!(clamp("short", 100), "short");
-    }
-
-    #[test]
-    fn report_url_carries_the_facts() {
-        let r = Report {
-            version: "0.14.0".into(),
-            game: "Cyberpunk 2077".into(),
-            gpu: "RTX 4090".into(),
-            driver: "610.57.04".into(),
-            api: "DX12".into(),
-            route: "OptiScaler -> model".into(),
-            diagnosis: vec!["NR evaluating".into()],
-            logs: vec![("OptiScaler.log".into(), "line1\nline2".into())],
-        };
-        let body = r.body();
-        assert!(body.contains("Cyberpunk 2077"));
-        assert!(body.contains("RTX 4090"));
-        assert!(body.contains("OptiScaler -> model"));
-        assert!(body.contains("NR evaluating"));
-        assert!(body.contains("OptiScaler.log"));
-        let url = r.url();
-        assert!(url.starts_with(&format!("https://github.com/{REPORT_REPO}/issues/new?title=")));
-        assert!(url.contains("Cyberpunk"));
-        // Title stays short; the game leads it.
-        assert!(r.title().starts_with("[bug] Cyberpunk 2077:"));
+    fn tail_keeps_the_end_of_a_big_log() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("big.log");
+        let mut body = vec![b'a'; (TAIL_BYTES + 10) as usize];
+        body.extend_from_slice(b"THE END");
+        fs::write(&p, &body).unwrap();
+        let got = tail(&p).unwrap();
+        assert!(got.starts_with(b"[... first 17 bytes omitted ...]"));
+        assert!(got.ends_with(b"THE END"));
+        assert!(tail(&t.path().join("none.log")).is_none());
     }
 }

@@ -34,7 +34,9 @@ fn push_native(req: &mut LaunchReq, name: &str) {
 
 pub fn required(game_dir: &Path, engine: Engine, proton: Option<&ProtonInfo>) -> LaunchReq {
     let mut req = LaunchReq::default();
-    if engine == Engine::ReShade && d3dcompiler_present(game_dir) {
+    // Both ReShade routes (the RenoDX add-on and the standalone AIO) load a
+    // consumer that compiles its neural pass through d3dcompiler_47.
+    if engine != Engine::Opti && d3dcompiler_present(game_dir) {
         req.overrides
             .push(("d3dcompiler_47".into(), "n".into()));
     }
@@ -265,6 +267,25 @@ mod tests {
 
     /// dgVoodoo's d3d9.dll and REFramework's dinput8.dll load under Proton only
     /// with their own overrides; a plain game gets neither, and a dinput8.dll
+    /// The standalone AIO is a ReShade add-on like the RenoDX one, so under
+    /// Proton it needs the same real `d3dcompiler_47` override; OptiScaler,
+    /// which compiles nothing of its own, does not.
+    #[test]
+    fn both_reshade_routes_get_the_d3dcompiler_override() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let has = |r: &LaunchReq, n: &str| r.overrides.iter().any(|(k, _)| k == n);
+        // Nothing beside the exe yet: the override is only for a real DLL.
+        assert!(!has(&required(d, Engine::ReShade, None), "d3dcompiler_47"));
+        std::fs::write(d.join("d3dcompiler_47.dll"), vec![0u8; 4_800_000]).unwrap();
+        for e in [Engine::ReShade, Engine::Aio] {
+            let r = required(d, e, None);
+            assert!(has(&r, "d3dcompiler_47"), "{e:?}: {r:?}");
+            assert!(has(&r, "dxgi"), "{e:?}: {r:?}");
+        }
+        assert!(!has(&required(d, Engine::Opti, None), "d3dcompiler_47"));
+    }
+
     /// that is some other mod is left alone.
     #[test]
     fn dgvoodoo_and_reframework_get_their_proton_overrides() {

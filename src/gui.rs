@@ -149,9 +149,15 @@ pub struct App {
     /// OptiScaler route: install wilsjo2's pre-SR multipass fork instead of
     /// Dagherbou's build (#72).
     opti_presr: bool,
+    /// RTX 20/30 multi-frame generation on the OptiScaler route: ShyVortex's
+    /// build with the Turing/Ampere unlock. Read back from the manifest's
+    /// repo line, so it follows the folder like the RTX 40 tick.
+    ampere_mfg: bool,
     /// ReShade route: pin the classic DLSS 5 add-on build, which the Feeder's
     /// host measured to work on NVIDIA 616.64 where the current one faults (#69).
     renodx_classic: bool,
+    /// Ask for the newest DLSS 5 add-on build instead of the default 4.70.
+    renodx_newest: bool,
     /// RTX 40 multi-frame generation (#83): mavismmg's add-on on the ReShade
     /// route, the pre-SR OptiScaler build's own unlock there. Opens on what the
     /// game already has.
@@ -309,7 +315,9 @@ impl App {
             working_scale: 1.0,
             upstream_preset: 3,
             opti_presr: false,
+            ampere_mfg: false,
             renodx_classic: false,
+            renodx_newest: false,
             ada_mfg: false,
             renodx: RenodxLookup::Idle,
             renodx_rx: None,
@@ -411,6 +419,31 @@ impl App {
             // own switch in OptiScaler.ini.
             self.ada_mfg = matches!(&self.status, Some(Ok(s)) if s.mfg || s.mfg_asi)
                 || dir.is_some_and(installer::opti_ada_mfg);
+            self.ampere_mfg = self
+                .status
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .and_then(|s| std::fs::read_to_string(s.game_dir().join(game::OPTI_MANIFEST)).ok())
+                .is_some_and(|m| {
+                    m.lines()
+                        .any(|l| l.trim() == format!("# repo {}", installer::OPTI_UNLOCKED_REPO))
+                });
+            // Same for the add-on build ticks: the tag recorded beside the
+            // add-on says which build is in, so the ticks come back the way
+            // the last Install left them instead of clearing on every
+            // reselect (#101).
+            let tag = self
+                .status
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .and_then(|s| {
+                    std::fs::read_to_string(s.consumer_dir().join(game::DLSS5_ADDON_MARKER)).ok()
+                })
+                .map(|t| t.trim().to_owned());
+            self.renodx_classic = tag.as_deref() == Some(installer::RENODX_CLASSIC_TAG);
+            self.renodx_newest = tag.as_deref().is_some_and(|t| {
+                t != installer::RENODX_CLASSIC_TAG && t != installer::RENODX_DEFAULT_TAG
+            });
             self.start_renodx_lookup();
         }
         self.reload_knobs_and_perf();
@@ -509,7 +542,9 @@ impl App {
             remix_swap: self.remix_swap_on,
             opti_presr: self.opti_presr,
             classic_addon: self.renodx_classic,
+            newest_addon: self.renodx_newest,
             ada_mfg: self.ada_mfg,
+            ampere_mfg: self.ampere_mfg,
             upstream_preset: if self.upstream_on {
                 self.upstream_preset
             } else {
@@ -541,10 +576,10 @@ impl App {
         let logs = ["ReShade.log", "dlss5-feed.log", "OptiScaler.log"]
             .iter()
             .filter_map(|n| {
-                crate::report::tail(&game::join_ci(&dir, &[n]), 25).map(|t| (n.to_string(), t))
+                crate::bugreport::tail(&game::join_ci(&dir, &[n]), 25).map(|t| (n.to_string(), t))
             })
             .collect();
-        let r = crate::report::Report {
+        let r = crate::bugreport::Report {
             version: env!("CARGO_PKG_VERSION").to_string(),
             game: exe
                 .file_stem()
@@ -598,7 +633,10 @@ impl App {
                         }
                     )
                 })
-                .map_err(|e| format!("{e:#}"))
+                .map_err(|e| {
+                    let dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
+                    installer::access_denied_hint(&format!("{e:#}"), &dir)
+                })
             } else {
                 let p_tx = tx.clone();
                 let s_tx = tx.clone();
@@ -636,6 +674,8 @@ impl App {
                         }
                         Ok(if engine == Engine::Opti {
                             "Done. In game: Insert opens the OptiScaler overlay → enable Neural Rendering.".to_owned()
+                        } else if engine == Engine::Aio {
+                            "Done. In game: turn the game's own upscaling, anti-aliasing and frame generation off, run windowed; Home opens ReShade → Add-ons tab → Standalone DLSS-NR + SR.".to_owned()
                         } else {
                             "Done. In game: Home opens ReShade → Add-ons tab → DLSS 5 Neural Rendering → enable. (Home tab saying \"no effect files\" is normal on games with their own DLSS.)".to_owned()
                         })
@@ -817,6 +857,8 @@ impl App {
             }
             self.engine = if st.opti {
                 Engine::Opti
+            } else if st.aio {
+                Engine::Aio
             } else {
                 Engine::ReShade
             };
@@ -965,6 +1007,19 @@ impl App {
             }
             Err(e) => self.log.push(LogLine::Fail(format!("{e:#}"))),
         }
+    }
+
+    fn save_report(&mut self) {
+        let Some(exe) = self.exe() else { return };
+        self.log.clear();
+        self.progress_msg.clear();
+        self.log.push(match crate::report::write_bundle(&exe) {
+            Ok(p) => LogLine::Ok(format!(
+                "Report written: {} — attach that zip to the GitHub issue.",
+                p.display()
+            )),
+            Err(e) => LogLine::Fail(format!("{e:#}")),
+        });
     }
 
     fn pump_update(&mut self) {
@@ -1217,6 +1272,20 @@ const TILE_FEEDER32: Tile = Tile {
     optional: false,
 };
 
+const TILE_AIO: Tile = Tile {
+    title: "Standalone AIO \u{00b7} experimental",
+    detail: "standalone-dlssnr.addon64 + nvngx.dll (kibblerz) \u{00b7} nvngx_dlssnr.dll",
+    ok: |s| s.aio && s.dlssnr,
+    optional: false,
+};
+
+const TILE_AIO_RUNTIME: Tile = Tile {
+    title: "NVIDIA runtimes",
+    detail: "nvngx_dlss.dll \u{00b7} nvngx_dlssg.dll for frame generation",
+    ok: |s| s.dlss,
+    optional: false,
+};
+
 const TILE_OPTI: Tile = Tile {
     title: "OptiScaler + NR pass",
     detail: "Dagherbou fork as dxgi.dll · Insert opens its overlay",
@@ -1368,6 +1437,9 @@ fn base_tiles(st: Option<&GameStatus>, engine: Engine, upstream_on: bool) -> Vec
     if st.is_some_and(|s| s.remix.is_some()) {
         return vec![&TILE_REMIX_MODEL, &TILE_REMIX_ON];
     }
+    if engine == Engine::Aio || st.is_some_and(|s| s.aio && !s.opti) {
+        return vec![&TILES_NATIVE[1], &TILE_AIO, &TILE_AIO_RUNTIME];
+    }
     match st.map(|s| s.mode) {
         Some(game::Mode::Native) if engine == Engine::Opti || st.is_some_and(|s| s.opti) => {
             vec![&TILES_NATIVE[0], &TILE_OPTI, &TILE_OPTI_MODEL]
@@ -1398,6 +1470,40 @@ fn base_tiles(st: Option<&GameStatus>, engine: Engine, upstream_on: bool) -> Vec
             })
             .collect(),
     }
+}
+
+/// The height an engine card needs at `col_w` for its text to stay inside
+/// the border. A fixed 74 px fitted the two lines at 1500 px and let them
+/// wrap past the bottom edge in narrower windows (#94).
+fn engine_card_height(ui: &egui::Ui, col_w: f32, title: &str, lines: &[&str], note: &str) -> f32 {
+    let painter = ui.painter();
+    // Widest pill state, so the text column never grows when the state changes.
+    let pill_w = painter
+        .layout_no_wrap(
+            "UNAVAILABLE".to_owned(),
+            t::plex_semibold(10.0),
+            t::TEXT_DIM,
+        )
+        .size()
+        .x;
+    let inner_w = (col_w - 38.0 - 12.0 - 32.0 - pill_w).max(40.0);
+    let mut h = 10.0 + 8.0;
+    h += painter
+        .layout(title.to_owned(), t::plex_semibold(13.5), t::TEXT, inner_w)
+        .size()
+        .y;
+    for l in lines
+        .iter()
+        .copied()
+        .chain((!note.is_empty()).then_some(note))
+    {
+        h += 2.0
+            + painter
+                .layout(l.to_owned(), t::plex(11.0), t::TEXT, inner_w)
+                .size()
+                .y;
+    }
+    h.ceil().max(74.0)
 }
 
 /// One selectable engine card: painted like a component tile, but clickable,
@@ -1461,7 +1567,17 @@ fn engine_card(
         "UNAVAILABLE"
     };
     let pill_font = t::plex_semibold(10.0);
-    let galley = painter.layout_no_wrap(pill_text.to_owned(), pill_font, t::BG);
+    // The colour is baked into the galley at layout time; the one passed to
+    // painter.galley() is only a fallback. Laying out in BG and "recolouring"
+    // later drew CHOOSE in the background colour on every build so far (#77).
+    let pill_color = if selected {
+        t::BG
+    } else if enabled {
+        t::TEXT_SOFT
+    } else {
+        t::TEXT_DIM
+    };
+    let galley = painter.layout_no_wrap(pill_text.to_owned(), pill_font, pill_color);
     let pill = egui::Rect::from_min_size(
         egui::pos2(rect.right() - galley.size().x - 32.0, rect.top() + 12.0),
         galley.size() + Vec2::new(20.0, 8.0),
@@ -1486,7 +1602,8 @@ fn engine_card(
         painter.galley(
             pill.min + Vec2::new(10.0, 4.0),
             galley,
-            if enabled { t::TEXT_OFF } else { t::TEXT_DIM },
+            // TEXT_OFF on the tile fill was barely legible (#77).
+            if enabled { t::TEXT_SOFT } else { t::TEXT_DIM },
         );
     }
 
@@ -2580,7 +2697,7 @@ impl eframe::App for App {
         };
 
         // A Vulkan game blocks the ReShade engine only; OptiScaler reaches it (#46).
-        if self.engine == Engine::ReShade {
+        if self.engine != Engine::Opti {
             if let Some(p) = ok_status
                 .as_ref()
                 .and_then(game::GameStatus::reshade_engine_problem)
@@ -3126,6 +3243,33 @@ impl eframe::App for App {
                                 game::set_mode_override(choice);
                                 self.inspect_resolved();
                             }
+                            // API: same idea. Unknown is assumed DX12, and a
+                            // DX11 game read that way never gets the bridge.
+                            let mut api = game::api_override();
+                            let api_name = |a: Option<game::Api>| match a {
+                                None => match s.api_detected {
+                                    game::Api::Unknown => "Auto: API unknown, assuming DX12",
+                                    game::Api::Dx11 => "Auto: DX11",
+                                    game::Api::Dx12 => "Auto: DX12",
+                                    game::Api::Dx9 => "Auto: DX9",
+                                    game::Api::Dx10 => "Auto: DX10",
+                                    game::Api::Vulkan => "Auto: Vulkan",
+                                },
+                                Some(game::Api::Dx11) => "Force DX11",
+                                Some(_) => "Force DX12",
+                            };
+                            let api_before = api;
+                            egui::ComboBox::from_id_salt("api_pick")
+                                .selected_text(RichText::new(api_name(api)).font(t::plex(12.0)).color(t::TEXT_SOFT))
+                                .show_ui(ui, |ui| {
+                                    for a in [None, Some(game::Api::Dx11), Some(game::Api::Dx12)] {
+                                        ui.selectable_value(&mut api, a, api_name(a));
+                                    }
+                                });
+                            if api != api_before && !self.running {
+                                game::set_api_override(api);
+                                self.inspect_resolved();
+                            }
                         }
                     });
                 }
@@ -3219,6 +3363,23 @@ impl eframe::App for App {
                     );
                     if ui.add_enabled(!self.running, cb).changed() {
                         self.renodx_classic = on;
+                    }
+                    // The default is 4.70; the newest rhi-repo build is the
+                    // opt-in since 5.2.1 broke four games in three days.
+                    let mut newest = self.renodx_newest;
+                    let cb = egui::Checkbox::new(
+                        &mut newest,
+                        RichText::new(
+                            "Try the newest add-on build (5.2.1 or later) instead of the default 4.70 \u{2014} multi-pass sliders, new colour codec; crashes or blown-out colours reported in some games",
+                        )
+                        .font(t::plex(11.5))
+                        .color(t::TEXT_SOFT),
+                    );
+                    if ui
+                        .add_enabled(!self.running && !self.renodx_classic, cb)
+                        .changed()
+                    {
+                        self.renodx_newest = newest;
                     }
                 }
                 // RTX 40 multi-frame generation on the ReShade route: a single
@@ -3320,7 +3481,15 @@ impl eframe::App for App {
 
                 // ── engine chooser ───────────────────────────────
                 let native = ok_status.as_ref().is_some_and(|s| s.mode == game::Mode::Native);
-                if !native {
+                if !native && self.engine == Engine::Opti {
+                    self.engine = Engine::ReShade;
+                }
+                // The AIO is a 64-bit ReShade add-on: no 32-bit build is wired
+                // here, and ReShade cannot reach a Vulkan game from dxgi.dll.
+                let aio_ok = ok_status
+                    .as_ref()
+                    .is_some_and(|s| !s.is32() && s.reshade_engine_problem().is_none());
+                if !aio_ok && self.engine == Engine::Aio {
                     self.engine = Engine::ReShade;
                 }
                 ui.horizontal(|ui| {
@@ -3332,9 +3501,9 @@ impl eframe::App for App {
                     );
                     ui.label(
                         RichText::new(if native {
-                            "— two ways to run DLSS 5 in this game, pick one"
+                            "— three ways to run DLSS 5 in this game, pick one"
                         } else {
-                            "— this game has no DLSS of its own, so only the ReShade path can work"
+                            "— this game has no DLSS of its own: the ReShade path, or the standalone AIO"
                         })
                         .font(t::plex(11.0))
                         .color(t::TEXT_DIM),
@@ -3342,9 +3511,43 @@ impl eframe::App for App {
                 });
                 {
                     let gap = 8.0;
-                    let card_h = 74.0;
                     let row_w = ui.available_width();
-                    let col_w = ((row_w - gap) / 2.0).floor();
+                    // Three cards on one row when the window is wide enough
+                    // for their text; a full-width third card below otherwise.
+                    // The wide card left half the row empty (#77).
+                    // Each card needs about 480 px for its two lines beside
+                    // the pill; at 1172 px three-up wrapped the third card's
+                    // text past its bottom edge (#77).
+                    let three_up = row_w >= 1500.0;
+                    let cols = if three_up { 3.0 } else { 2.0 };
+                    let col_w = ((row_w - gap * (cols - 1.0)) / cols).floor();
+                    let reshade_title = "ReShade + DLSS 5 add-on";
+                    let reshade_lines = ["The default. Works in every supported game.", "In game: Home → Add-ons → DLSS 5 Neural Rendering."];
+                    let opti_title = "OptiScaler (built-in NR pass)";
+                    let opti_lines = ["Dagherbou's fork, no ReShade. Also swaps upscalers.", "In game: Insert → enable Neural Rendering."];
+                    let opti_note = if native {
+                        ""
+                    } else {
+                        "Needs a game with its own DLSS — this one has none."
+                    };
+                    let aio_title = "ReShade + standalone AIO \u{00b7} experimental";
+                    let aio_lines = [
+                        "kibblerz's all-in-one: neural rendering, super resolution, frame generation.",
+                        "In game: Home \u{2192} Add-ons \u{2192} Standalone DLSS-NR + SR. Windowed mode recommended.",
+                    ];
+                    let aio_note = if aio_ok {
+                        ""
+                    } else if ok_status.as_ref().is_some_and(|s| s.is32()) {
+                        "64-bit games only."
+                    } else {
+                        "Needs a game ReShade can reach from dxgi.dll."
+                    };
+                    let aio_h = engine_card_height(ui, col_w, aio_title, &aio_lines, aio_note);
+                    let mut card_h = engine_card_height(ui, col_w, reshade_title, &reshade_lines, "")
+                        .max(engine_card_height(ui, col_w, opti_title, &opti_lines, opti_note));
+                    if three_up {
+                        card_h = card_h.max(aio_h);
+                    }
                     let (row_rect, _) =
                         ui.allocate_exact_size(Vec2::new(row_w, card_h), egui::Sense::hover());
                     let left = egui::Rect::from_min_size(row_rect.min, Vec2::new(col_w, card_h));
@@ -3357,8 +3560,8 @@ impl eframe::App for App {
                         left,
                         self.engine == Engine::ReShade,
                         true,
-                        "ReShade + DLSS 5 add-on",
-                        &["The default. Works in every supported game.", "In game: Home → Add-ons → DLSS 5 Neural Rendering."],
+                        reshade_title,
+                        &reshade_lines,
                         "",
                     ) {
                         self.engine = Engine::ReShade;
@@ -3368,15 +3571,35 @@ impl eframe::App for App {
                         right,
                         self.engine == Engine::Opti,
                         native,
-                        "OptiScaler (built-in NR pass)",
-                        &["Dagherbou's fork, no ReShade. Also swaps upscalers.", "In game: Insert → enable Neural Rendering."],
-                        if native {
-                            ""
-                        } else {
-                            "Needs a game with its own DLSS — this one has none."
-                        },
+                        opti_title,
+                        &opti_lines,
+                        opti_note,
                     ) {
                         self.engine = Engine::Opti;
+                    }
+                    let row2 = if three_up {
+                        egui::Rect::from_min_size(
+                            egui::pos2(row_rect.left() + (col_w + gap) * 2.0, row_rect.top()),
+                            Vec2::new(col_w, card_h),
+                        )
+                    } else {
+                        // Half width like the two above it: a full-width third
+                        // card was mostly empty (#77).
+                        ui.add_space(gap);
+                        let (r, _) = ui
+                            .allocate_exact_size(Vec2::new(row_w, aio_h), egui::Sense::hover());
+                        egui::Rect::from_min_size(r.min, Vec2::new(col_w, aio_h))
+                    };
+                    if engine_card(
+                        ui,
+                        row2,
+                        self.engine == Engine::Aio,
+                        aio_ok,
+                        aio_title,
+                        &aio_lines,
+                        aio_note,
+                    ) {
+                        self.engine = Engine::Aio;
                     }
                 }
                 if self.engine == Engine::Opti {
@@ -3446,6 +3669,37 @@ impl eframe::App for App {
                         };
                         if r.changed() {
                             self.ada_mfg = on;
+                        }
+                    }
+                    // RTX 20/30: the unlock lives in ShyVortex's build only, so
+                    // the tick swaps the build underneath rather than adding a
+                    // fourth choice to learn (#65).
+                    if ok_status
+                        .as_ref()
+                        .and_then(|s| s.gpu.as_ref())
+                        .is_some_and(|(_, t)| *t == crate::gpu::Tier::Rtx2030)
+                    {
+                        ui.add_space(6.0);
+                        let mut on = self.ampere_mfg;
+                        let cb = egui::Checkbox::new(
+                            &mut on,
+                            RichText::new(
+                                "Unlock multi-frame generation on this RTX 20/30 card (3X\u{2013}4X) \u{2014} the game must have DLSS frame generation of its own \u{00b7} experimental",
+                            )
+                            .font(t::plex(11.5))
+                            .color(t::TEXT_SOFT),
+                        );
+                        if ui.add_enabled(!self.running, cb).changed() {
+                            self.ampere_mfg = on;
+                        }
+                        if self.ampere_mfg {
+                            ui.label(
+                                RichText::new(
+                                    "Installs ShyVortex's OptiScaler build (wilsjo2's pre-SR fork plus sdli1995's Turing/Ampere unlock and the Streamline runtime) in place of the build above. One report of it failing on Forza Horizon 6 on RTX 20.",
+                                )
+                                .font(t::plex(11.0))
+                                .color(t::TEXT_DIM),
+                            );
                         }
                     }
                     ui.add_space(6.0);
@@ -3520,9 +3774,25 @@ impl eframe::App for App {
                         );
                     });
                     let gap = 8.0;
-                    let card_h = 74.0;
                     let row_w = ui.available_width();
                     let col_w = ((row_w - gap) / 2.0).floor();
+                    let stable_title = "Stable \u{2014} RenoDX DLSS 5 add-on";
+                    let stable_lines = [
+                        "The proven route. The network runs after the upscaler, at output resolution.",
+                        "In game: Home \u{2192} Add-ons \u{2192} DLSS 5 Neural Rendering.",
+                    ];
+                    let up_title = "Experimental \u{2014} Neural Upstream";
+                    let up_lines = [
+                        "Runs the network before the upscaler, at render resolution, so it costs less.",
+                        "Replaces the add-on on the left. Read the warning below first.",
+                    ];
+                    let up_note = if native {
+                        ""
+                    } else {
+                        "Needs a game with its own DLSS \u{2014} this one has none."
+                    };
+                    let card_h = engine_card_height(ui, col_w, stable_title, &stable_lines, "")
+                        .max(engine_card_height(ui, col_w, up_title, &up_lines, up_note));
                     let (row_rect, _) =
                         ui.allocate_exact_size(Vec2::new(row_w, card_h), egui::Sense::hover());
                     let left = egui::Rect::from_min_size(row_rect.min, Vec2::new(col_w, card_h));
@@ -3535,11 +3805,8 @@ impl eframe::App for App {
                         left,
                         !self.upstream_on,
                         true,
-                        "Stable \u{2014} RenoDX DLSS 5 add-on",
-                        &[
-                            "The proven route. The network runs after the upscaler, at output resolution.",
-                            "In game: Home \u{2192} Add-ons \u{2192} DLSS 5 Neural Rendering.",
-                        ],
+                        stable_title,
+                        &stable_lines,
                         "",
                     ) {
                         self.upstream_on = false;
@@ -3549,16 +3816,9 @@ impl eframe::App for App {
                         right,
                         self.upstream_on,
                         native,
-                        "Experimental \u{2014} Neural Upstream",
-                        &[
-                            "Runs the network before the upscaler, at render resolution, so it costs less.",
-                            "Replaces the add-on on the left. Read the warning below first.",
-                        ],
-                        if native {
-                            ""
-                        } else {
-                            "Needs a game with its own DLSS \u{2014} this one has none."
-                        },
+                        up_title,
+                        &up_lines,
+                        up_note,
                     ) {
                         self.upstream_on = true;
                     }
@@ -3689,7 +3949,7 @@ impl eframe::App for App {
                                 RenodxLookup::NotFound => dim(ui, "— no RenoDX mod is published for this game.".into()),
                                 RenodxLookup::Failed(e) => dim(ui, format!("— lookup failed: {e}")),
                                 RenodxLookup::Found(m) => {
-                                    let label = format!("Also install {} — {}", m.file, m.status_label());
+                                    let label = format!("Also install {} — {} — from {}", m.file, m.status_label(), m.source_label());
                                     let cb = egui::Checkbox::new(&mut self.renodx_on, RichText::new(label).font(t::plex(12.0)).color(t::TEXT_SOFT));
                                     ui.add_enabled(!self.running, cb).on_hover_text(if cfg!(target_os = "linux") {
                                         "Game-specific HDR / tone-mapping mod from the RenoDX project. Loads beside the DLSS 5 add-on (different add-on name, different settings section). Turn any other HDR tone mapping off (gamescope's inverse tone mapping, for one) to avoid doing it twice."
@@ -3800,6 +4060,22 @@ impl eframe::App for App {
                         .clicked()
                     {
                         self.run_diagnose();
+                    }
+                    let report = egui::Button::new(
+                        RichText::new("Save report").font(t::plex_medium(13.0)).color(t::TEXT_OFF),
+                    )
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::new(1.0, t::BORDER_STRONG))
+                    .corner_radius(CornerRadius::same(8))
+                    .min_size(Vec2::new(110.0, 42.0));
+                    if ui
+                        .add_enabled(ok_status.is_some() && !self.running, report)
+                        .on_hover_text(
+                            "Writes one zip to your Desktop with this game's logs, inis, folder listing and Diagnose output — attach it to a GitHub issue.",
+                        )
+                        .clicked()
+                    {
+                        self.save_report();
                     }
                     let vulkan = ok_status
                         .as_ref()
@@ -4261,5 +4537,40 @@ mod tests {
         assert!(tiles
             .iter()
             .any(|t| t.title == "DLSS 5 add-on \u{00b7} leaked" && !(t.ok)(&st)));
+    }
+
+    /// At the default 1100 px window (478 px cards) the AIO card's lines wrap, and the card
+    /// grows to hold them instead of letting them run past its border (#94).
+    #[test]
+    fn engine_cards_grow_with_wrapped_text() {
+        let ctx = egui::Context::default();
+        t::install(&ctx);
+        let mut heights = (0.0f32, 0.0f32, 0.0f32);
+        ctx.begin_pass(egui::RawInput::default());
+        {
+            let mut root = egui::Ui::new(ctx.clone(), egui::Id::new("t"), egui::UiBuilder::new());
+            egui::CentralPanel::default().show(&mut root, |ui| {
+                let lines = [
+                    "kibblerz's all-in-one: neural rendering, super resolution, frame generation.",
+                    "In game: Home \u{2192} Add-ons \u{2192} Standalone DLSS-NR + SR. Windowed mode recommended.",
+                ];
+                let short = ["The default. Works in every supported game.", "In game: Home → Add-ons → DLSS 5 Neural Rendering."];
+                heights.0 = engine_card_height(ui, 478.0, "ReShade + standalone AIO · experimental", &lines, "");
+                heights.1 = engine_card_height(ui, 478.0, "ReShade + DLSS 5 add-on", &short, "");
+                heights.2 = engine_card_height(ui, 1000.0, "ReShade + standalone AIO · experimental", &lines, "");
+            });
+        }
+        ctx.end_pass().textures_delta.clear();
+        // Two wrapped lines: two more 11 px rows than the unwrapped card.
+        assert!(
+            heights.0 >= heights.2 + 2.0 * 11.0,
+            "{} vs {}",
+            heights.0,
+            heights.2
+        );
+        // Short lines at the same width still fit the base height.
+        assert_eq!(heights.1, 74.0);
+        // Nothing wraps at 1000 px.
+        assert_eq!(heights.2, 74.0);
     }
 }

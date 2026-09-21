@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod bugreport;
 mod compare;
 mod diagnose;
 mod feeder_cfg;
@@ -28,9 +29,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// `dlss5oneclick <GAME.exe | game folder | game name | appid> [--remove | --remove-all |
-/// --check | --diagnose | --engine=opti | --renodx | --mfg | --upstream | --fg |
-/// --model-res=25..100 | --remix-swap | --install-remix-mod | --remove-remix-mod | --imports |
-/// --ignore-anticheat | --mode=feeder|native | --bridge |
+/// --check | --diagnose | --report | --engine=opti|aio | --renodx | --mfg | --ampere-mfg |
+/// --upstream | --fg | --model-res=25..100 | --addon=latest|4.55|<tag> | --opti-tag=<tag> |
+/// --remix-swap | --install-remix-mod | --remove-remix-mod | --imports |
+/// --ignore-anticheat | --mode=feeder|native | --api=dx11|dx12 | --bridge |
 /// --launch-options | --revert-launch-options] | --list-games | --remix-list | --update | --version` runs headless;
 /// no args opens the GUI.
 /// Read by the NVIDIA and AMD drivers from this exe's export table to choose
@@ -151,6 +153,12 @@ error: {e:#}"
             }
         }
     }
+    if let Some(t) = args.iter().find_map(|a| a.strip_prefix("--opti-tag=")) {
+        std::env::set_var(installer::OPTI_TAG_ENV, t);
+    }
+    if args.iter().any(|a| a == "--ampere-mfg") {
+        std::env::set_var(installer::AMPERE_MFG_ENV, "1");
+    }
     if args.iter().any(|a| a == "--ignore-anticheat") {
         game::set_ignore_anticheat(true);
     }
@@ -163,6 +171,22 @@ error: {e:#}"
     }
     if args.iter().any(|a| a == "--bridge") {
         std::env::set_var(game::BRIDGE_ENV, "1");
+    }
+    if let Some(a) = args.iter().find_map(|a| a.strip_prefix("--addon=")) {
+        // "latest" lifts the 4.70 default; a bare number becomes a tag.
+        let v = if a.eq_ignore_ascii_case("latest") || a.starts_with("renodx-dlss5-") {
+            a.to_owned()
+        } else {
+            format!("renodx-dlss5-{a}")
+        };
+        std::env::set_var(installer::RENODX_TAG_ENV, v);
+    }
+    if let Some(a) = args.iter().find_map(|a| a.strip_prefix("--api=")) {
+        std::env::set_var(game::API_ENV, a);
+        if game::api_override().is_none() {
+            eprintln!("error: --api must be dx11 or dx12");
+            std::process::exit(1);
+        }
     }
     if let Some(first) = args.first().filter(|a| !a.starts_with('-')) {
         attach_parent_console();
@@ -186,13 +210,18 @@ error: {e:#}"
         }
         let code = cli(
             target,
-            args.iter().any(|a| a == "--remove"),
-            args.iter().any(|a| a == "--remove-all"),
-            args.iter().any(|a| a == "--check"),
-            args.iter().any(|a| a == "--diagnose"),
+            Actions {
+                remove: args.iter().any(|a| a == "--remove"),
+                remove_all: args.iter().any(|a| a == "--remove-all"),
+                check: args.iter().any(|a| a == "--check"),
+                diagnose_only: args.iter().any(|a| a == "--diagnose"),
+                report: args.iter().any(|a| a == "--report"),
+            },
             Choice {
                 engine: if args.iter().any(|a| a == "--engine=opti" || a == "--opti") {
                     installer::Engine::Opti
+                } else if args.iter().any(|a| a == "--engine=aio" || a == "--aio") {
+                    installer::Engine::Aio
                 } else {
                     installer::Engine::ReShade
                 },
@@ -526,15 +555,26 @@ fn parse_model_res(s: &str) -> Option<f32> {
     (25..=100).contains(&pct).then(|| pct as f32 / 100.0)
 }
 
-fn cli(
-    target: PathBuf,
+/// The headless mode asked for. Mutually exclusive, and each one returns
+/// before an install starts; bundled so `cli` does not grow a positional bool
+/// per flag, the shape `Extras` exists to avoid.
+#[derive(Clone, Copy, Default)]
+struct Actions {
     remove: bool,
     remove_all: bool,
     check: bool,
     diagnose_only: bool,
-    choice: Choice,
-    launch_only: Option<bool>,
-) -> i32 {
+    report: bool,
+}
+
+fn cli(target: PathBuf, actions: Actions, choice: Choice, launch_only: Option<bool>) -> i32 {
+    let Actions {
+        remove,
+        remove_all,
+        check,
+        diagnose_only,
+        report,
+    } = actions;
     let Choice {
         engine,
         with_renodx,
@@ -555,7 +595,11 @@ fn cli(
         // (DLSS5ONECLICK_RENODX_TAG names an add-on build directly.)
         opti_presr: installer::opti_presr_from_env(),
         classic_addon: false,
+        // --addon=latest travels in RENODX_TAG_ENV, which rhi_env_pinned reads
+        // directly; the tick is the GUI's way to the same place.
+        newest_addon: false,
         ada_mfg: ada_mfg || installer::ada_mfg_from_env(),
+        ampere_mfg: installer::ampere_mfg_from_env(),
         upstream_preset: if upstream {
             installer::upstream_preset_from_env()
         } else {
@@ -586,6 +630,22 @@ fn cli(
         );
     } else if !candidates.is_empty() {
         println!("using {}", exe.display());
+    }
+    if report {
+        return match report::write_bundle(&exe) {
+            Ok(p) => {
+                println!(
+                    "Report written: {}
+Attach that zip to the GitHub issue.",
+                    p.display()
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                1
+            }
+        };
     }
     if let Some(_revert) = launch_only {
         #[cfg(target_os = "linux")]
@@ -637,6 +697,12 @@ fn cli(
                 for p in &st.problems {
                     println!("  ! {}", text::tidy(p));
                 }
+                // No engine asked for: the plan follows what is in the folder.
+                let engine = match engine {
+                    installer::Engine::ReShade if st.opti => installer::Engine::Opti,
+                    installer::Engine::ReShade if st.aio => installer::Engine::Aio,
+                    e => e,
+                };
                 let names: Vec<&str> =
                     installer::plan_with(&st, engine, extras)
                     .iter()
@@ -708,10 +774,11 @@ fn cli(
                 }
                 match net::client().and_then(|c| renodx::lookup(&c, &exe)) {
                     Ok(Some(m)) => println!(
-                        "  RenoDX HDR mod available: {} -> {} ({}){}",
+                        "  RenoDX HDR mod available: {} -> {} ({}, from {}){}",
                         m.title,
                         m.file,
                         m.status_label(),
+                        m.source_label(),
                         if m.note.is_empty() {
                             String::new()
                         } else {
@@ -800,6 +867,11 @@ fn cli(
                 println!(
                     "
 Done. In game: Insert opens the OptiScaler overlay -> enable Neural Rendering (off by default)."
+                );
+            } else if engine == installer::Engine::Aio {
+                println!(
+                    "
+Done. In game: turn the game's own upscaling, anti-aliasing and frame generation off, run windowed; Home opens ReShade -> Add-ons tab -> Standalone DLSS-NR + SR."
                 );
             } else {
                 println!("

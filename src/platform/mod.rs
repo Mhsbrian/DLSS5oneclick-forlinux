@@ -236,11 +236,14 @@ pub fn ensure_d3dcompiler(
     progress: &dyn Fn(&str),
 ) -> D3dcompilerAdvice {
     use D3dcompilerAdvice as A;
-    // Only the ReShade engine installs the add-on that compiles a runtime pass;
-    // OptiScaler carries its own upscaler and needs no d3dcompiler.
-    if engine != crate::installer::Engine::ReShade
-        || !game_dir.join(crate::game::DLSS5_ADDON).is_file()
-    {
+    // Both ReShade routes load a neural consumer that compiles its pass at
+    // runtime; OptiScaler carries its own upscaler and needs no d3dcompiler.
+    let consumer = match engine {
+        crate::installer::Engine::ReShade => crate::game::DLSS5_ADDON,
+        crate::installer::Engine::Aio => crate::game::AIO_ADDON,
+        crate::installer::Engine::Opti => return A::NotApplicable,
+    };
+    if !crate::game::join_ci(game_dir, &[consumer]).is_file() {
         return A::NotApplicable;
     }
     let Some(entry) = entry_for_path(game_dir) else {
@@ -405,6 +408,8 @@ pub fn host_context(st: &crate::game::GameStatus) -> crate::diagnose::HostContex
     let game_dir = st.game_dir();
     let engine = if st.opti {
         crate::installer::Engine::Opti
+    } else if st.aio {
+        crate::installer::Engine::Aio
     } else {
         crate::installer::Engine::ReShade
     };

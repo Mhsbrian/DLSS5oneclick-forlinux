@@ -151,7 +151,31 @@ fn diagnose_with(st: &GameStatus, proton: bool) -> Vec<Finding> {
     let d = st.game_dir();
     let mut out = Vec::new();
     let consumer = st.consumer_dir();
-    let rs_log = read(&consumer, "ReShade.log").or_else(|| read(&consumer, "ReShade2.log"));
+    let mut rs_log = read(&consumer, "ReShade.log").or_else(|| read(&consumer, "ReShade2.log"));
+    // Rockstar's Launcher.exe sits in RDR2's folder and loads dxgi.dll too, so
+    // the newest ReShade.log is the launcher's 30-second session and the game's
+    // own — the one with the crash — is ReShade.log1. Read that one when the
+    // newest log names a different exe and the older one names ours (#97).
+    let ours = st
+        .exe
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase());
+    let mut log_note = None;
+    if let (Some(rs), Some(ours), false) = (rs_log.as_deref(), ours.as_deref(), st.is32()) {
+        if let Some(loaded) = reshade_host_exe(rs).filter(|h| h.to_ascii_lowercase() != ours) {
+            if let Some(prev) = read(&consumer, "ReShade.log1")
+                .filter(|p| reshade_host_exe(p).is_some_and(|h| h.to_ascii_lowercase() == ours))
+            {
+                log_note = Some(ok(format!(
+                    "ReShade.log is {loaded}'s session (a launcher in the game folder loads \
+                     dxgi.dll too, and it ran last); the game's own session is ReShade.log1, \
+                     which is what the findings below read."
+                )));
+                rs_log = Some(prev);
+            }
+        }
+    }
+    out.extend(log_note);
     // Wine and Proton substitute their own d3dcompiler_47.dll, whose HLSL
     // compiler is vkd3d-shader. It does not implement every attribute ReShade
     // emits, and says so in its own words (#70).
@@ -159,6 +183,24 @@ fn diagnose_with(st: &GameStatus, proton: bool) -> Vec<Finding> {
         .as_deref()
         .is_some_and(|l| l.contains("not yet implemented feature"));
     let wine = proton || wine_hlsl;
+
+    // ── a Windows compatibility layer on the exe ───────────────────
+    // Watch Dogs 1 (#62) ran under apphelp/AcGenral and got SuperSampling ->
+    // 0xBAD00002 on every attempt; the Feeder's author reads PlatformError
+    // from a query that touches no device as a process reporting an older
+    // Windows, which is exactly what a shim does (DLSS5-Feeder#47).
+    if let Some(layer) = crate::library::compat_layer(&st.exe) {
+        let refused = rs_log
+            .as_deref()
+            .into_iter()
+            .chain(read(&consumer, "dlss5-feed.log").as_deref())
+            .chain(read(&consumer, "dlss5-feed-host.log").as_deref())
+            .any(|l| l.contains("0xBAD00001") || l.contains("0xBAD00002"));
+        let text = format!(
+            "Windows runs this exe under a compatibility layer ({layer}). A shimmed process              reports an older Windows to NGX, and NGX then refuses before it touches a device              (SuperSampling -> 0xBAD00002 / Init -> 0xBAD00001; Watch Dogs 1 in #62).              Right-click the exe ▸ Properties ▸ Compatibility ▸ untick everything (and the              same for the launcher if it set it), then try again."
+        );
+        out.push(if refused { bad(text) } else { warn(text) });
+    }
 
     // ── a game-shipped HLSL compiler shadowing the system one ──────
     // The add-on compiles its NR pass at cs_5_1. A d3dcompiler_47.dll that
@@ -316,6 +358,14 @@ fn diagnose_with(st: &GameStatus, proton: bool) -> Vec<Finding> {
     if rs.contains("Initializing crosire's ReShade") {
         out.push(ok("ReShade loaded into the game."));
     }
+    // Neural Upstream stands in for the RenoDX add-on and logs under its own
+    // tag. Reading its log for the RenoDX add-on's lines reported "the add-on
+    // never registered" and "no NGX call was intercepted" on an install whose
+    // log showed the add-on registered and hooked (#86).
+    if st.upstream {
+        out.extend(upstream_findings(&rs));
+        return out;
+    }
     let failed_line = rs
         .lines()
         .find(|l| l.contains("Failed to load add-on") && l.contains("renodx-dlss5"));
@@ -385,11 +435,35 @@ fn diagnose_with(st: &GameStatus, proton: bool) -> Vec<Finding> {
             }
         )));
     } else if rs.contains("inline feature 18 evaluation succeeded") {
-        out.push(ok(
-            "Neural rendering ran: the add-on evaluated the DLSS 5 model on real frames. If the \
-             picture still looks unchanged, raise NR Intensity / Local Structure in its panel — \
-             the default is subtle.",
-        ));
+        // "Ran" is not "ran on your frames". Cyberpunk 2077 drove the feature
+        // through 18 re-creations and four worksets in four minutes, reaching
+        // sixty evaluations in 95 seconds — under one frame a second — and
+        // Diagnose called that success (#95). Count the churn.
+        let created = rs.matches("feature 18 created via").count();
+        let worksets = rs.matches("second NR workset is live").count();
+        // Every F6 and every slider drag re-creates the feature too, so a
+        // count alone is not churn: a Prey session with 93 creations had
+        // reached 600 straight evaluations first (#99). The add-on logs the
+        // count at 1, 60 and 600; reaching 600 means the pass held.
+        let held = rs.contains("evaluation succeeded (count=600");
+        if worksets >= 2 || (created >= 6 && !held) {
+            out.push(bad(format!(
+                "The neural pass is being torn down and re-created instead of running: the \
+                 feature was created {created} times and the add-on opened {} worksets in this \
+                 session. Each re-creation resets the model and costs GPU time, and almost no \
+                 frame is evaluated — FPS drops, picture unchanged. This happens in games that \
+                 drive DLSS from several threads or several NGX features (Cyberpunk 2077 with \
+                 Ray Reconstruction, #95). Try Model Resolution 100% first; if it persists, \
+                 the OptiScaler engine runs the pass inside the upscaler and is not affected.",
+                worksets + 1
+            )));
+        } else {
+            out.push(ok(
+                "Neural rendering ran: the add-on evaluated the DLSS 5 model on real frames. If the \
+                 picture still looks unchanged, raise NR Intensity / Local Structure in its panel — \
+                 the default is subtle.",
+            ));
+        }
     } else if rs.contains("feature=1 (DLSS/DLAA)") {
         out.push(warn(
             "The add-on saw the game's DLSS but has not evaluated the model yet (feature 18 never \
@@ -646,10 +720,35 @@ fn diagnose_with(st: &GameStatus, proton: bool) -> Vec<Finding> {
                 )));
             }
         }
-        if fd.contains("MV probe") && fd.contains("0% non-zero") {
+        // The last probe is the verdict: the first ones run on a menu or a
+        // loading screen. And "100% non-zero" contains "0% non-zero", so the
+        // substring test reported every healthy log as all-zero (#99).
+        if let Some(l) = fd.lines().rev().find(|l| l.contains("MV probe")) {
+            let pct = l
+                .split("non-zero")
+                .next()
+                .and_then(|p| p.rsplit(',').next())
+                .and_then(|p| p.trim().trim_end_matches('%').parse::<u32>().ok());
+            if pct == Some(0) {
+                out.push(bad(
+                    "Motion vectors are all zero at the last probe: the provider is enabled but \
+                     writes nothing. Check that Lumenite_Kernel sits above DLSS5_Feed in the \
+                     technique list, and that ReShade's Generic Depth is on the right buffer.",
+                ));
+            }
+        }
+        if fd
+            .lines()
+            .rev()
+            .find(|l| l.contains("Depth probe"))
+            .is_some_and(|l| l.contains("flat"))
+        {
             out.push(bad(
-                "Motion vectors are all zero: the provider is enabled but writes nothing. Check \
-                 that Lumenite_Kernel sits above DLSS5_Feed in the technique list.",
+                "Depth is flat at the last probe: ReShade's Generic Depth add-on is not on the \
+                 game's depth buffer, so the Lumenite motion vectors have nothing to work from. \
+                 In game: Home → Add-ons → Generic Depth → pick the buffer at the render \
+                 resolution with the most draw calls, and tick \"Copy depth buffer before clear \
+                 operations\" (Prey, #99).",
             ));
         }
         if fd.contains("DLSS super sampling is not available") {
@@ -987,6 +1086,87 @@ pub fn host_findings(st: &GameStatus, ctx: &HostContext) -> Vec<Finding> {
                  tick RTX 40 multi-frame generation and run Install to replace it.",
             )),
         }
+    }
+    out
+}
+
+/// What matiasLombo's neural-upstream (`nvngx.dll.addon64`, "DLSS5 NR
+/// Pre-Upscale") wrote to ReShade.log, read against its own source: the game's
+/// DLSS is logged as `CreateFeature id=1` (a DLSS create carries no DLSSNR
+/// slots, so `<no slot>` there is normal), every DLSS evaluate as `eval feat=`,
+/// and the add-on's own network as `2b: SNIPPET CreateFeature(18, …)` followed
+/// by `2c: NR Evaluate(…) -> 0x00000001` once it ran.
+fn upstream_findings(rs: &str) -> Vec<Finding> {
+    let mut out = Vec::new();
+    if let Some(l) = rs
+        .lines()
+        .find(|l| l.contains("Failed to load add-on") && l.contains("nvngx.dll.addon64"))
+    {
+        let code = l
+            .rsplit("error code ")
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('!');
+        out.push(bad(format!(
+            "ReShade refused to load nvngx.dll.addon64 (Neural Upstream), error code {code}."
+        )));
+        return out;
+    }
+    if rs.contains("[NRPRE] addon registered") || rs.contains("DLSS5 NR Pre-Upscale") {
+        out.push(ok(
+            "The Neural Upstream add-on (DLSS5 NR Pre-Upscale) registered.",
+        ));
+    } else {
+        out.push(bad(
+            "The Neural Upstream add-on never registered. nvngx.dll.addon64 is missing from              the game folder, disabled in ReShade's Add-ons tab, or quarantined by antivirus.",
+        ));
+        return out;
+    }
+    if rs.contains("[NRPRE] no NGX evaluate could be hooked") {
+        out.push(bad(
+            "Neural Upstream could not hook the game's NGX evaluate: the game's DLSS runtime              was not loaded when the add-on looked for it. Turn DLSS on in the game's graphics              settings and restart the game.",
+        ));
+        return out;
+    }
+    let nr_ran = rs
+        .lines()
+        .any(|l| l.contains("2c: NR Evaluate(") && l.contains("-> 0x00000001"));
+    let nr_failed = rs
+        .lines()
+        .find(|l| l.contains("NR Evaluate(") && l.contains("FAILED"));
+    let snippet_failed = rs
+        .lines()
+        .find(|l| l.contains("SNIPPET CreateFeature(18") && !l.contains("-> 0x00000001"));
+    if nr_ran {
+        out.push(ok(
+            "Neural rendering ran: Neural Upstream evaluated the DLSS 5 model at render              resolution on real frames. If the picture looks unchanged, raise EffectStrength              (F6) in the add-on's ReShade panel.",
+        ));
+    } else if let Some(l) = nr_failed {
+        out.push(bad(format!(
+            "Neural Upstream created its network but evaluating it fails: {}",
+            l.trim()
+        )));
+    } else if let Some(l) = snippet_failed {
+        out.push(bad(format!(
+            "Neural Upstream could not create the DLSS 5 network: {}",
+            l.trim()
+        )));
+    } else if rs.contains("2b: core exports missing") {
+        out.push(bad(
+            "nvngx_dlssnr.dll beside the game is not the build Neural Upstream expects              (its NGX exports are missing). Run Install again to refresh the model.",
+        ));
+    } else if rs.contains("[NRPRE] eval feat=") {
+        out.push(warn(
+            "The game's DLSS is running frames through the add-on, but the DLSS 5 network was              never created. Press F7 in game (DLSS-NR on/off) and check the add-on's panel;              if it stays off, attach this log.",
+        ));
+    } else if rs.contains("[NRPRE] CreateFeature id=") {
+        out.push(warn(
+            "The game created its DLSS feature but never rendered a frame through it: the              session ended at a menu or loading screen. Load into gameplay, play for a minute,              then run this again.",
+        ));
+    } else {
+        out.push(bad(
+            "No NGX call was intercepted: this game's own DLSS never ran. Turn DLSS on in the              game's graphics settings (the add-on hooks the game's DLSS calls; without them it              has nothing to work with).",
+        ));
     }
     out
 }
@@ -1700,5 +1880,208 @@ mod tests {
         let f = run(&exe).unwrap();
         assert!(f.iter().all(|x| x.level == Level::Ok), "{f:?}");
         assert!(f.iter().any(|x| x.text.contains("raise NR Intensity")));
+    }
+
+    /// The lines felipeptxa's RDR2 log carried (#86): the add-on registered,
+    /// hooked, and saw the game create its DLSS feature, then the session
+    /// ended at the menu. Read as the RenoDX add-on's log this was two FAILs.
+    #[test]
+    fn neural_upstream_log_is_read_by_its_own_lines() {
+        let menu = "Registered add-on \"DLSS5 NR Pre-Upscale\"
+            [NRPRE] addon registered (NR at render resolution -- configure in the ReShade overlay)
+            [NRPRE] hook 0 on NVSDK_NGX_D3D12_EvaluateFeature: OK
+            [NRPRE] hook on NVSDK_NGX_D3D12_CreateFeature: OK (module 0)
+            [NRPRE] CreateFeature id=1 -> res=0x00000001 handle=1 | NR W=4294967295 H=4294967295 ratio=-1.000 preset=-1 | DLSSNR.Color=<no slot> | DLSSNR.Output=<no slot> | DLSSNR.Depth=<no slot> | DLSSNR.MVec=<no slot>
+            [NRPRE] F11: cadence phase -> 0/1
+";
+        let f = upstream_findings(menu);
+        assert!(
+            f.iter()
+                .any(|x| x.level == Level::Ok && x.text.contains("registered")),
+            "{f:?}"
+        );
+        assert!(
+            f.iter().any(|x| x.text.contains("never rendered a frame")),
+            "{f:?}"
+        );
+        assert!(
+            !f.iter().any(|x| x.text.contains("never registered")),
+            "{f:?}"
+        );
+        assert!(!f.iter().any(|x| x.text.contains("No NGX call")), "{f:?}");
+
+        let ran = format!(
+            "{menu}[NRPRE] eval feat=1  render_subrect=1707x960 | a | b | c | d
+             [NRPRE] 2b: SNIPPET CreateFeature(18, 1707x960) -> 0x00000001 handle=000001
+             [NRPRE] 2c: NR Evaluate(HI) -> 0x00000001
+"
+        );
+        let f = upstream_findings(&ran);
+        assert!(
+            f.iter()
+                .any(|x| x.level == Level::Ok && x.text.contains("Neural rendering ran")),
+            "{f:?}"
+        );
+
+        let failed = format!(
+            "{menu}[NRPRE] eval feat=1  render_subrect=1707x960 | a | b | c | d
+             [NRPRE] 2b: SNIPPET CreateFeature(18, 1707x960) -> 0xBAD00002 handle=0000000000000000
+"
+        );
+        let f = upstream_findings(&failed);
+        assert!(
+            f.iter()
+                .any(|x| x.level == Level::Bad && x.text.contains("0xBAD00002")),
+            "{f:?}"
+        );
+    }
+
+    /// Cyberpunk 2077 (#95): the pass "ran" — sixty evaluations in 95 seconds
+    /// across 18 feature re-creations and four worksets. That is churn, not
+    /// neural rendering, and Diagnose must not call it success.
+    #[test]
+    fn feature_churn_is_reported_as_a_failure_not_a_pass() {
+        let (t, exe) = setup(false);
+        let d = t.path();
+        let mut log = String::from(
+            "Initializing crosire's ReShade version '6.8.0'\nRegistered add-on \"DLSS 5 Neural Rendering\"\n",
+        );
+        for _ in 0..18 {
+            log.push_str("DLSS5 Generic: feature 18 created via the signed snippet after DLSS/DLAA for NR input 1920x1080\n");
+        }
+        for _ in 0..6 {
+            log.push_str(
+                "DLSS5 Generic: multi-pass: a second NR workset is live; independent passes\n",
+            );
+        }
+        log.push_str("DLSS5 Generic: inline feature 18 evaluation succeeded (count=60, NR input 1920x1080)\n");
+        fs::write(d.join("ReShade.log"), &log).unwrap();
+        let st = game::inspect(&exe).unwrap();
+        let f = diagnose(&st);
+        assert!(
+            f.iter()
+                .any(|x| x.level == Level::Bad && x.text.contains("created 18 times")),
+            "{f:?}"
+        );
+        assert!(
+            !f.iter().any(|x| x.text.starts_with("Neural rendering ran")),
+            "{f:?}"
+        );
+
+        // One creation, sixty frames: the pass ran.
+        fs::write(
+            d.join("ReShade.log"),
+            "Initializing crosire's ReShade version '6.8.0'\nRegistered add-on \"DLSS 5 Neural Rendering\"\n\
+             DLSS5 Generic: feature 18 created via the signed snippet after DLSS/DLAA\n\
+             DLSS5 Generic: inline feature 18 evaluation succeeded (count=60)\n",
+        )
+        .unwrap();
+        let f = diagnose(&game::inspect(&exe).unwrap());
+        assert!(
+            f.iter().any(|x| x.text.starts_with("Neural rendering ran")),
+            "{f:?}"
+        );
+
+        // Prey (#99): 93 creations from F6 mashing and slider drags, but the
+        // pass had held for 600 straight evaluations. Not churn.
+        let mut log = String::from(
+            "Initializing crosire's ReShade version '6.8.0'
+Registered add-on \"DLSS 5 Neural Rendering\"
+             DLSS5 Generic: inline feature 18 evaluation succeeded (count=600, NR input 2880x1620)
+",
+        );
+        for _ in 0..93 {
+            log.push_str(
+                "DLSS5 Generic: feature 18 created via the signed snippet after DLSS/DLAA
+",
+            );
+        }
+        fs::write(d.join("ReShade.log"), &log).unwrap();
+        let f = diagnose(&game::inspect(&exe).unwrap());
+        assert!(
+            f.iter().any(|x| x.text.starts_with("Neural rendering ran")),
+            "{f:?}"
+        );
+    }
+
+    /// RDR2 (#97): Launcher.exe in the game folder loads dxgi.dll after the
+    /// game exits, so ReShade.log is the launcher's and the game's session is
+    /// ReShade.log1. Diagnose read the launcher's log and reported the add-on
+    /// missing and no NGX call, then told the user to install for Launcher.exe.
+    #[test]
+    fn launcher_log_on_top_falls_back_to_the_games_log1() {
+        let (t, exe) = setup(false);
+        let d = t.path();
+        fs::write(d.join(game::DLSS5_ADDON), b"a").unwrap();
+        fs::write(
+            d.join("ReShade.log"),
+            "Initializing crosire's ReShade version '6.8.0' (64-bit) loaded from 'D:\\g\\dxgi.dll' into 'D:\\g\\Launcher.exe' (0x1) ...\n",
+        )
+        .unwrap();
+        fs::write(
+            d.join("ReShade.log1"),
+            "Initializing crosire's ReShade version '6.8.0' (64-bit) loaded from 'D:\\g\\dxgi.dll' into 'D:\\g\\game.exe' (0x1) ...\n\
+             Registered add-on \"DLSS 5 Neural Rendering\"\n",
+        )
+        .unwrap();
+        let f = diagnose(&game::inspect(&exe).unwrap());
+        assert!(f.iter().any(|x| x.text.contains("ReShade.log1")), "{f:?}");
+        assert!(
+            f.iter().any(|x| x.text.contains("add-on registered")),
+            "{f:?}"
+        );
+        assert!(
+            !f.iter().any(|x| x.text.contains("never registered")),
+            "{f:?}"
+        );
+        assert!(
+            !f.iter().any(|x| x.text.contains("different executables")),
+            "{f:?}"
+        );
+    }
+
+    /// "100% non-zero" contains "0% non-zero": every healthy feed log read as
+    /// all-zero motion vectors. And the first probes run on a menu — the last
+    /// one is the verdict (#99).
+    #[test]
+    fn mv_and_depth_probes_are_read_from_the_last_line_and_parsed() {
+        let (t, exe) = setup(true);
+        let d = t.path();
+        fs::write(
+            d.join("ReShade.log"),
+            "Initializing crosire's ReShade version '6.8.0'\nRegistered add-on \"DLSS 5 Neural Rendering\"\n",
+        )
+        .unwrap();
+        fs::write(
+            d.join("dlss5-feed.log"),
+            "[feed] feature ready: 3840x2160 DLAA\n\
+             [feed] MV probe (centre 64x64, frame 600): mean |mv| 0.000 px, max 0.00 px, 0% non-zero  <-- DLSS is getting (almost) no motion vectors\n\
+             [feed] Depth probe (4x 32x32, frame 600): min 0, max 0, mean 0, variance 0, 100% finite  <-- sampled depth is flat\n\
+             [feed] MV probe (centre 64x64, frame 70800): mean |mv| 1.618 px, max 2.16 px, 100% non-zero\n\
+             [feed] Depth probe (4x 32x32, frame 70800): min 0.0075, max 0.027, mean 0.016, variance 5.58e-05, 100% finite\n",
+        )
+        .unwrap();
+        let f = diagnose(&game::inspect(&exe).unwrap());
+        assert!(
+            !f.iter()
+                .any(|x| x.text.contains("Motion vectors are all zero")),
+            "{f:?}"
+        );
+        assert!(!f.iter().any(|x| x.text.contains("Depth is flat")), "{f:?}");
+
+        fs::write(
+            d.join("dlss5-feed.log"),
+            "[feed] feature ready: 3840x2160 DLAA\n\
+             [feed] MV probe (centre 64x64, frame 600): mean |mv| 0.000 px, max 0.00 px, 0% non-zero  <-- DLSS is getting (almost) no motion vectors\n\
+             [feed] Depth probe (4x 32x32, frame 600): min 0, max 0, mean 0, variance 0, 100% finite  <-- sampled depth is flat; inspect the depth debug view\n",
+        )
+        .unwrap();
+        let f = diagnose(&game::inspect(&exe).unwrap());
+        assert!(
+            f.iter()
+                .any(|x| x.text.contains("Motion vectors are all zero")),
+            "{f:?}"
+        );
+        assert!(f.iter().any(|x| x.text.contains("Depth is flat")), "{f:?}");
     }
 }
