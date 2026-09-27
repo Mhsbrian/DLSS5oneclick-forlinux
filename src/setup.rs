@@ -9,9 +9,13 @@
 //! setup" is the only thing that moves a game down its ladder.
 //!
 //! The order comes from what is known about each route:
-//! - ShortFuse's add-on is the RenoDX author's own neural consumer, made for
-//!   games that ship their own DLSS, so it is first there.
-//! - The RenoDX DLSS 5 add-on, newest stable build, then 4.70: the build every
+//! - The RenoDX DLSS 5 add-on, newest build (release candidates included), is
+//!   first in games that ship their own DLSS: the 8.5 builds run NR before the
+//!   game's upscale (the Render hook point) at far less cost, and the tool
+//!   writes that setting for them.
+//! - ShortFuse's add-on, the RenoDX author's own neural consumer made for games
+//!   with their own DLSS, is next.
+//! - Then the DLSS 5 add-on 4.70: the build every
 //!   reporter had working when 5.2.1 broke four games (#96, #86, #76, #100),
 //!   and the last one with Enable Upscaling (#109). Then 4.55, the build the
 //!   Feeder's host names as passing where newer ones fault in the driver (#69).
@@ -29,7 +33,7 @@ use crate::installer::{self, Consumer, Engine};
 pub struct Setup {
     pub engine: Engine,
     pub consumer: Consumer,
-    /// A pinned DLSS 5 add-on build; `None` is the newest stable one.
+    /// A pinned DLSS 5 add-on build; `None` is the newest one.
     pub addon_tag: Option<&'static str>,
 }
 
@@ -67,7 +71,7 @@ const OPTI: Setup = Setup {
 const PROFILES: &[(&str, &[Setup], &str)] = &[
     (
         "cyberpunk2077.exe",
-        &[OPTI, SF, DLSS5_NEWEST, DLSS5_STEADY, DLSS5_CLASSIC],
+        &[OPTI, DLSS5_NEWEST, SF, DLSS5_STEADY, DLSS5_CLASSIC],
         "Cyberpunk 2077 works on the OptiScaler engine (#95)",
     ),
     (
@@ -105,7 +109,7 @@ pub fn ladder(st: &GameStatus) -> Vec<Setup> {
         (Mode::Native, Api::Vulkan) if !st.is32() => vec![OPTI],
         (_, Api::Vulkan) => vec![],
         (Mode::Native, _) if !st.is32() => {
-            vec![SF, DLSS5_NEWEST, DLSS5_STEADY, DLSS5_CLASSIC, OPTI]
+            vec![DLSS5_NEWEST, SF, DLSS5_STEADY, DLSS5_CLASSIC, OPTI]
         }
         // No DLSS of its own, or 32-bit: the Feeder carries it, and the DLSS 5
         // add-on is its consumer.
@@ -159,9 +163,11 @@ pub fn hand_chosen(st: &GameStatus) -> bool {
 /// top when nothing is.
 pub fn level(st: &GameStatus) -> usize {
     let l = ladder(st);
-    installed(st)
-        .and_then(|s| l.iter().position(|x| *x == s))
-        .unwrap_or(0)
+    // A ShortFuse add-on the user placed is not ours, but it is the setup the
+    // game is on: starting on the DLSS 5 add-on above it would stop at the
+    // step that refuses to take someone else's add-on out.
+    let on = installed(st).or((st.sf && !st.dlss5_addon).then_some(SF));
+    on.and_then(|s| l.iter().position(|x| *x == s)).unwrap_or(0)
 }
 
 /// For a setup picked by hand, what it is, in words.
@@ -239,7 +245,7 @@ pub fn label(s: &Setup) -> String {
         (Engine::Opti, ..) => "OptiScaler with its built-in neural rendering pass".to_owned(),
         (Engine::Aio, ..) => "ReShade + standalone AIO".to_owned(),
         (_, Consumer::ShortFuse, _) => "ReShade + ShortFuse's DLSS add-on".to_owned(),
-        (_, Consumer::Dlss5, None) => "ReShade + DLSS 5 add-on (newest stable build)".to_owned(),
+        (_, Consumer::Dlss5, None) => "ReShade + DLSS 5 add-on (newest build)".to_owned(),
         (_, Consumer::Dlss5, Some(t)) => format!(
             "ReShade + DLSS 5 add-on {}",
             t.trim_start_matches(installer::DLSS5_PREFIX)
@@ -282,15 +288,15 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_game_with_its_own_dlss_starts_on_shortfuse() {
+    fn a_fresh_game_with_its_own_dlss_starts_on_the_newest_dlss5_addon() {
         let t = tempfile::tempdir().unwrap();
         let st = native(t.path());
         assert_eq!(
             ladder(&st),
-            vec![SF, DLSS5_NEWEST, DLSS5_STEADY, DLSS5_CLASSIC, OPTI]
+            vec![DLSS5_NEWEST, SF, DLSS5_STEADY, DLSS5_CLASSIC, OPTI]
         );
-        assert_eq!(current(&st), Some(SF));
-        assert_eq!(next(&st), Some((1, DLSS5_NEWEST)));
+        assert_eq!(current(&st), Some(DLSS5_NEWEST));
+        assert_eq!(next(&st), Some((1, SF)));
     }
 
     /// What is in the folder decides the rung, so Install and Update refresh
@@ -349,7 +355,7 @@ mod tests {
         let mut st = native(t.path());
         st.exe = t.path().join("Cyberpunk2077.exe");
         st.reshade = true;
-        assert_eq!(current(&st), Some(SF));
+        assert_eq!(current(&st), Some(DLSS5_NEWEST));
         assert_eq!(ladder(&st).last(), Some(&OPTI));
         st.dlss5_addon = true;
         fs::write(

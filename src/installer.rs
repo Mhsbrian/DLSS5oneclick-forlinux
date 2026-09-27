@@ -484,7 +484,7 @@ pub fn stale_components(dir: &Path, latest: &Latest) -> Vec<String> {
         mine(game::DLSS5_ADDON_MARKER).filter(|_| dir.join(game::DLSS5_ADDON).is_file())
     {
         let h = have.trim();
-        let want = if crate::settings::Settings::load().renodx_prerelease {
+        let want = if !crate::settings::Settings::load().renodx_stable_only {
             &latest.dlss5_pre
         } else {
             &latest.dlss5
@@ -1500,7 +1500,9 @@ fn plan_reshade_consumer_with(st: &GameStatus, upstream: bool, c: Consumer) -> V
                 }
                 v.push(STEP_DLSS5);
             }
-            if st.needs_bridge() && !sf {
+            // Planned for every such game: on an 8.x add-on the step takes a
+            // bridge out instead of putting one in.
+            if st.dx11_native() && !sf {
                 v.push(STEP_BRIDGE);
             }
             v.push(STEP_CONFIG);
@@ -1616,12 +1618,71 @@ pub const RENODX_TAG_ENV: &str = "DLSS5ONECLICK_RENODX_TAG";
 pub const RENODX_STEADY_TAG: &str = "renodx-dlss5-4.70";
 /// The env value that asks for the newest build (the default when unset).
 pub const RENODX_LATEST: &str = "latest";
-/// Set when the user opted into release candidates of the DLSS 5 add-on: the
-/// newest-build step then takes the newest build, candidate or not (#77).
-pub const RENODX_PRERELEASE_ENV: &str = "DLSS5ONECLICK_RENODX_PRERELEASE";
+/// Set when the user asked for stable builds of the DLSS 5 add-on only: the
+/// newest-build step then skips release candidates. Unset (the default since
+/// 0.14.3) it takes the newest build, candidate or not: the 8.5 release
+/// candidates are the builds with the Render hook point, while the newest
+/// stable one was still 6.5.3.
+pub const RENODX_STABLE_ENV: &str = "DLSS5ONECLICK_RENODX_STABLE";
 
 pub fn renodx_prerelease() -> bool {
-    std::env::var_os(RENODX_PRERELEASE_ENV).is_some()
+    std::env::var_os(RENODX_STABLE_ENV).is_none()
+}
+
+/// The `ReShade.ini` section the DLSS 5 add-on reads its settings from.
+pub const DLSS5_INI_SECTION: &str = "RenoDX.DLSS5";
+
+/// The 8.x DLSS 5 add-on's cheaper settings for a game with its own DLSS, as
+/// `[RenoDX.DLSS5]` keys (plain numbers, a list's position in its menu):
+/// - `NRHookPoint=1`, Render: NR runs on the game's image before DLSS
+///   upscales it, on far fewer pixels (the menu order is Upscaled, Render,
+///   Present; the add-on's own hints name 0 and 2). With Ray Reconstruction
+///   the add-on goes back to Upscaled by itself.
+/// - `NRPasses=1`: one pass; a second doubles the cost.
+/// - `NRDetailStability=2`, Always (Auto, Off, Always): Render redraws small
+///   detail a little differently each frame, and this holds it still.
+/// - `EnableHooks=1` when the game ships NVIDIA Streamline
+///   (`sl.interposer.dll`): the add-on's own advice when a Streamline game
+///   sends it nothing.
+///
+/// Written only where the key is missing, so what a player set stays.
+pub fn dlss5_fast_defaults(streamline: bool) -> Vec<(&'static str, &'static str)> {
+    let mut v = vec![
+        ("NRHookPoint", "1"),
+        ("NRPasses", "1"),
+        ("NRDetailStability", "2"),
+    ];
+    if streamline {
+        v.push(("EnableHooks", "1"));
+    }
+    v
+}
+
+/// The add-on build is 8.0 or newer: the builds with these settings.
+pub fn dlss5_has_fast_settings(tag: &str) -> bool {
+    tag.starts_with(DLSS5_PREFIX)
+        && ver_key(tag, DLSS5_PREFIX)
+            .0
+            .first()
+            .is_some_and(|m| *m >= 8)
+}
+
+/// Add the missing `dlss5_fast_defaults` to `cdir\ReShade.ini`; returns the
+/// keys written.
+fn write_dlss5_fast_defaults(cdir: &Path, streamline: bool) -> Result<Vec<String>> {
+    let path = cdir.join("ReShade.ini");
+    let mut ini = crate::reshade_ini::Ini::load(&path);
+    let mut wrote = Vec::new();
+    for (k, v) in dlss5_fast_defaults(streamline) {
+        if ini.get(DLSS5_INI_SECTION, k).is_none() {
+            ini.set(DLSS5_INI_SECTION, k, v);
+            wrote.push(format!("{k}={v}"));
+        }
+    }
+    if !wrote.is_empty() {
+        ini.save(&path)?;
+    }
+    Ok(wrote)
 }
 
 /// Set beside `RENODX_TAG_ENV` when the setup picker chose the build rather
@@ -1714,18 +1775,15 @@ pub fn rhi_latest(client: &Client, prefix: &str) -> Result<(String, String)> {
     if let Some(pinned) = rhi_pinned(client, prefix) {
         return pinned;
     }
-    if prefix == DLSS5_PREFIX && renodx_prerelease() {
-        if let Ok(releases) = net::get_json_github(client, RHI_RELEASES) {
-            if let Some(arr) = releases.as_array() {
-                if let Ok(r) = pick_latest_asset_with(arr, prefix, true) {
-                    return Ok(r);
-                }
-            }
-        }
-    }
-    if let Ok(releases) = net::get_json_github(client, RHI_RELEASES) {
+    // One choice for every route below. A failed first lookup used to fall
+    // through to a second one that skipped release candidates, so one network
+    // hiccup quietly installed the stable build instead of the newest one.
+    let pre = prefix == DLSS5_PREFIX && renodx_prerelease();
+    if let Ok(releases) = net::get_json_github(client, RHI_RELEASES)
+        .or_else(|_| net::get_json_github(client, RHI_RELEASES))
+    {
         if let Some(arr) = releases.as_array() {
-            if let Ok(r) = pick_latest_asset(arr, prefix) {
+            if let Ok(r) = pick_latest_asset_with(arr, prefix, pre) {
                 return Ok(r);
             }
         }
@@ -1738,7 +1796,7 @@ pub fn rhi_latest(client: &Client, prefix: &str) -> Result<(String, String)> {
                 .chars()
                 .next()
                 .is_some_and(|c| c.is_ascii_digit())
-                && !prerelease_tag_name(t)
+                && (pre || !prerelease_tag_name(t))
         })
         .map(|t| (ver_key(&t, prefix), t, String::new()))
         .collect();
@@ -2508,6 +2566,22 @@ fn step_dlss5(
         };
         installed.push(shown);
     }
+    // A game with its own DLSS on an 8.x build gets the cheaper settings the
+    // build offers (Render hook point, one pass). The Feeder's games are left
+    // at the add-on's defaults: there the DLSS call is the Feeder's own.
+    if st.mode == game::Mode::Native {
+        let tag = fs::read_to_string(cdir.join(game::DLSS5_ADDON_MARKER)).unwrap_or_default();
+        if dlss5_has_fast_settings(tag.trim()) {
+            let streamline = st.game_dir().join("sl.interposer.dll").is_file();
+            let wrote = write_dlss5_fast_defaults(&cdir, streamline)?;
+            if !wrote.is_empty() {
+                installed.push(format!(
+                    "ReShade.ini [{DLSS5_INI_SECTION}]: {}",
+                    wrote.join(", ")
+                ));
+            }
+        }
+    }
     // The pin belongs to this game, not to the session: leaving it set would
     // quietly hold the next game on the classic build too.
     if auto_classic {
@@ -2885,6 +2959,28 @@ fn step_bridge(
     _work: &Path,
     progress: Progress,
 ) -> Result<Vec<String>> {
+    // The DLSS 5 add-on step just ran, so its build is read from disk, not
+    // from `st`. An 8.x build bridges Direct3D 11 itself, and with a second
+    // bridge loaded it leaves the game's own DLSS alone ("a Direct3D 11 bridge
+    // add-on of another project is loaded"): the bridge goes.
+    let tag =
+        fs::read_to_string(st.consumer_dir().join(game::DLSS5_ADDON_MARKER)).unwrap_or_default();
+    if dlss5_has_fast_settings(tag.trim()) {
+        let mut out = Vec::new();
+        for f in [game::BRIDGE_ADDON, "dlss5-dx11-bridge.addon64"] {
+            let p = st.game_dir().join(f);
+            if p.is_file() {
+                fs::remove_file(&p)?;
+                out.push(format!("removed {f}"));
+            }
+        }
+        progress(100, "DX11 bridge not needed");
+        out.push(format!(
+            "no separate DX11 bridge: {} bridges Direct3D 11 itself",
+            tag.trim()
+        ));
+        return Ok(out);
+    }
     let dest = st.game_dir().join(game::BRIDGE_ADDON);
     // The bridge has no version tag in its file name and its releases fix
     // add-on-specific behaviour (1.4.0: the 2026-08-28 add-on build), so an
@@ -5406,5 +5502,73 @@ AmpereMfgUnlock=true
             pick_latest_asset_with(&arr, DLSS5_PREFIX, false).unwrap().0,
             "renodx-dlss5-6.5.3"
         );
+    }
+
+    /// 8.x builds get the Render hook point, one pass and detail stability;
+    /// EnableHooks only for a Streamline game; a key the player set is kept.
+    #[test]
+    fn dlss5_8x_fast_settings_are_written_once_and_keep_the_players() {
+        assert!(dlss5_has_fast_settings("renodx-dlss5-8.5.0-rc10"));
+        assert!(dlss5_has_fast_settings("renodx-dlss5-8.0.1"));
+        assert!(!dlss5_has_fast_settings("renodx-dlss5-6.5.3"));
+        assert!(!dlss5_has_fast_settings("renodx-dlss5-4.70"));
+        assert!(!dlss5_has_fast_settings("renodx-dlss-SF-26.0922.0041"));
+        let t = tempfile::tempdir().unwrap();
+        fs::write(
+            t.path().join("ReShade.ini"),
+            "[GENERAL]\nPresetPath=.\\ReShadePreset.ini\n[RenoDX.DLSS5]\nNRPasses=2\n",
+        )
+        .unwrap();
+        let wrote = write_dlss5_fast_defaults(t.path(), true).unwrap();
+        assert_eq!(
+            wrote,
+            vec!["NRHookPoint=1", "NRDetailStability=2", "EnableHooks=1"]
+        );
+        let ini = crate::reshade_ini::Ini::load(&t.path().join("ReShade.ini"));
+        assert_eq!(ini.get(DLSS5_INI_SECTION, "NRPasses"), Some("2"));
+        assert_eq!(ini.get(DLSS5_INI_SECTION, "NRHookPoint"), Some("1"));
+        assert_eq!(
+            ini.get("GENERAL", "PresetPath"),
+            Some(".\\ReShadePreset.ini")
+        );
+        assert!(write_dlss5_fast_defaults(t.path(), true)
+            .unwrap()
+            .is_empty());
+        assert!(!dlss5_fast_defaults(false)
+            .iter()
+            .any(|(k, _)| *k == "EnableHooks"));
+    }
+
+    /// An 8.x DLSS 5 add-on bridges Direct3D 11 itself: a DX11 game on it is
+    /// complete without dlss5-bridge, and the bridge step takes one out.
+    #[test]
+    fn an_8x_addon_needs_no_separate_dx11_bridge() {
+        let t = tempfile::tempdir().unwrap();
+        let mut st = game::stub_status(game::Mode::Native, game::Api::Dx11);
+        st.exe = t.path().join("game.exe");
+        assert!(st.needs_bridge());
+        fs::write(
+            t.path().join(game::DLSS5_ADDON_MARKER),
+            "renodx-dlss5-8.5.0-rc10",
+        )
+        .unwrap();
+        assert!(st.dx11_native() && !st.needs_bridge());
+        st.reshade = true;
+        st.dlss5_addon = true;
+        st.dlssnr = true;
+        assert!(st.complete());
+        fs::write(t.path().join(game::BRIDGE_ADDON), b"x").unwrap();
+        let client = reqwest::blocking::Client::new();
+        let out = step_bridge(&client, &st, t.path(), &|_, _| {}).unwrap();
+        assert!(!t.path().join(game::BRIDGE_ADDON).exists());
+        assert!(out
+            .iter()
+            .any(|l| l.contains("removed dlss5-bridge.addon64")));
+        fs::write(
+            t.path().join(game::DLSS5_ADDON_MARKER),
+            "renodx-dlss5-6.5.3",
+        )
+        .unwrap();
+        assert!(st.needs_bridge());
     }
 }

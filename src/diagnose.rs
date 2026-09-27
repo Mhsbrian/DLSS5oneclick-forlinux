@@ -371,7 +371,7 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
         // The add-on hooks NVSDK_NGX_D3D12_*. A game whose DLSS runs on D3D11
         // calls the D3D11 entry points, which it never sees, so "no create"
         // is expected until the bridge is installed (#33, BG3 DX11).
-        if st.api == game::Api::Dx11 && !st.bridge {
+        if st.needs_bridge() && !st.bridge {
             out.push(bad(
                 "No NGX call was intercepted, and this is a Direct3D 11 game with its own \
                  DLSS: the add-on hooks the D3D12 NGX entry points, but the game calls the \

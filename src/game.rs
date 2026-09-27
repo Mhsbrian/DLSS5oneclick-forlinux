@@ -1100,8 +1100,19 @@ impl GameStatus {
             self.game_dir().to_path_buf()
         }
     }
-    pub fn needs_bridge(&self) -> bool {
+    /// A Direct3D 11 game with its own DLSS: the one kind that has a bridge step.
+    pub fn dx11_native(&self) -> bool {
         self.mode == Mode::Native && self.api == Api::Dx11
+    }
+    /// The DLSS 5 add-on this tool placed is an 8.x build. Those carry their own
+    /// Direct3D 11 bridge and, when another project's bridge is loaded, switch
+    /// to serving only that tool's D3D12 calls: the game's own DLSS gets no NR.
+    pub fn dlss5_own_bridge(&self) -> bool {
+        fs::read_to_string(self.consumer_dir().join(DLSS5_ADDON_MARKER))
+            .is_ok_and(|t| crate::installer::dlss5_has_fast_settings(t.trim()))
+    }
+    pub fn needs_bridge(&self) -> bool {
+        self.dx11_native() && !self.dlss5_own_bridge()
     }
     pub fn complete(&self) -> bool {
         // The AIO is its own consumer on either kind of game: ReShade, the

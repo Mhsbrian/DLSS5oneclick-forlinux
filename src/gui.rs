@@ -262,7 +262,7 @@ impl App {
             ampere_mfg: false,
             renodx_classic: false,
             renodx_steady: false,
-            consumer: installer::Consumer::ShortFuse,
+            consumer: installer::Consumer::Dlss5,
             advanced: false,
             ada_mfg: false,
             opti_fg: false,
@@ -645,10 +645,10 @@ impl App {
         if switch_engine && st.as_ref().is_some_and(|g| g.renodx_mod.is_some()) {
             with_renodx = true;
         }
-        if self.settings.renodx_prerelease {
-            std::env::set_var(installer::RENODX_PRERELEASE_ENV, "1");
+        if self.settings.renodx_stable_only {
+            std::env::set_var(installer::RENODX_STABLE_ENV, "1");
         } else {
-            std::env::remove_var(installer::RENODX_PRERELEASE_ENV);
+            std::env::remove_var(installer::RENODX_STABLE_ENV);
         }
         if self.ada_mfg {
             std::env::set_var(installer::ADA_MFG_ENV, "1");
@@ -3308,7 +3308,7 @@ impl eframe::App for App {
                     let cb = egui::Checkbox::new(
                         &mut steady,
                         RichText::new(
-                            "DLSS 5 add-on: install 4.70 instead of the newest stable build \u{2014} the last one with Enable Upscaling; the newer builds broke some games",
+                            "DLSS 5 add-on: install 4.70 instead of the newest build \u{2014} the last one with Enable Upscaling; the newer builds broke some games",
                         )
                         .font(t::plex(11.5))
                         .color(t::TEXT_SOFT),
@@ -3320,11 +3320,11 @@ impl eframe::App for App {
                         self.renodx_steady = steady;
                     }
                     // Saved with the settings: it applies to every game (#77).
-                    let mut pre = self.settings.renodx_prerelease;
+                    let mut stable = self.settings.renodx_stable_only;
                     let cb = egui::Checkbox::new(
-                        &mut pre,
+                        &mut stable,
                         RichText::new(
-                            "DLSS 5 add-on: include release candidates (7.0.0-rc and similar test builds) when installing or updating to the newest build \u{2014} they fix some bugs sooner and break others",
+                            "DLSS 5 add-on: stable builds only \u{2014} skip release candidates (8.5.0-rc and similar test builds) when installing or updating to the newest build",
                         )
                         .font(t::plex(11.5))
                         .color(t::TEXT_SOFT),
@@ -3333,7 +3333,7 @@ impl eframe::App for App {
                         .add_enabled(!self.running && !self.renodx_classic && !self.renodx_steady, cb)
                         .changed()
                     {
-                        self.settings.renodx_prerelease = pre;
+                        self.settings.renodx_stable_only = stable;
                         let _ = self.settings.save();
                     }
                 }
@@ -3697,7 +3697,7 @@ impl eframe::App for App {
                         );
                         ui.label(
                             RichText::new(if native {
-                                "\u{2014} all of them run DLSS 5; ShortFuse's is the default for a game with its own DLSS"
+                                "\u{2014} all of them run DLSS 5; the DLSS 5 add-on is the default for a game with its own DLSS"
                             } else {
                                 "\u{2014} only the DLSS 5 add-on works in a game with no DLSS of its own"
                             })
@@ -3708,13 +3708,13 @@ impl eframe::App for App {
                     let gap = 8.0;
                     let row_w = ui.available_width();
                     let col_w = ((row_w - gap) / 2.0).floor();
-                    // ShortFuse's add-on first: the RenoDX author's own consumer,
+                    // ShortFuse's add-on: the RenoDX author's own consumer, for
                     // 64-bit games with DLSS of their own.
                     let sf_ok = native && ok_status.as_ref().is_some_and(|s| !s.is32());
                     if !sf_ok && self.consumer == installer::Consumer::ShortFuse {
                         self.consumer = installer::Consumer::Dlss5;
                     }
-                    let sf_title = "Default \u{2014} ShortFuse's DLSS add-on";
+                    let sf_title = "ShortFuse's DLSS add-on";
                     let sf_lines = [
                         "From the author of RenoDX. Hooks the game's own DLSS in DX11 and DX12, so no bridge.",
                         "In game: Home \u{2192} Add-ons \u{2192} RenoDX DLSS.",
@@ -3740,9 +3740,9 @@ impl eframe::App for App {
                         self.consumer = installer::Consumer::ShortFuse;
                     }
                     ui.add_space(gap);
-                    let stable_title = "RenoDX DLSS 5 add-on";
+                    let stable_title = "Default \u{2014} RenoDX DLSS 5 add-on";
                     let stable_lines = [
-                        "The proven route. The network runs after the upscaler, at output resolution.",
+                        "Newest build. On 8.x it runs before the game's upscale (Render hook point), set for you.",
                         "In game: Home \u{2192} Add-ons \u{2192} DLSS 5 Neural Rendering.",
                     ];
                     let up_title = "Experimental \u{2014} Neural Upstream";
