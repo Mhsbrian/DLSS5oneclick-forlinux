@@ -1641,21 +1641,20 @@ pub const DLSS5_INI_SECTION: &str = "RenoDX.DLSS5";
 /// - `NRPasses=1`: one pass; a second doubles the cost.
 /// - `NRDetailStability=2`, Always (Auto, Off, Always): Render redraws small
 ///   detail a little differently each frame, and this holds it still.
-/// - `EnableHooks=1` when the game ships NVIDIA Streamline
-///   (`sl.interposer.dll`): the add-on's own advice when a Streamline game
-///   sends it nothing.
+///
+/// `EnableHooks` is left at the add-on's default. 0.14.3 wrote
+/// `EnableHooks=1` for Streamline games, but in Dead Space the add-on said its
+/// Streamline could not be hooked and served the game's DLSS through NGX
+/// anyway, while warning that 1 can crash a game at start. Its NGX path
+/// "still covers Streamline's DLSS calls".
 ///
 /// Written only where the key is missing, so what a player set stays.
-pub fn dlss5_fast_defaults(streamline: bool) -> Vec<(&'static str, &'static str)> {
-    let mut v = vec![
+pub fn dlss5_fast_defaults() -> [(&'static str, &'static str); 3] {
+    [
         ("NRHookPoint", "1"),
         ("NRPasses", "1"),
         ("NRDetailStability", "2"),
-    ];
-    if streamline {
-        v.push(("EnableHooks", "1"));
-    }
-    v
+    ]
 }
 
 /// The add-on build is 8.0 or newer: the builds with these settings.
@@ -1669,11 +1668,11 @@ pub fn dlss5_has_fast_settings(tag: &str) -> bool {
 
 /// Add the missing `dlss5_fast_defaults` to `cdir\ReShade.ini`; returns the
 /// keys written.
-fn write_dlss5_fast_defaults(cdir: &Path, streamline: bool) -> Result<Vec<String>> {
+fn write_dlss5_fast_defaults(cdir: &Path) -> Result<Vec<String>> {
     let path = cdir.join("ReShade.ini");
     let mut ini = crate::reshade_ini::Ini::load(&path);
     let mut wrote = Vec::new();
-    for (k, v) in dlss5_fast_defaults(streamline) {
+    for (k, v) in dlss5_fast_defaults() {
         if ini.get(DLSS5_INI_SECTION, k).is_none() {
             ini.set(DLSS5_INI_SECTION, k, v);
             wrote.push(format!("{k}={v}"));
@@ -2572,8 +2571,7 @@ fn step_dlss5(
     if st.mode == game::Mode::Native {
         let tag = fs::read_to_string(cdir.join(game::DLSS5_ADDON_MARKER)).unwrap_or_default();
         if dlss5_has_fast_settings(tag.trim()) {
-            let streamline = st.game_dir().join("sl.interposer.dll").is_file();
-            let wrote = write_dlss5_fast_defaults(&cdir, streamline)?;
+            let wrote = write_dlss5_fast_defaults(&cdir)?;
             if !wrote.is_empty() {
                 installed.push(format!(
                     "ReShade.ini [{DLSS5_INI_SECTION}]: {}",
@@ -5509,7 +5507,7 @@ AmpereMfgUnlock=true
     }
 
     /// 8.x builds get the Render hook point, one pass and detail stability;
-    /// EnableHooks only for a Streamline game; a key the player set is kept.
+    /// a key the player set is kept.
     #[test]
     fn dlss5_8x_fast_settings_are_written_once_and_keep_the_players() {
         assert!(dlss5_has_fast_settings("renodx-dlss5-8.5.0-rc10"));
@@ -5523,11 +5521,8 @@ AmpereMfgUnlock=true
             "[GENERAL]\nPresetPath=.\\ReShadePreset.ini\n[RenoDX.DLSS5]\nNRPasses=2\n",
         )
         .unwrap();
-        let wrote = write_dlss5_fast_defaults(t.path(), true).unwrap();
-        assert_eq!(
-            wrote,
-            vec!["NRHookPoint=1", "NRDetailStability=2", "EnableHooks=1"]
-        );
+        let wrote = write_dlss5_fast_defaults(t.path()).unwrap();
+        assert_eq!(wrote, vec!["NRHookPoint=1", "NRDetailStability=2"]);
         let ini = crate::reshade_ini::Ini::load(&t.path().join("ReShade.ini"));
         assert_eq!(ini.get(DLSS5_INI_SECTION, "NRPasses"), Some("2"));
         assert_eq!(ini.get(DLSS5_INI_SECTION, "NRHookPoint"), Some("1"));
@@ -5535,12 +5530,7 @@ AmpereMfgUnlock=true
             ini.get("GENERAL", "PresetPath"),
             Some(".\\ReShadePreset.ini")
         );
-        assert!(write_dlss5_fast_defaults(t.path(), true)
-            .unwrap()
-            .is_empty());
-        assert!(!dlss5_fast_defaults(false)
-            .iter()
-            .any(|(k, _)| *k == "EnableHooks"));
+        assert!(write_dlss5_fast_defaults(t.path()).unwrap().is_empty());
     }
 
     /// An 8.x DLSS 5 add-on bridges Direct3D 11 itself: a DX11 game on it is
