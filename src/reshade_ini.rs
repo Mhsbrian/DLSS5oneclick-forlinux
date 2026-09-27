@@ -75,6 +75,20 @@ impl Ini {
         }
     }
 
+    /// Drop `key` from `section`; true when it was there.
+    pub fn remove(&mut self, section: &str, key: &str) -> bool {
+        let Some((_, kv)) = self
+            .sections
+            .iter_mut()
+            .find(|(n, _)| n.eq_ignore_ascii_case(section))
+        else {
+            return false;
+        };
+        let before = kv.len();
+        kv.retain(|(k, _)| !k.eq_ignore_ascii_case(key));
+        kv.len() != before
+    }
+
     pub fn set_default(&mut self, section: &str, key: &str, value: &str) {
         if self.get(section, key).is_none() {
             self.set(section, key, value);

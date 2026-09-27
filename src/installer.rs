@@ -495,6 +495,12 @@ pub fn stale_components(dir: &Path, latest: &Latest) -> Vec<String> {
         if h != RENODX_STEADY_TAG && h != RENODX_CLASSIC_TAG && !ahead {
             check("DLSS 5 add-on", Some(have), want);
         }
+        if enable_hooks_from_0143(&crate::reshade_ini::Ini::load(&dir.join("ReShade.ini"))) {
+            out.push(
+                "ReShade.ini EnableHooks=1 \u{2192} automatic (the 0.14.3 setting can crash some games at start)"
+                    .to_owned(),
+            );
+        }
     }
     if let Ok(m) = fs::read_to_string(dir.join(game::OPTI_MANIFEST)) {
         // Compare against the repo this install came from. Comparing a pre-SR
@@ -1642,11 +1648,11 @@ pub const DLSS5_INI_SECTION: &str = "RenoDX.DLSS5";
 /// - `NRDetailStability=2`, Always (Auto, Off, Always): Render redraws small
 ///   detail a little differently each frame, and this holds it still.
 ///
-/// `EnableHooks` is left at the add-on's default. 0.14.3 wrote
-/// `EnableHooks=1` for Streamline games, but in Dead Space the add-on said its
-/// Streamline could not be hooked and served the game's DLSS through NGX
-/// anyway, while warning that 1 can crash a game at start. Its NGX path
-/// "still covers Streamline's DLSS calls".
+/// `EnableHooks` is left out: with no key the add-on runs NGX-only and turns
+/// its Streamline hooks on by itself when a Streamline game's DLSS calls do
+/// not reach it ("auto-enabling the Streamline hook layer for this session").
+/// `1` forces those hooks from the start, which the add-on warns can crash a
+/// game at boot; `2` forces NGX-only and turns the automatic switch off.
 ///
 /// Written only where the key is missing, so what a player set stays.
 pub fn dlss5_fast_defaults() -> [(&'static str, &'static str); 3] {
@@ -1666,6 +1672,17 @@ pub fn dlss5_has_fast_settings(tag: &str) -> bool {
             .is_some_and(|m| *m >= 8)
 }
 
+/// 0.14.3 wrote EnableHooks=1 in Streamline games beside the three settings.
+/// Where all four still hold those values it is that write, and Install takes
+/// it out so the add-on's automatic choice applies; a value the player changed
+/// stays.
+fn enable_hooks_from_0143(ini: &crate::reshade_ini::Ini) -> bool {
+    ini.get(DLSS5_INI_SECTION, "EnableHooks") == Some("1")
+        && dlss5_fast_defaults()
+            .iter()
+            .all(|(k, v)| ini.get(DLSS5_INI_SECTION, k) == Some(*v))
+}
+
 /// Add the missing `dlss5_fast_defaults` to `cdir\ReShade.ini`; returns the
 /// keys written.
 fn write_dlss5_fast_defaults(cdir: &Path) -> Result<Vec<String>> {
@@ -1677,6 +1694,9 @@ fn write_dlss5_fast_defaults(cdir: &Path) -> Result<Vec<String>> {
             ini.set(DLSS5_INI_SECTION, k, v);
             wrote.push(format!("{k}={v}"));
         }
+    }
+    if enable_hooks_from_0143(&ini) && ini.remove(DLSS5_INI_SECTION, "EnableHooks") {
+        wrote.push("EnableHooks=1 removed (the add-on picks the hooks itself)".to_owned());
     }
     if !wrote.is_empty() {
         ini.save(&path)?;
@@ -5564,5 +5584,31 @@ AmpereMfgUnlock=true
         )
         .unwrap();
         assert!(st.needs_bridge());
+    }
+
+    /// The EnableHooks=1 that 0.14.3 wrote beside the three settings goes; one
+    /// next to settings the player changed stays.
+    #[test]
+    fn the_0143_enable_hooks_write_is_taken_back() {
+        let t = tempfile::tempdir().unwrap();
+        let ini = t.path().join("ReShade.ini");
+        fs::write(
+            &ini,
+            "[RenoDX.DLSS5]\nNRHookPoint=1\nNRPasses=1\nNRDetailStability=2\nEnableHooks=1\n",
+        )
+        .unwrap();
+        let wrote = write_dlss5_fast_defaults(t.path()).unwrap();
+        assert_eq!(wrote.len(), 1, "{wrote:?}");
+        let got = crate::reshade_ini::Ini::load(&ini);
+        assert_eq!(got.get(DLSS5_INI_SECTION, "EnableHooks"), None);
+        assert_eq!(got.get(DLSS5_INI_SECTION, "NRHookPoint"), Some("1"));
+        fs::write(
+            &ini,
+            "[RenoDX.DLSS5]\nNRHookPoint=0\nNRPasses=1\nNRDetailStability=2\nEnableHooks=1\n",
+        )
+        .unwrap();
+        assert!(write_dlss5_fast_defaults(t.path()).unwrap().is_empty());
+        let got = crate::reshade_ini::Ini::load(&ini);
+        assert_eq!(got.get(DLSS5_INI_SECTION, "EnableHooks"), Some("1"));
     }
 }
