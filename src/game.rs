@@ -25,6 +25,11 @@ pub const DLSS5_ADDON: &str = "renodx-dlss5.addon64";
 pub const SF_ADDON: &str = "renodx-dlss.addon64";
 /// The ShortFuse add-on release tag this tool placed.
 pub const SF_ADDON_MARKER: &str = "renodx-dlss.addon64.dlss5oneclick";
+/// Beside a ShortFuse add-on placed from 0.14.3 on, when ShortFuse stopped
+/// being the first setup: this one was chosen (the next setup after the DLSS 5
+/// add-on, or Advanced), so Update keeps it. One without it was the old
+/// default and moves to the DLSS 5 add-on.
+pub const SF_CHOSEN_MARKER: &str = "renodx-dlss.addon64.chosen.dlss5oneclick";
 pub const DLSSNR_DLL: &str = "nvngx_dlssnr.dll";
 pub const DLSS_DLL: &str = "nvngx_dlss.dll";
 pub const LUMENITE_KERNEL_FX: &str = "lumenite_Kernel.fx";

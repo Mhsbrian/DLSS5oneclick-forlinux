@@ -211,7 +211,7 @@ fn meta_from_status(st: &GameStatus, latest: &installer::Latest) -> GameMeta {
         addon: st.dlss5_addon || st.opti,
         ready: st.complete(),
         installed: game::installed_by_tool(dir),
-        stale: installer::stale_components(dir, latest),
+        stale: setup::stale(st, latest),
         rt_likely: st.rt_likely,
         unreal_likely: st.unreal_likely,
         unity_likely: st.unity_likely,

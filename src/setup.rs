@@ -161,7 +161,38 @@ pub fn hand_chosen(st: &GameStatus) -> bool {
 
 /// The rung the game is on: where what is installed sits on its ladder, or the
 /// top when nothing is.
+/// ShortFuse's add-on placed as the default before 0.14.3 (no chosen marker),
+/// in a game whose list now starts on the DLSS 5 add-on: Install and Update
+/// move it there. Where the list starts elsewhere (Dragon's Dogma 2, where the
+/// newer builds crash) it stays.
+pub fn legacy_default_sf(st: &GameStatus) -> bool {
+    installed(st) == Some(SF)
+        && !st.consumer_dir().join(game::SF_CHOSEN_MARKER).is_file()
+        && ladder(st).first() == Some(&DLSS5_NEWEST)
+}
+
+/// What Update would change: the components with a newer build, and the move
+/// off an old default ShortFuse install.
+pub fn stale(st: &GameStatus, latest: &installer::Latest) -> Vec<String> {
+    let mut v = installer::stale_components(st.game_dir(), latest);
+    if legacy_default_sf(st) {
+        v.push(format!(
+            "ShortFuse's add-on \u{2192} DLSS 5 add-on {} (the new default)",
+            latest
+                .dlss5_pre
+                .as_deref()
+                .or(latest.dlss5.as_deref())
+                .unwrap_or("newest build")
+                .trim_start_matches(installer::DLSS5_PREFIX)
+        ));
+    }
+    v
+}
+
 pub fn level(st: &GameStatus) -> usize {
+    if legacy_default_sf(st) {
+        return 0;
+    }
     let l = ladder(st);
     // A ShortFuse add-on the user placed is not ours, but it is the setup the
     // game is on: starting on the DLSS 5 add-on above it would stop at the
@@ -322,6 +353,21 @@ mod tests {
         assert_eq!(installed(&st), None);
         fs::write(t.path().join(game::SF_ADDON_MARKER), "renodx-dlss-SF-1").unwrap();
         assert_eq!(installed(&st), Some(SF));
+        // Placed as the old default: Update moves it to the DLSS 5 add-on.
+        assert!(legacy_default_sf(&st));
+        assert_eq!(current(&st), Some(DLSS5_NEWEST));
+        assert!(stale(&st, &installer::Latest::default())
+            .iter()
+            .any(|l| l.contains("ShortFuse's add-on")));
+        // Chosen from 0.14.3 on: it stays.
+        fs::write(t.path().join(game::SF_CHOSEN_MARKER), b"").unwrap();
+        assert!(!legacy_default_sf(&st));
+        assert_eq!(current(&st), Some(SF));
+        // Dragon's Dogma 2 keeps an old ShortFuse install too.
+        fs::remove_file(t.path().join(game::SF_CHOSEN_MARKER)).unwrap();
+        st.exe = t.path().join("DD2.exe");
+        assert!(!legacy_default_sf(&st));
+        st.exe = t.path().join("game.exe");
         st.sf = false;
         st.reshade = false;
         st.opti = true;

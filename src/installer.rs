@@ -2866,6 +2866,7 @@ fn step_sf(
     if dest.is_file() {
         match fs::read_to_string(cdir.join(game::SF_ADDON_MARKER)) {
             Ok(mine) if mine.trim() == tag => {
+                fs::write(cdir.join(game::SF_CHOSEN_MARKER), b"")?;
                 return Ok(vec![format!("{} already current ({tag})", game::SF_ADDON)]);
             }
             Ok(_) => progress(0, &format!("{}: {tag} is out, refreshing", game::SF_ADDON)),
@@ -2881,6 +2882,7 @@ fn step_sf(
     net::download(client, &url, &z, game::SF_ADDON, progress)?;
     install_single_from_zip(&z, game::SF_ADDON, &dest)?;
     fs::write(cdir.join(game::SF_ADDON_MARKER), tag.as_bytes())?;
+    fs::write(cdir.join(game::SF_CHOSEN_MARKER), b"")?;
     Ok(vec![format!("{} ({tag})", game::SF_ADDON)])
 }
 
@@ -2901,6 +2903,7 @@ fn step_sf_cleanup(
         );
     }
     let mut removed = Vec::new();
+    let _ = fs::remove_file(st.consumer_dir().join(game::SF_CHOSEN_MARKER));
     for f in [game::SF_ADDON, game::SF_ADDON_MARKER] {
         let p = st.consumer_dir().join(f);
         if p.is_file() {
@@ -3564,6 +3567,7 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
         d.join(game::DLSS5_ADDON),
         d.join(game::DLSS5_ADDON_MARKER),
         d.join(game::SF_ADDON_MARKER),
+        d.join(game::SF_CHOSEN_MARKER),
         d.join(game::DLSSNR_DLL),
         d.join(game::BRIDGE_ADDON),
         d.join(game::UPSTREAM_ADDON),

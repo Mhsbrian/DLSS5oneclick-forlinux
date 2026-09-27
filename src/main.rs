@@ -547,7 +547,7 @@ Attach that zip to the GitHub issue.",
                     let latest = net::client()
                         .map(|c| installer::Latest::fetch(&c))
                         .unwrap_or_default();
-                    match installer::stale_components(st.game_dir(), &latest).as_slice() {
+                    match setup::stale(&st, &latest).as_slice() {
                         [] => println!("  installed by this tool · everything current"),
                         stale => {
                             println!("  installed by this tool · out of date:");
