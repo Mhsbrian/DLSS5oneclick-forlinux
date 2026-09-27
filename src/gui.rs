@@ -1659,13 +1659,15 @@ impl App {
                 // None = "Installed by this tool", always first: the whole
                 // point is to see at a glance what has been modified and
                 // what has fallen behind.
-                let sections: [Option<Store>; 6] = [
+                let sections: [Option<Store>; 8] = [
                     None,
                     Some(Store::Manual),
                     Some(Store::Steam),
                     Some(Store::Epic),
                     Some(Store::Gog),
                     Some(Store::Xbox),
+                    Some(Store::Ea),
+                    Some(Store::Ubisoft),
                 ];
                 for section in sections {
                     let idx: Vec<usize> = self
@@ -2384,11 +2386,16 @@ impl App {
 }
 
 /// The stores' own marks (Simple Icons, CC0 1.0), white PNGs tinted at paint time.
-const STORE_ICON_PNG: [(Store, &[u8]); 4] = [
+const STORE_ICON_PNG: [(Store, &[u8]); 6] = [
     (Store::Steam, include_bytes!("../assets/store-steam.png")),
     (Store::Xbox, include_bytes!("../assets/store-xbox.png")),
     (Store::Epic, include_bytes!("../assets/store-epic.png")),
     (Store::Gog, include_bytes!("../assets/store-gog.png")),
+    (Store::Ea, include_bytes!("../assets/store-ea.png")),
+    (
+        Store::Ubisoft,
+        include_bytes!("../assets/store-ubisoft.png"),
+    ),
 ];
 
 fn load_store_icons(ctx: &egui::Context) -> HashMap<Store, egui::TextureHandle> {
