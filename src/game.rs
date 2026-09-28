@@ -77,6 +77,11 @@ pub const RESHADE_MARKER: &str = "dxgi.dll.dlss5oneclick";
 /// Feeder's host names them all "v4.6 engine" and warns about a combination the
 /// classic build is not part of. The tag is the only way to tell them apart.
 pub const DLSS5_ADDON_MARKER: &str = "renodx-dlss5.addon64.dlss5oneclick";
+/// Written once the 8.x add-on's faster settings went into this game's
+/// ReShade.ini: they are the tool's starting point, not something it keeps
+/// putting back, so a later Install leaves the player's choices alone even when
+/// the add-on stores a default by leaving its key out.
+pub const DLSS5_SETTINGS_MARKER: &str = "renodx-dlss5.settings.dlss5oneclick";
 /// The DLSS5-Feeder release tag this tool placed, so a stale install can be
 /// spotted without downloading the zip to compare sizes.
 pub const FEEDER_MARKER: &str = "dlss5-feed.dlss5oneclick";

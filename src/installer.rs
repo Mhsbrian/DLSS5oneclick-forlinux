@@ -1683,16 +1683,20 @@ fn enable_hooks_from_0143(ini: &crate::reshade_ini::Ini) -> bool {
             .all(|(k, v)| ini.get(DLSS5_INI_SECTION, k) == Some(*v))
 }
 
-/// Add the missing `dlss5_fast_defaults` to `cdir\ReShade.ini`; returns the
-/// keys written.
+/// The first time (no `DLSS5_SETTINGS_MARKER` yet), add the missing
+/// `dlss5_fast_defaults` to `cdir\ReShade.ini` and leave the marker; every
+/// time, take back the 0.14.3 EnableHooks=1. Returns what changed.
 fn write_dlss5_fast_defaults(cdir: &Path) -> Result<Vec<String>> {
     let path = cdir.join("ReShade.ini");
     let mut ini = crate::reshade_ini::Ini::load(&path);
     let mut wrote = Vec::new();
-    for (k, v) in dlss5_fast_defaults() {
-        if ini.get(DLSS5_INI_SECTION, k).is_none() {
-            ini.set(DLSS5_INI_SECTION, k, v);
-            wrote.push(format!("{k}={v}"));
+    let first = !cdir.join(game::DLSS5_SETTINGS_MARKER).is_file();
+    if first {
+        for (k, v) in dlss5_fast_defaults() {
+            if ini.get(DLSS5_INI_SECTION, k).is_none() {
+                ini.set(DLSS5_INI_SECTION, k, v);
+                wrote.push(format!("{k}={v}"));
+            }
         }
     }
     if enable_hooks_from_0143(&ini) && ini.remove(DLSS5_INI_SECTION, "EnableHooks") {
@@ -1700,6 +1704,9 @@ fn write_dlss5_fast_defaults(cdir: &Path) -> Result<Vec<String>> {
     }
     if !wrote.is_empty() {
         ini.save(&path)?;
+    }
+    if first {
+        fs::write(cdir.join(game::DLSS5_SETTINGS_MARKER), b"")?;
     }
     Ok(wrote)
 }
@@ -2850,9 +2857,11 @@ fn step_dlss5_cleanup(
     progress: Progress,
 ) -> Result<Vec<String>> {
     let mut removed = Vec::new();
-    let marker = st.consumer_dir().join(game::DLSS5_ADDON_MARKER);
-    if marker.is_file() {
-        fs::remove_file(&marker)?;
+    for m in [game::DLSS5_ADDON_MARKER, game::DLSS5_SETTINGS_MARKER] {
+        let marker = st.consumer_dir().join(m);
+        if marker.is_file() {
+            fs::remove_file(&marker)?;
+        }
     }
     let f = st.consumer_dir().join(game::DLSS5_ADDON);
     if f.is_file() {
@@ -3584,6 +3593,7 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
         d.join(game::FEEDER_ADDON),
         d.join(game::DLSS5_ADDON),
         d.join(game::DLSS5_ADDON_MARKER),
+        d.join(game::DLSS5_SETTINGS_MARKER),
         d.join(game::SF_ADDON_MARKER),
         d.join(game::SF_CHOSEN_MARKER),
         d.join(game::DLSSNR_DLL),
@@ -3644,6 +3654,7 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
             game::HOST_EXE,
             game::DLSS5_ADDON,
             game::DLSS5_ADDON_MARKER,
+            game::DLSS5_SETTINGS_MARKER,
             game::DLSSNR_DLL,
             game::DLSSNR_MARKER,
             game::DLSS_MARKER,
@@ -5610,5 +5621,20 @@ AmpereMfgUnlock=true
         assert!(write_dlss5_fast_defaults(t.path()).unwrap().is_empty());
         let got = crate::reshade_ini::Ini::load(&ini);
         assert_eq!(got.get(DLSS5_INI_SECTION, "EnableHooks"), Some("1"));
+    }
+
+    /// The settings go in once; a hook point the player set back to Upscaled
+    /// (the add-on may store that default by leaving the key out) stays.
+    #[test]
+    fn fast_settings_are_written_once_per_game() {
+        let t = tempfile::tempdir().unwrap();
+        let ini = t.path().join("ReShade.ini");
+        fs::write(&ini, "[GENERAL]\n").unwrap();
+        assert_eq!(write_dlss5_fast_defaults(t.path()).unwrap().len(), 3);
+        assert!(t.path().join(game::DLSS5_SETTINGS_MARKER).is_file());
+        fs::write(&ini, "[RenoDX.DLSS5]\nNRPasses=1\nNRDetailStability=2\n").unwrap();
+        assert!(write_dlss5_fast_defaults(t.path()).unwrap().is_empty());
+        let got = crate::reshade_ini::Ini::load(&ini);
+        assert_eq!(got.get(DLSS5_INI_SECTION, "NRHookPoint"), None);
     }
 }
