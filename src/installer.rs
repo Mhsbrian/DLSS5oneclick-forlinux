@@ -489,10 +489,9 @@ pub fn stale_components(dir: &Path, latest: &Latest) -> Vec<String> {
         } else {
             &latest.dlss5
         };
-        let ahead = want
-            .as_deref()
-            .is_some_and(|w| newer_tag(h, w, DLSS5_PREFIX));
-        if h != RENODX_STEADY_TAG && h != RENODX_CLASSIC_TAG && !ahead {
+        // A release candidate on a game whose player asked for stable builds
+        // only is out of date too: Update takes it back to the stable build.
+        if h != RENODX_STEADY_TAG && h != RENODX_CLASSIC_TAG {
             check("DLSS 5 add-on", Some(have), want);
         }
         if enable_hooks_from_0143(&crate::reshade_ini::Ini::load(&dir.join("ReShade.ini"))) {
@@ -1729,15 +1728,8 @@ pub fn renodx_tag_choice(env: Option<&str>) -> Option<String> {
 pub const DLSS5_PREFIX: &str = "renodx-dlss5-";
 pub const SF_PREFIX: &str = "renodx-dlss-SF-";
 
-/// The DLSS 5 add-on this tool placed in `cdir` is a newer build than `tag`.
-fn present_newer(cdir: &Path, tag: &str) -> bool {
-    cdir.join(game::DLSS5_ADDON).is_file()
-        && fs::read_to_string(cdir.join(game::DLSS5_ADDON_MARKER))
-            .ok()
-            .is_some_and(|m| newer_tag(m.trim(), tag, DLSS5_PREFIX))
-}
-
 /// `a` is a later version than `b` (both with `prefix`).
+#[cfg(test)]
 pub fn newer_tag(a: &str, b: &str, prefix: &str) -> bool {
     a.starts_with(prefix) && b.starts_with(prefix) && ver_key(a, prefix) > ver_key(b, prefix)
 }
@@ -2517,21 +2509,10 @@ fn step_dlss5(
             (true, Some(t)) => t,
             _ => rhi_latest(client, prefix)?,
         };
-        // The newest-build step never goes backwards: a build this tool placed
-        // that is newer than the newest stable one (a 7.0.0 release candidate
-        // from 0.13.27's "newest" tick) stays until a stable build passes it
-        // (#77). A pinned build is exactly that build and is not affected.
-        if prefix == DLSS5_PREFIX
-            && std::env::var_os(RENODX_TAG_ENV).is_none()
-            && present_newer(&cdir, &tag)
-        {
-            let mine = fs::read_to_string(cdir.join(game::DLSS5_ADDON_MARKER)).unwrap_or_default();
-            installed.push(format!(
-                "{fname} kept at {} (newer than the newest stable {tag})",
-                mine.trim()
-            ));
-            continue;
-        }
+        // No "never backwards" hold here any more: release candidates are the
+        // default since 0.14.3, so the newest-build step only lands below a
+        // build already in place when the player asked for stable builds
+        // only, and then going back is the point (#116).
         if present {
             match marker.map(|m| fs::read_to_string(cdir.join(m))) {
                 Some(Ok(mine)) if mine.trim() == tag => {
@@ -5489,21 +5470,6 @@ AmpereMfgUnlock=true
             "renodx-dlss5-6.5.3",
             DLSS5_PREFIX
         ));
-        let t = tempfile::tempdir().unwrap();
-        fs::write(t.path().join(game::DLSS5_ADDON), b"x").unwrap();
-        fs::write(
-            t.path().join(game::DLSS5_ADDON_MARKER),
-            "renodx-dlss5-7.0.0-rc8",
-        )
-        .unwrap();
-        assert!(present_newer(t.path(), "renodx-dlss5-6.5.3"));
-        let latest = Latest {
-            dlss5: Some("renodx-dlss5-6.5.3".into()),
-            ..Default::default()
-        };
-        assert!(!stale_components(t.path(), &latest)
-            .iter()
-            .any(|c| c.contains("DLSS 5 add-on")));
     }
 
     /// A stable build beats its own release candidates, which beat each other
