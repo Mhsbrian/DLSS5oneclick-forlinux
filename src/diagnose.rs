@@ -124,7 +124,7 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
         .file_name()
         .map(|n| n.to_string_lossy().to_ascii_lowercase());
     let mut log_note = None;
-    if let (Some(rs), Some(ours), false) = (rs_log.as_deref(), ours.as_deref(), st.is32()) {
+    if let (Some(rs), Some(ours), false) = (rs_log.as_deref(), ours.as_deref(), st.uses_host()) {
         if let Some(loaded) = reshade_host_exe(rs).filter(|h| h.to_ascii_lowercase() != ours) {
             if let Some(prev) = read(&consumer, "ReShade.log1")
                 .filter(|p| reshade_host_exe(p).is_some_and(|h| h.to_ascii_lowercase() == ours))
@@ -247,7 +247,7 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
     // opens and which loads the feeder, and the 64-bit one in host64\ that hosts
     // the neural add-on. Reporting only the second leaves "Home does nothing"
     // unexplained, which is the first thing the player actually notices (#69).
-    if st.is32() && !game::is_reshade_dll(&d.join(game::RESHADE_PROXY)) {
+    if st.uses_host() && !game::is_reshade_dll(&d.join(game::RESHADE_PROXY)) {
         out.push(bad(format!(
             "No ReShade beside the game exe: {} is missing or is not ReShade, so the Home key \
              opens nothing and the feeder never loads. That is upstream of anything in host64\\. \
@@ -258,7 +258,7 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
         )));
     }
     let Some(rs) = rs_log else {
-        out.push(bad(if st.is32() {
+        out.push(bad(if st.uses_host() {
             "No host64\\ReShade.log: the 64-bit helper's ReShade never loaded, which is what \
              \"host lost: pipe never appeared\" in dlss5-feed.log means. Look in \
              host64\\dlss5-feed-host.log for the reason, and check antivirus did not remove \
@@ -310,8 +310,8 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
         out.push(bad(format!(
             "The DLSS 5 add-on never registered. renodx-dlss5.addon64 is missing from {}, \
              disabled in ReShade's Add-ons tab, or quarantined by antivirus.",
-            if st.is32() {
-                "host64\\ (where a 32-bit game's add-on lives)"
+            if st.uses_host() {
+                "host64\\ (where the add-on lives when the game is 32-bit or on the Feeder's helper mode)"
             } else {
                 "the game folder"
             }
@@ -428,7 +428,7 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
     // A game with more than one executable (a Vulkan build and a DX11 build,
     // a launcher and the game) can be installed for one and played through
     // another: ReShade loads, everything looks right, nothing is hooked (#33).
-    if let Some(loaded) = reshade_host_exe(&rs).filter(|_| !st.is32()) {
+    if let Some(loaded) = reshade_host_exe(&rs).filter(|_| !st.uses_host()) {
         let ours = st
             .exe
             .file_name()
@@ -533,7 +533,7 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
                 ));
             }
             ngx_init_failure_for(&hl, Some(&st.consumer_dir().join(game::HOST_EXE)), &mut out);
-        } else if st.is32() {
+        } else if st.uses_host() {
             out.push(warn(
                 "No host64\\dlss5-feed-host.log yet: the 64-bit helper has not started. It is \
                  spawned by the first fed frame, so enable Lumenite_Kernel + DLSS5_Feed in \

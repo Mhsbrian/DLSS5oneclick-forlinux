@@ -1116,6 +1116,12 @@ const TILES_FEEDER: [Tile; 6] = [
 ];
 
 /// Same Feeder row as above, but the in-game half is addon32 on 32-bit titles.
+const TILE_FEEDER_HELPER: Tile = Tile {
+    title: "DLSS5-Feeder",
+    detail: "dlss5-feed-helper.addon64 (64-bit helper mode) \u{00b7} DLSS5_Feed.fx",
+    ok: |s| s.feeder,
+    optional: false,
+};
 const TILE_FEEDER32: Tile = Tile {
     title: "DLSS5-Feeder",
     detail: "dlss5-feed.addon32 · DLSS5_Feed.fx (detail residual + Optical Flow)",
@@ -1196,7 +1202,7 @@ const TILE_SF: Tile = Tile {
 };
 
 const TILE_HOST: Tile = Tile {
-    title: "host64 helper (32-bit game)",
+    title: "host64 helper (32-bit game or 64-bit DX10)",
     detail: "dlss5-feed-host64.exe + 64-bit ReShade · add-on and models live in host64\\",
     ok: |s| s.host_exe && s.host_reshade,
     optional: false,
@@ -1251,7 +1257,7 @@ fn tiles_for(
     if st.is_some_and(|s| s.re_engine) {
         v.insert(0, &TILE_REFRAMEWORK);
     }
-    if st.is_some_and(|s| s.is32()) {
+    if st.is_some_and(|s| s.uses_host()) {
         v.insert(1, &TILE_HOST);
     }
     if renodx_on || st.is_some_and(|s| s.renodx_mod.is_some()) {
@@ -1294,7 +1300,9 @@ fn base_tiles(
         _ => TILES_FEEDER
             .iter()
             .map(|t| {
-                if t.title == "DLSS5-Feeder" && st.is_some_and(|s| s.is32()) {
+                if t.title == "DLSS5-Feeder" && st.is_some_and(|s| s.helper) {
+                    &TILE_FEEDER_HELPER
+                } else if t.title == "DLSS5-Feeder" && st.is_some_and(|s| s.is32()) {
                     &TILE_FEEDER32
                 } else {
                     t

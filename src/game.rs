@@ -14,6 +14,12 @@ pub const FEEDER_ADDON: &str = "dlss5-feed.addon64";
 /// beside the exe that holds everything a 32-bit process cannot load
 /// (a 64-bit ReShade, the DLSS 5 add-on, the two NVIDIA DLLs, the helper exe).
 pub const FEEDER_ADDON32: &str = "dlss5-feed.addon32";
+/// The Feeder's 64-bit helper mode (1.18.0-beta.1): the 32-bit add-on's in-game
+/// half built as 64-bit code, for a 64-bit game that cannot take the normal
+/// add-on. It has the Direct3D 10 backend the normal one lacks, so it is the
+/// only route for a 64-bit DirectX 10 game (Crysis, #134). NGX runs in the
+/// same `host64\` helper as for a 32-bit game.
+pub const FEEDER_HELPER_ADDON: &str = "dlss5-feed-helper.addon64";
 pub const HOST_DIR: &str = "host64";
 pub const HOST_EXE: &str = "dlss5-feed-host64.exe";
 pub const FEEDER_FX: &str = "DLSS5_Feed.fx";
@@ -929,6 +935,11 @@ pub struct GameStatus {
     /// 32-bit only: `host64\dlss5-feed-host64.exe` and a 64-bit ReShade beside it.
     pub host_exe: bool,
     pub host_reshade: bool,
+    /// A 64-bit game on the Feeder's helper mode: the in-game half is
+    /// `dlss5-feed-helper.addon64` and the rest lives in `host64\`, as for a
+    /// 32-bit game. A 64-bit DirectX 10 game with no DLSS of its own, or a game
+    /// that already carries the helper add-on.
+    pub helper: bool,
     /// Capcom RE Engine (needs REFramework before ReShade will run).
     pub re_engine: bool,
     pub reframework: bool,
@@ -982,6 +993,7 @@ pub(crate) fn stub_status(mode: Mode, api: Api) -> GameStatus {
         api_detected: api,
         host_exe: false,
         host_reshade: false,
+        helper: false,
         re_engine: false,
         reframework: false,
         upstream: false,
@@ -1097,6 +1109,21 @@ impl GameStatus {
     pub fn is32(&self) -> bool {
         self.bitness == 32
     }
+    /// The layout with a `host64\` helper folder: a 32-bit game, or a 64-bit one
+    /// on the Feeder's helper mode.
+    pub fn uses_host(&self) -> bool {
+        self.is32() || self.helper
+    }
+    /// The Feeder's in-game add-on for this game.
+    pub fn feeder_addon(&self) -> &'static str {
+        if self.is32() {
+            FEEDER_ADDON32
+        } else if self.helper {
+            FEEDER_HELPER_ADDON
+        } else {
+            FEEDER_ADDON
+        }
+    }
     /// DX9 without dgVoodoo2 yet: Install will download it into the game folder.
     pub fn needs_dgvoodoo(&self) -> bool {
         self.api == Api::Dx9 && !is_dgvoodoo(self.game_dir())
@@ -1104,7 +1131,7 @@ impl GameStatus {
     /// Where the DLSS 5 add-on and the NVIDIA DLLs live: beside the exe for a
     /// 64-bit game, in `host64\` for a 32-bit one.
     pub fn consumer_dir(&self) -> PathBuf {
-        if self.is32() {
+        if self.uses_host() {
             self.game_dir().join(HOST_DIR)
         } else {
             self.game_dir().to_path_buf()
@@ -1139,7 +1166,7 @@ impl GameStatus {
                     && self.dlss5_addon
                     && self.dlssnr
                     && self.dlss
-                    && (!self.is32() || (self.host_exe && self.host_reshade))
+                    && (!self.uses_host() || (self.host_exe && self.host_reshade))
             }
             Mode::Native => {
                 // Any neural consumer counts: the RenoDX DLSS 5 add-on,
@@ -1278,18 +1305,6 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
                 .into(),
         );
     }
-    // 32-bit: NGX is 64-bit only, so the game can never carry its own DLSS;
-    // everything 64-bit goes to host64\ and the Feeder's addon32 sits in-game.
-    let cdir = if is32 {
-        d.join(HOST_DIR)
-    } else {
-        d.to_path_buf()
-    };
-    let feeder = if is32 {
-        d.join(FEEDER_ADDON32).is_file() && shaders.join(FEEDER_FX).is_file()
-    } else {
-        d.join(FEEDER_ADDON).is_file() && shaders.join(FEEDER_FX).is_file()
-    };
     let mode_detected = if !is32 && game_ships_dlss(d) {
         Mode::Native
     } else {
@@ -1300,6 +1315,29 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     } else {
         mode_override().unwrap_or(mode_detected)
     };
+    // A 64-bit DirectX 10 game with no DLSS of its own: the Feeder's normal
+    // 64-bit add-on has no Direct3D 10 backend, so it goes on the helper mode.
+    // A folder that already carries the helper add-on stays on it.
+    let helper = !is32
+        && mode == Mode::Feeder
+        && (api == Api::Dx10 || d.join(FEEDER_HELPER_ADDON).is_file());
+    // 32-bit: NGX is 64-bit only, so the game can never carry its own DLSS;
+    // everything 64-bit goes to host64\ and the Feeder's addon32 sits in-game.
+    // The helper mode lays out the same way with its own in-game add-on.
+    let host = is32 || helper;
+    let cdir = if host {
+        d.join(HOST_DIR)
+    } else {
+        d.to_path_buf()
+    };
+    let feeder_addon = if is32 {
+        FEEDER_ADDON32
+    } else if helper {
+        FEEDER_HELPER_ADDON
+    } else {
+        FEEDER_ADDON
+    };
+    let feeder = d.join(feeder_addon).is_file() && shaders.join(FEEDER_FX).is_file();
     let renodx_mod = fs::read_to_string(d.join(RENODX_MANIFEST))
         .ok()
         .map(|s| s.trim().to_owned())
@@ -1326,8 +1364,9 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         dlss: cdir.join(DLSS_DLL).is_file(),
         mode_detected,
         api_detected,
-        host_exe: is32 && cdir.join(HOST_EXE).is_file(),
-        host_reshade: is32 && is_reshade_dll(&cdir.join(RESHADE_PROXY)),
+        host_exe: host && cdir.join(HOST_EXE).is_file(),
+        host_reshade: host && is_reshade_dll(&cdir.join(RESHADE_PROXY)),
+        helper,
         re_engine: d.join(RE_ENGINE_PAK).is_file(),
         reframework: is_reframework_dll(&d.join(REFRAMEWORK_DLL)),
         unreal_likely: unreal_likely(exe, d),

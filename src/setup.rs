@@ -301,6 +301,11 @@ pub fn reason(st: &GameStatus) -> String {
     if st.is32() {
         parts.push("32-bit".to_owned());
     }
+    if st.helper {
+        parts.push(
+            "64-bit DirectX 10: the Feeder's helper mode (beta, not yet run in a game)".to_owned(),
+        );
+    }
     if let Some((_, tier)) = &st.gpu {
         parts.push(tier.label().to_owned());
     }

@@ -397,12 +397,7 @@ pub fn missing_install_files(st: &GameStatus) -> Vec<String> {
                 missing.push("reshade-shaders/Shaders headers (ReShade.fxh…)".into());
             }
             if !st.feeder {
-                let addon = if st.is32() {
-                    game::FEEDER_ADDON32
-                } else {
-                    game::FEEDER_ADDON
-                };
-                missing.push(format!("{addon} / {}", game::FEEDER_FX));
+                missing.push(format!("{} / {}", st.feeder_addon(), game::FEEDER_FX));
             }
             if !st.lumenite {
                 missing.push("LumeniteFX shaders".into());
@@ -416,7 +411,7 @@ pub fn missing_install_files(st: &GameStatus) -> Vec<String> {
             if !st.dlss {
                 missing.push(game::DLSS_DLL.into());
             }
-            if st.is32() {
+            if st.uses_host() {
                 if !st.host_exe {
                     missing.push(format!("{}/{}", game::HOST_DIR, game::HOST_EXE));
                 }
@@ -1455,7 +1450,7 @@ fn plan_reshade_consumer_with(st: &GameStatus, upstream: bool, c: Consumer) -> V
     match st.mode {
         game::Mode::Feeder => {
             let mut v = vec![STEP_RESHADE];
-            if st.is32() {
+            if st.uses_host() {
                 v.push(STEP_HOST_RESHADE);
             }
             // Two neural consumers cannot run together; a ShortFuse add-on
@@ -2293,19 +2288,23 @@ fn step_feeder(
             .find(|m| net::file_name(&m.replace('\\', "/")).eq_ignore_ascii_case(want))
             .cloned()
     };
-    // 32-bit: the in-game half is addon32 and the 64-bit helper exe goes to
-    // host64\; both must come from the same zip (helper protocol).
-    let addon_name = if st.is32() {
-        game::FEEDER_ADDON32
-    } else {
-        game::FEEDER_ADDON
-    };
-    let addon =
-        pick(addon_name).ok_or_else(|| anyhow!("DLSS5-Feeder {tag} has no {addon_name}"))?;
+    // 32-bit (and the 64-bit helper mode): the in-game half is addon32 (or the
+    // helper add-on) and the 64-bit helper exe goes to host64\; both must come
+    // from the same zip (helper protocol).
+    let addon_name = st.feeder_addon();
+    let addon = pick(addon_name).ok_or_else(|| {
+        if st.helper {
+            anyhow!(
+                "DLSS5-Feeder {tag} has no {addon_name}: the 64-bit helper mode needs Feeder 1.18.0-beta.1 or newer"
+            )
+        } else {
+            anyhow!("DLSS5-Feeder {tag} has no {addon_name}")
+        }
+    })?;
     let fx = pick(game::FEEDER_FX)
         .ok_or_else(|| anyhow!("DLSS5-Feeder {tag} has no {}", game::FEEDER_FX))?;
-    let host_member = st.is32().then(|| pick(game::HOST_EXE)).flatten();
-    if st.is32() && host_member.is_none() {
+    let host_member = st.uses_host().then(|| pick(game::HOST_EXE)).flatten();
+    if st.uses_host() && host_member.is_none() {
         bail!("DLSS5-Feeder {tag} has no {}", game::HOST_EXE);
     }
     // The 32-bit halves talk a versioned IPC protocol to each other, and a
@@ -2316,7 +2315,7 @@ fn step_feeder(
     let marker_says = |dir: &Path| -> bool {
         fs::read_to_string(dir.join(game::FEEDER_MARKER)).is_ok_and(|m| m.trim() == tag.as_str())
     };
-    let halves_agree = !st.is32() || marker_says(&st.consumer_dir());
+    let halves_agree = !st.uses_host() || marker_says(&st.consumer_dir());
     let host_current = match &host_member {
         Some(m) => same_size(&mut zip, m, &st.consumer_dir().join(game::HOST_EXE)),
         None => true,
@@ -2329,9 +2328,21 @@ fn step_feeder(
     {
         return Ok(vec![format!("DLSS5-Feeder already current ({tag}{note})")]);
     }
+    let had_marker = d.join(game::FEEDER_MARKER).is_file();
     net::extract_member(&mut zip, &addon, &d.join(addon_name))?;
     fs::write(d.join(game::FEEDER_MARKER), tag.as_bytes())?;
     let mut out = vec![format!("{addon_name} ({tag}{note})")];
+    // The helper mode replaces the normal 64-bit add-on; the Feeder says its
+    // own stands down when both are there, but the folder is ambiguous. One
+    // this tool placed earlier goes.
+    let stale = d.join(game::FEEDER_ADDON);
+    if st.helper && had_marker && stale.is_file() {
+        fs::remove_file(&stale)?;
+        out.push(format!(
+            "{} removed (the helper add-on replaces it)",
+            game::FEEDER_ADDON
+        ));
+    }
     if let Some(m) = &host_member {
         let host = st.consumer_dir();
         fs::create_dir_all(&host)?;
@@ -2566,7 +2577,7 @@ fn step_dlss5(
         if let Some(m) = marker {
             fs::write(cdir.join(m), tag.as_bytes())?;
         }
-        let shown = if st.is32() {
+        let shown = if st.uses_host() {
             format!("{}/{fname} ({tag})", game::HOST_DIR)
         } else {
             format!("{fname} ({tag})")
@@ -2800,6 +2811,7 @@ fn step_feeder_cleanup(
     let mut removed = Vec::new();
     for f in [
         d.join(game::FEEDER_ADDON),
+        d.join(game::FEEDER_HELPER_ADDON),
         d.join("reshade-shaders")
             .join("Shaders")
             .join(game::FEEDER_FX),
@@ -3384,7 +3396,7 @@ fn step_gpu_pref(
         return Ok(vec![]);
     }
     let mut targets = vec![st.exe.clone()];
-    if st.is32() {
+    if st.uses_host() {
         targets.push(st.consumer_dir().join(game::HOST_EXE));
     }
     let mut out = Vec::new();
@@ -3627,8 +3639,10 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
             targets.push(d.join(game::DLSSG_DLL));
         }
     }
-    // 32-bit layout: the in-game addon32 and everything in host64\.
+    // 32-bit layout: the in-game addon32 and everything in host64\; the helper
+    // mode's in-game add-on too.
     targets.push(d.join(game::FEEDER_ADDON32));
+    targets.push(d.join(game::FEEDER_HELPER_ADDON));
     let host = d.join(game::HOST_DIR);
     if host.is_dir() {
         for f in [
@@ -3639,6 +3653,7 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
             game::DLSSNR_DLL,
             game::DLSSNR_MARKER,
             game::DLSS_MARKER,
+            game::FEEDER_MARKER,
         ] {
             targets.push(host.join(f));
         }
@@ -3726,6 +3741,7 @@ pub fn foreign_addons(d: &Path) -> Vec<String> {
         game::MFG_ADDON,
         game::FEEDER_ADDON,
         game::FEEDER_ADDON32,
+        game::FEEDER_HELPER_ADDON,
         "dlss5-dx11-bridge.addon64",
     ];
     let renodx_ours = fs::read_to_string(d.join(game::RENODX_MANIFEST))
@@ -5602,5 +5618,60 @@ AmpereMfgUnlock=true
         assert!(write_dlss5_fast_defaults(t.path()).unwrap().is_empty());
         let got = crate::reshade_ini::Ini::load(&ini);
         assert_eq!(got.get(DLSS5_INI_SECTION, "NRHookPoint"), None);
+    }
+
+    /// A 64-bit game on the Feeder's helper mode lays out like a 32-bit one:
+    /// the helper add-on beside the exe, everything else in host64\.
+    #[test]
+    fn helper_mode_lays_out_like_a_32_bit_game_with_its_own_addon() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe(&t.path().join("game64.exe"), game::PE_X64);
+        let d = t.path();
+        assert!(!game::inspect(&exe).unwrap().helper);
+        // The helper add-on beside a 64-bit exe puts the game on that mode.
+        fs::write(d.join(game::FEEDER_HELPER_ADDON), b"h").unwrap();
+        let st = game::inspect(&exe).unwrap();
+        assert!(st.helper && st.uses_host() && !st.is32());
+        assert_eq!(st.mode, game::Mode::Feeder);
+        assert_eq!(st.feeder_addon(), game::FEEDER_HELPER_ADDON);
+        assert_eq!(st.consumer_dir(), d.join(game::HOST_DIR));
+        let names: Vec<&str> = plan_with(&st, Engine::ReShade, false, false)
+            .iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names[1], "64-bit ReShade for the host64 helper");
+        let miss = missing_install_files(&st);
+        assert!(
+            miss.iter()
+                .any(|m| m.starts_with(game::FEEDER_HELPER_ADDON)),
+            "{miss:?}"
+        );
+        assert!(miss.iter().any(|m| m.contains(game::HOST_EXE)), "{miss:?}");
+        // A normal 64-bit add-on is not what the helper layout counts.
+        let host = d.join(game::HOST_DIR);
+        fs::create_dir_all(d.join("reshade-shaders").join("Shaders")).unwrap();
+        fs::create_dir_all(&host).unwrap();
+        fs::write(
+            d.join("reshade-shaders")
+                .join("Shaders")
+                .join(game::FEEDER_FX),
+            b"fx",
+        )
+        .unwrap();
+        fs::write(host.join(game::HOST_EXE), b"host").unwrap();
+        fs::write(host.join(game::FEEDER_MARKER), b"v1.18.0-beta.1").unwrap();
+        make_reshade_dll(&host.join(game::RESHADE_PROXY));
+        fs::write(host.join(game::RESHADE_MARKER), b"6.8.0").unwrap();
+        let st = game::inspect(&exe).unwrap();
+        assert!(st.feeder && st.host_exe && st.host_reshade);
+        // Remove takes the helper add-on and the host folder out.
+        let removed = uninstall(&exe).unwrap();
+        assert!(
+            removed.iter().any(|r| r.contains(game::HOST_EXE)),
+            "{removed:?}"
+        );
+        assert!(!host.exists());
+        assert!(!d.join(game::FEEDER_HELPER_ADDON).exists());
+        assert!(foreign_addons(d).is_empty());
     }
 }
