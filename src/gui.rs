@@ -65,6 +65,9 @@ pub struct App {
     skipped_version: String,
     /// A card whose install just finished and whose state has to be re-read.
     pending_refresh: Option<usize>,
+    /// Games waiting for "Update all": started one at a time, each when the
+    /// previous install has finished.
+    update_queue: Vec<usize>,
     /// The card being installed from the Games page, so the progress is shown
     /// where the user started it instead of throwing them onto another page.
     updating: Option<usize>,
@@ -281,6 +284,7 @@ impl App {
             store_icons: HashMap::new(),
             kofi_icon: None,
             updating: None,
+            update_queue: Vec::new(),
             pending_refresh: None,
             meta_one_rx: None,
             checked_manually: false,
@@ -879,7 +883,9 @@ impl App {
     }
 
     /// Install / Update from a Games card: resolve Shipping exe, keep progress on the card.
-    fn update_game(&mut self, path: PathBuf, index: usize) {
+    /// Returns whether the install started; a game with problems does not, and
+    /// is left for the user to open on its Setup page.
+    fn update_game(&mut self, path: PathBuf, index: usize) -> bool {
         // Prefer the canonical Shipping exe from meta when we already inspected it.
         let target = self.meta.get(&index).map(|m| m.exe.clone()).unwrap_or(path);
         self.exe_text = target.to_string_lossy().into_owned();
@@ -887,7 +893,7 @@ impl App {
         if let Some(Ok(st)) = &self.status {
             if !st.problems.is_empty() {
                 self.page = Page::Setup;
-                return;
+                return false;
             }
             self.engine = if st.opti {
                 Engine::Opti
@@ -898,8 +904,40 @@ impl App {
             };
             self.updating = Some(index);
             self.start(None);
+            true
         } else {
             self.page = Page::Setup;
+            false
+        }
+    }
+
+    /// The folder (or exe) to install into for a library game: the folder, so
+    /// the exe finder ranks every candidate (a store's launch exe can be a
+    /// bootstrapper, #29), and the store's exe when nothing is found.
+    fn launch_path(g: &library::Game) -> PathBuf {
+        match game::resolve_target(&g.dir) {
+            Ok(_) => g.dir.clone(),
+            Err(_) => match &g.exe_hint {
+                Some(e) if e.is_file() && game::exe_bitness(e).is_ok() => e.clone(),
+                _ => g.dir.clone(),
+            },
+        }
+    }
+
+    /// Run the next game of "Update all" once nothing else is installing.
+    fn step_update_queue(&mut self) {
+        if self.running || self.update_queue.is_empty() {
+            return;
+        }
+        let i = self.update_queue.remove(0);
+        let Some(path) = self.games.get(i).map(Self::launch_path) else {
+            return;
+        };
+        let page = self.page;
+        // A game that cannot start (problems) must not pull the user off the
+        // Games page in the middle of a batch.
+        if !self.update_game(path, i) {
+            self.page = page;
         }
     }
 
@@ -1653,6 +1691,7 @@ impl App {
         let mut clicked: Option<(PathBuf, usize)> = None;
         let mut forgotten: Option<PathBuf> = None;
         let mut update = false;
+        let mut update_all = false;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -1701,10 +1740,14 @@ impl App {
                         .iter()
                         .filter(|i| self.meta.get(i).is_some_and(|m| m.ready))
                         .count();
-                    let stale = idx
+                    let stale_idx: Vec<usize> = idx
                         .iter()
+                        .copied()
                         .filter(|i| self.meta.get(i).is_some_and(|m| !m.stale.is_empty()))
-                        .count();
+                        .collect();
+                    let stale = stale_idx.len();
+                    let batch_busy = self.running || !self.update_queue.is_empty();
+                    let queued = self.update_queue.len();
                     ui.horizontal(|ui| {
                         ui.set_max_width(avail);
                         ui.spacing_mut().item_spacing.x = 8.0;
@@ -1723,6 +1766,18 @@ impl App {
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if stale > 0 {
+                                let label = if queued > 0 {
+                                    format!("Updating\u{2026} {queued} more")
+                                } else {
+                                    format!("Update all ({stale})")
+                                };
+                                if ui
+                                    .add_enabled(!batch_busy, egui::Button::new(label))
+                                    .on_hover_text("Update every game listed here that is out of date, one after another")
+                                    .clicked()
+                                {
+                                    update_all = true;
+                                }
                                 ui.label(
                                     RichText::new(format!("{stale} need updating"))
                                         .font(t::plex(11.5))
@@ -1754,21 +1809,7 @@ impl App {
                             }
                             if matches!(action, CardAction::Open | CardAction::Update) {
                                 update = action == CardAction::Update;
-                                let g = &self.games[i];
-                                // The folder, so the exe finder ranks every candidate:
-                                // a store's launch exe can be a bootstrapper (Epic names
-                                // Satisfactory's FactoryGameEGS.exe, the real one is the
-                                // -Shipping.exe under Engine\Binaries\Win64, #29). The
-                                // store's exe is the fallback when nothing is found.
-                                let path = match game::resolve_target(&g.dir) {
-                                    Ok(_) => g.dir.clone(),
-                                    Err(_) => match &g.exe_hint {
-                                        Some(e) if e.is_file() && game::exe_bitness(e).is_ok() => {
-                                            e.clone()
-                                        }
-                                        _ => g.dir.clone(),
-                                    },
-                                };
+                                let path = Self::launch_path(&self.games[i]);
                                 clicked = Some((path, i));
                             }
                         }
@@ -1804,6 +1845,16 @@ impl App {
             } else {
                 self.open_game(p);
             }
+        }
+        if update_all {
+            // Every game on the page that shows an update, in the order shown.
+            self.update_queue = (0..self.games.len())
+                .filter(|i| {
+                    self.meta
+                        .get(i)
+                        .is_some_and(|m| m.installed && !m.stale.is_empty())
+                })
+                .collect();
         }
     }
 
@@ -2512,6 +2563,7 @@ impl eframe::App for App {
         if let Some(i) = self.pending_refresh.take() {
             self.refresh_one(i, ui.ctx());
         }
+        self.step_update_queue();
         if let Some(rx) = &self.meta_one_rx {
             if let Ok((i, m)) = rx.try_recv() {
                 self.meta.insert(i, m);
@@ -2519,7 +2571,10 @@ impl eframe::App for App {
             }
         }
         self.maybe_recheck_update();
-        if self.running || matches!(self.renodx, RenodxLookup::Pending) {
+        if self.running
+            || !self.update_queue.is_empty()
+            || matches!(self.renodx, RenodxLookup::Pending)
+        {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }

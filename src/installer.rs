@@ -334,6 +334,11 @@ pub struct Latest {
     pub dlss5: Option<String>,
     /// Newest DLSS 5 add-on build including release candidates.
     pub dlss5_pre: Option<String>,
+    /// Size of the published RTX 40 MFG unlock and DX11 bridge add-ons. Neither
+    /// carries a version in its file name, so an installed copy is compared by
+    /// size, which is how the install step decides to refresh it too.
+    pub mfg_len: Option<u64>,
+    pub bridge_len: Option<u64>,
 }
 
 impl Latest {
@@ -368,6 +373,8 @@ impl Latest {
                 .and_then(|l| l.as_array())
                 .and_then(|a| pick_latest_asset_with(a, DLSS5_PREFIX, true).ok())
                 .map(|(t, _)| t),
+            mfg_len: net::remote_len(client, MFG_DOWNLOAD).ok().flatten(),
+            bridge_len: net::remote_len(client, BRIDGE_DOWNLOAD).ok().flatten(),
         }
     }
 }
@@ -518,6 +525,21 @@ pub fn stale_components(dir: &Path, latest: &Latest) -> Vec<String> {
             (None, Some(want)) => out.push(format!("OptiScaler unknown version → {want}")),
             _ => {}
         }
+    }
+    // Add-ons with no version in their name: out of date when the published file
+    // differs in size, the same test the install step refreshes them by (#120).
+    let differs = |file: &str, remote: Option<u64>| {
+        remote.is_some_and(|r| fs::metadata(dir.join(file)).is_ok_and(|m| m.len() != r))
+    };
+    if differs(game::MFG_ADDON, latest.mfg_len) {
+        out.push("RTX 40 MFG unlock add-on \u{2192} newest build".to_owned());
+    }
+    // Builds before 8 need dlss5-bridge in DX11 games; 8.x has its own and the
+    // install removes a separate one, so a copy beside 8.x is not "behind".
+    let bridge_needed =
+        mine(game::DLSS5_ADDON_MARKER).is_some_and(|t| !dlss5_has_fast_settings(t.trim()));
+    if bridge_needed && differs(game::BRIDGE_ADDON, latest.bridge_len) {
+        out.push("DX11 bridge add-on \u{2192} newest build".to_owned());
     }
     out
 }
@@ -1390,7 +1412,9 @@ pub fn plan_with(st: &GameStatus, engine: Engine, with_renodx: bool, upstream: b
     // its own ini key; on the ReShade route it is this separate add-on, which
     // is what actually reached 6X for the reporter in #83. It is an .addon64,
     // so a 32-bit game's ReShade could not load it.
-    if engine == Engine::ReShade && ada_mfg() == "true" && !st.is32() {
+    // An MFG add-on already in the game is refreshed too, so the update it
+    // shows (#120) clears whichever way Install was started.
+    if engine == Engine::ReShade && (ada_mfg() == "true" || st.mfg) && !st.is32() {
         let at = v.len().saturating_sub(1); // before ReShade config
         v.insert(at, STEP_MFG);
     }
@@ -4886,6 +4910,8 @@ RestoreComputeSignature=true
             dlss5: None,
             dlss5_pre: None,
             aio: None,
+            mfg_len: None,
+            bridge_len: None,
         };
         assert!(stale_components(d, &latest).is_empty());
 
@@ -4932,6 +4958,8 @@ RestoreComputeSignature=true
             dlss5: None,
             dlss5_pre: None,
             aio: None,
+            mfg_len: None,
+            bridge_len: None,
         };
 
         // Current pre-SR install: the repo line settles it.
@@ -5673,5 +5701,36 @@ AmpereMfgUnlock=true
         assert!(!host.exists());
         assert!(!d.join(game::FEEDER_HELPER_ADDON).exists());
         assert!(foreign_addons(d).is_empty());
+    }
+
+    /// The add-ons with no version tag are out of date when their size differs
+    /// from the published file (#120), and the bridge only counts below 8.x.
+    #[test]
+    fn untagged_addons_are_compared_by_size() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        fs::write(d.join(game::MFG_ADDON), vec![0u8; 100]).unwrap();
+        let mut latest = Latest {
+            mfg_len: Some(100),
+            ..Default::default()
+        };
+        assert!(stale_components(d, &latest).is_empty());
+        latest.mfg_len = Some(120);
+        assert!(stale_components(d, &latest)
+            .iter()
+            .any(|l| l.contains("MFG")));
+        latest.mfg_len = None; // offline: no claim either way
+        assert!(stale_components(d, &latest).is_empty());
+        fs::write(d.join(game::BRIDGE_ADDON), vec![0u8; 10]).unwrap();
+        fs::write(d.join(game::DLSS5_ADDON), b"x").unwrap();
+        latest.bridge_len = Some(20);
+        fs::write(d.join(game::DLSS5_ADDON_MARKER), "renodx-dlss5-6.5.3").unwrap();
+        assert!(stale_components(d, &latest)
+            .iter()
+            .any(|l| l.contains("bridge")));
+        fs::write(d.join(game::DLSS5_ADDON_MARKER), "renodx-dlss5-8.5.0-rc10").unwrap();
+        assert!(!stale_components(d, &latest)
+            .iter()
+            .any(|l| l.contains("bridge")));
     }
 }
