@@ -97,6 +97,42 @@ fn read(dir: &Path, name: &str) -> Option<String> {
     fs::read_to_string(dir.join(name)).ok()
 }
 
+/// The game created a DLSS session of its own (render size below output size)
+/// while DLSS5-Feeder is feeding frames: two DLSS sessions in one game, which
+/// crashed Kingdom Come: Deliverance II when a save loaded (#118). The Feeder's
+/// own session renders at the output size unless `work_resolution` is under
+/// 100%, so with that at 100 any smaller render size is the game's.
+fn game_own_dlss_note(rs_log: &str, feed_cfg: Option<&str>) -> Option<String> {
+    let work = feed_cfg
+        .and_then(|c| {
+            c.lines()
+                .find_map(|l| l.trim().strip_prefix("work_resolution="))
+        })
+        .and_then(|v| v.trim().trim_end_matches('%').parse::<u32>().ok())
+        .unwrap_or(100);
+    if work != 100 {
+        return None;
+    }
+    let re = regex::Regex::new(
+        r"NGX create contract:.*feature=1 \(DLSS/DLAA\).*render=(\d+)x(\d+) out=(\d+)x(\d+)",
+    )
+    .unwrap();
+    rs_log.lines().find_map(|l| {
+        let c = re.captures(l)?;
+        let n = |i: usize| c[i].parse::<u64>().ok();
+        let (rw, rh, ow, oh) = (n(1)?, n(2)?, n(3)?, n(4)?);
+        (rw * rh < ow * oh).then(|| {
+            format!(
+                "The game created a DLSS session of its own ({rw}x{rh} rendered to {ow}x{oh}) while \
+                 DLSS5-Feeder is feeding frames, and two DLSS sessions in one game can crash it \
+                 (Kingdom Come: Deliverance II when a save loaded, #118). A game that creates its \
+                 own DLSS belongs on the setup for games with their own DLSS: on the Setup page \
+                 set the dropdown next to the game name to \"Force native DLSS\" and press Install."
+            )
+        })
+    })
+}
+
 /// The exe ReShade actually loaded into, from its first line:
 /// `... loaded from '...dxgi.dll' into 'C:\\...bg3_dx11.exe' (0x...)`.
 fn reshade_host_exe(log: &str) -> Option<String> {
@@ -525,6 +561,9 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
             ));
         }
         ngx_init_failure_for(&fd, Some(&st.exe), &mut out);
+        if let Some(note) = game_own_dlss_note(&rs, read(d, "dlss5-feed.cfg").as_deref()) {
+            out.push(warn(note));
+        }
         // 32-bit games: the work happens in host64\, and its own log names the reason.
         if let Some(hl) = read(&d.join(game::HOST_DIR), "dlss5-feed-host.log") {
             if hl.contains("feature ready") {
@@ -1531,5 +1570,22 @@ RenoDX DLSS could not attach the direct nvngx_dlssnr.dll runtime.
 retry after 30
 ";
         assert!(!sf_findings(other).iter().any(|x| x.text.contains("ran:")));
+    }
+
+    /// The lines from the Kingdom Come: Deliverance II report in #118: the
+    /// Feeder's own session renders at the output size, the game's own does not.
+    #[test]
+    fn a_game_side_dlss_session_beside_the_feeder_is_named() {
+        let feeder = "16:13:41:349 [41212] | INFO  | [DLSS 5 Neural Rendering] DLSS5 Generic: NGX create contract: handle=0x1bbd3fa5b30 feature=1 (DLSS/DLAA) source=create flags=0x4a [MVLowRes DepthInverted AutoExposure] render=3440x1440 out=3440x1440";
+        let game = "16:14:38:240 [41204] | INFO  | [DLSS 5 Neural Rendering] DLSS5 Generic: NGX create contract: handle=0x1ba974d9570 feature=1 (DLSS/DLAA) source=create flags=0x6b [IsHDR MVLowRes DepthInverted DoSharpening AutoExposure] render=2293x960 out=3440x1440";
+        assert!(super::game_own_dlss_note(feeder, None).is_none());
+        let note =
+            super::game_own_dlss_note(&format!("{feeder}\n{game}"), Some("work_resolution=100\n"));
+        assert!(note
+            .as_deref()
+            .is_some_and(|n| n.contains("2293x960") && n.contains("Force native DLSS")));
+        // The Feeder's own session is smaller than the output when work_resolution is.
+        assert!(super::game_own_dlss_note(game, Some("work_resolution=75\n")).is_none());
+        assert!(super::game_own_dlss_note("nothing here", None).is_none());
     }
 }
