@@ -358,7 +358,7 @@ pub fn pe_import_fns(exe: &Path, dll: &str) -> Vec<String> {
             if name_rva == 0 && rd32(desc)? == 0 {
                 break;
             }
-            let is_ours = to_off(name_rva).map(&cstr).is_some_and(|n| n == want);
+            let is_ours = to_off(name_rva).map(cstr).is_some_and(|n| n == want);
             if is_ours {
                 // OriginalFirstThunk when present, else FirstThunk.
                 let thunk_rva = match rd32(desc)? {
