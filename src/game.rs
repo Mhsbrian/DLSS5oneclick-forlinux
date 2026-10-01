@@ -579,23 +579,40 @@ pub fn detect_api(exe: &Path) -> Api {
         .collect();
     dlls.sort_by_key(|(size, _)| std::cmp::Reverse(*size));
     let mut seen_dx11 = false;
+    let mut seen_dx10 = false;
     let mut seen_dx9 = false;
     for (_, dll) in dlls.into_iter().take(12) {
         match classify(&pe_imports(&dll)) {
             Api::Dx12 => return Api::Dx12,
             Api::Dx11 => seen_dx11 = true,
+            // CryEngine 1 (Crysis) ships one renderer DLL per API and picks
+            // at run time, so a Direct3D 10 renderer is the only place the
+            // API shows (#114). Only a DLL named like a renderer counts: a
+            // stray d3d10 import in some other module must not turn a
+            // Direct3D 11 game's unknown exe into a DirectX 10 one.
+            Api::Dx10 => {
+                let n = dll
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                seen_dx10 |= n.contains("render") || n.contains("d3d10");
+            }
             // Aion renders through XRenderD3D9.dll rather than from the exe,
             // so the renderer DLL is the only place the API shows (#16). The
             // marker-only case is excluded here too (#53).
             Api::Dx9 => seen_dx9 |= d3d9_is_the_renderer(&dll),
-            Api::Dx10 | Api::Vulkan | Api::Unknown => {}
+            Api::Vulkan | Api::Unknown => {}
         }
-    }
-    if seen_dx9 && !seen_dx11 {
-        return Api::Dx9;
     }
     if seen_dx11 {
         Api::Dx11
+    } else if seen_dx10 {
+        // Beside a Direct3D 9 renderer too (Crysis ships both), the game runs
+        // DirectX 10 unless it is started with -dx9.
+        Api::Dx10
+    } else if seen_dx9 {
+        Api::Dx9
     } else {
         Api::Unknown
     }
@@ -2623,5 +2640,25 @@ mod tests {
         assert!(!game_ships_dlss(d));
         fs::write(d.join(DLSS_DLL), b"x").unwrap();
         assert!(game_ships_dlss(d));
+    }
+
+    /// Crysis ships one renderer DLL per API and loads one at run time, so the
+    /// exe shows nothing. A Direct3D 10 renderer beside a Direct3D 9 one reads
+    /// as DirectX 10 (#114); a Direct3D 10 import in a DLL that is not a
+    /// renderer does not.
+    #[test]
+    fn a_direct3d10_renderer_dll_makes_the_game_directx_10() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe(&d.join("Crysis.exe"), PE_X64);
+        make_pe_with_imports(&d.join("CryRenderD3D9.dll"), PE_X64, &["d3d9.dll"]);
+        assert_eq!(detect_api(&exe), Api::Dx9);
+        make_pe_with_imports(&d.join("CryRenderD3D10.dll"), PE_X64, &["d3d10.dll"]);
+        assert_eq!(detect_api(&exe), Api::Dx10);
+        let t2 = tempfile::tempdir().unwrap();
+        let d2 = t2.path();
+        let exe2 = make_pe(&d2.join("game.exe"), PE_X64);
+        make_pe_with_imports(&d2.join("helper.dll"), PE_X64, &["d3d10.dll"]);
+        assert_eq!(detect_api(&exe2), Api::Unknown);
     }
 }

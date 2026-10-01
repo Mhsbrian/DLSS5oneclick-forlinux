@@ -564,6 +564,17 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
         if let Some(note) = game_own_dlss_note(&rs, read(d, "dlss5-feed.cfg").as_deref()) {
             out.push(warn(note));
         }
+        // The normal 64-bit add-on stops itself on a Direct3D 9 or 10 game.
+        if fd.contains("only Direct3D 11/12, Vulkan and OpenGL games are supported") {
+            out.push(bad(if st.helper {
+                "The Feeder's 64-bit helper add-on reports this game's API as unsupported."
+            } else {
+                "The Feeder's normal 64-bit add-on stopped itself: this game does not use Direct3D \
+                 11/12, Vulkan or OpenGL. A DirectX 9 game needs dgVoodoo2 (Install adds it); a \
+                 DirectX 10 game, Crysis for one, belongs on the Feeder's helper mode: update the \
+                 tool, press Install again, and check the Setup line says \"helper mode\" (#114)."
+            }));
+        }
         // 32-bit games: the work happens in host64\, and its own log names the reason.
         if let Some(hl) = read(&d.join(game::HOST_DIR), "dlss5-feed-host.log") {
             if hl.contains("feature ready") {
