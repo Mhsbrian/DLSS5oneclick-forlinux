@@ -24,6 +24,17 @@ pub struct Settings {
     /// Soft overlay UX defaults (cfg keys the Feeder reads).
     #[serde(default)]
     pub overlay: OverlayDefaults,
+    /// The Setup page opens with the advanced options shown (#77).
+    #[serde(default)]
+    pub advanced_open: bool,
+    /// The DLSS 5 add-on takes stable builds only, skipping release candidates.
+    /// Off by default since 0.14.3, when the newest-build step started taking
+    /// the release candidates too; the 0.14.1 opt-in key is no longer read.
+    #[serde(default)]
+    pub renodx_stable_only: bool,
+    /// Games page order: newest install first. Off = alphabetical.
+    #[serde(default)]
+    pub sort_newest: bool,
 }
 
 fn default_quality() -> String {
@@ -83,6 +94,9 @@ impl Default for Settings {
             quality: default_quality(),
             knobs: KnobDefaults::default(),
             overlay: OverlayDefaults::default(),
+            advanced_open: false,
+            renodx_stable_only: false,
+            sort_newest: false,
         }
     }
 }
@@ -122,12 +136,25 @@ impl Settings {
                 evaluate_stride: 1,
                 log_frames: 3,
             },
+            advanced_open: false,
+            renodx_stable_only: false,
+            sort_newest: false,
         }
     }
 
     /// Restore knobs / overlay / quality seed to [`Self::feeder_stock`].
     pub fn reset_to_feeder_defaults(&mut self) {
+        // Only the Feeder values: whether advanced options are shown is a
+        // window preference, not a Feeder default.
+        let (advanced_open, renodx_stable_only, sort_newest) = (
+            self.advanced_open,
+            self.renodx_stable_only,
+            self.sort_newest,
+        );
         *self = Self::feeder_stock();
+        self.advanced_open = advanced_open;
+        self.renodx_stable_only = renodx_stable_only;
+        self.sort_newest = sort_newest;
     }
 
     pub fn path() -> PathBuf {

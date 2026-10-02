@@ -123,6 +123,42 @@ fn last_nr_resolution(log: &str) -> String {
         .unwrap_or_else(|| "full resolution".to_string())
 }
 
+/// The game created a DLSS session of its own (render size below output size)
+/// while DLSS5-Feeder is feeding frames: two DLSS sessions in one game, which
+/// crashed Kingdom Come: Deliverance II when a save loaded (#118). The Feeder's
+/// own session renders at the output size unless `work_resolution` is under
+/// 100%, so with that at 100 any smaller render size is the game's.
+fn game_own_dlss_note(rs_log: &str, feed_cfg: Option<&str>) -> Option<String> {
+    let work = feed_cfg
+        .and_then(|c| {
+            c.lines()
+                .find_map(|l| l.trim().strip_prefix("work_resolution="))
+        })
+        .and_then(|v| v.trim().trim_end_matches('%').parse::<u32>().ok())
+        .unwrap_or(100);
+    if work != 100 {
+        return None;
+    }
+    let re = regex::Regex::new(
+        r"NGX create contract:.*feature=1 \(DLSS/DLAA\).*render=(\d+)x(\d+) out=(\d+)x(\d+)",
+    )
+    .unwrap();
+    rs_log.lines().find_map(|l| {
+        let c = re.captures(l)?;
+        let n = |i: usize| c[i].parse::<u64>().ok();
+        let (rw, rh, ow, oh) = (n(1)?, n(2)?, n(3)?, n(4)?);
+        (rw * rh < ow * oh).then(|| {
+            format!(
+                "The game created a DLSS session of its own ({rw}x{rh} rendered to {ow}x{oh}) while \
+                 DLSS5-Feeder is feeding frames, and two DLSS sessions in one game can crash it \
+                 (Kingdom Come: Deliverance II when a save loaded, #118). A game that creates its \
+                 own DLSS belongs on the setup for games with their own DLSS: on the Setup page \
+                 set the dropdown next to the game name to \"Force native DLSS\" and press Install."
+            )
+        })
+    })
+}
+
 /// The exe ReShade actually loaded into, from its first line:
 /// `... loaded from '...dxgi.dll' into 'C:\\...bg3_dx11.exe' (0x...)`.
 fn reshade_host_exe(log: &str) -> Option<String> {
@@ -161,7 +197,7 @@ fn diagnose_with(st: &GameStatus, proton: bool) -> Vec<Finding> {
         .file_name()
         .map(|n| n.to_string_lossy().to_ascii_lowercase());
     let mut log_note = None;
-    if let (Some(rs), Some(ours), false) = (rs_log.as_deref(), ours.as_deref(), st.is32()) {
+    if let (Some(rs), Some(ours), false) = (rs_log.as_deref(), ours.as_deref(), st.uses_host()) {
         if let Some(loaded) = reshade_host_exe(rs).filter(|h| h.to_ascii_lowercase() != ours) {
             if let Some(prev) = read(&consumer, "ReShade.log1")
                 .filter(|p| reshade_host_exe(p).is_some_and(|h| h.to_ascii_lowercase() == ours))
@@ -332,7 +368,7 @@ fn diagnose_with(st: &GameStatus, proton: bool) -> Vec<Finding> {
     // opens and which loads the feeder, and the 64-bit one in host64\ that hosts
     // the neural add-on. Reporting only the second leaves "Home does nothing"
     // unexplained, which is the first thing the player actually notices (#69).
-    if st.is32() && !game::is_reshade_dll(&game::join_ci(d, &[game::RESHADE_PROXY])) {
+    if st.uses_host() && !game::is_reshade_dll(&game::join_ci(d, &[game::RESHADE_PROXY])) {
         out.push(bad(format!(
             "No ReShade beside the game exe: {} is missing or is not ReShade, so the Home key \
              opens nothing and the feeder never loads. That is upstream of anything in host64\\. \
@@ -343,7 +379,7 @@ fn diagnose_with(st: &GameStatus, proton: bool) -> Vec<Finding> {
         )));
     }
     let Some(rs) = rs_log else {
-        out.push(bad(if st.is32() {
+        out.push(bad(if st.uses_host() {
             "No host64\\ReShade.log: the 64-bit helper's ReShade never loaded, which is what \
              \"host lost: pipe never appeared\" in dlss5-feed.log means. Look in \
              host64\\dlss5-feed-host.log for the reason, and check antivirus did not remove \
@@ -364,6 +400,12 @@ fn diagnose_with(st: &GameStatus, proton: bool) -> Vec<Finding> {
     // log showed the add-on registered and hooked (#86).
     if st.upstream {
         out.extend(upstream_findings(&rs));
+        return out;
+    }
+    // ShortFuse's add-on logs as "RenoDX DLSS", not as the DLSS 5 add-on, so
+    // the DLSS 5 add-on's lines would all read as missing.
+    if st.sf && !st.dlss5_addon {
+        out.extend(sf_findings(&rs));
         return out;
     }
     let failed_line = rs
@@ -389,8 +431,8 @@ fn diagnose_with(st: &GameStatus, proton: bool) -> Vec<Finding> {
         out.push(bad(format!(
             "The DLSS 5 add-on never registered. renodx-dlss5.addon64 is missing from {}, \
              disabled in ReShade's Add-ons tab, or quarantined by antivirus.",
-            if st.is32() {
-                "host64\\ (where a 32-bit game's add-on lives)"
+            if st.uses_host() {
+                "host64\\ (where the add-on lives when the game is 32-bit or on the Feeder's helper mode)"
             } else {
                 "the game folder"
             }
@@ -481,7 +523,7 @@ fn diagnose_with(st: &GameStatus, proton: bool) -> Vec<Finding> {
         // The add-on hooks NVSDK_NGX_D3D12_*. A game whose DLSS runs on D3D11
         // calls the D3D11 entry points, which it never sees, so "no create"
         // is expected until the bridge is installed (#33, BG3 DX11).
-        if st.api == game::Api::Dx11 && !st.bridge {
+        if st.needs_bridge() && !st.bridge {
             out.push(bad(
                 "No NGX call was intercepted, and this is a Direct3D 11 game with its own \
                  DLSS: the add-on hooks the D3D12 NGX entry points, but the game calls the \
@@ -577,7 +619,7 @@ fn diagnose_with(st: &GameStatus, proton: bool) -> Vec<Finding> {
     // A game with more than one executable (a Vulkan build and a DX11 build,
     // a launcher and the game) can be installed for one and played through
     // another: ReShade loads, everything looks right, nothing is hooked (#33).
-    if let Some(loaded) = reshade_host_exe(&rs).filter(|_| !st.is32()) {
+    if let Some(loaded) = reshade_host_exe(&rs).filter(|_| !st.uses_host()) {
         let ours = st
             .exe
             .file_name()
@@ -687,6 +729,20 @@ fn diagnose_with(st: &GameStatus, proton: bool) -> Vec<Finding> {
             ));
         }
         ngx_init_failure_for(&fd, Some(&st.exe), &mut out);
+        if let Some(note) = game_own_dlss_note(&rs, read(d, "dlss5-feed.cfg").as_deref()) {
+            out.push(warn(note));
+        }
+        // The normal 64-bit add-on stops itself on a Direct3D 9 or 10 game.
+        if fd.contains("only Direct3D 11/12, Vulkan and OpenGL games are supported") {
+            out.push(bad(if st.helper {
+                "The Feeder's 64-bit helper add-on reports this game's API as unsupported."
+            } else {
+                "The Feeder's normal 64-bit add-on stopped itself: this game does not use Direct3D \
+                 11/12, Vulkan or OpenGL. A DirectX 9 game needs dgVoodoo2 (Install adds it); a \
+                 DirectX 10 game, Crysis for one, belongs on the Feeder's helper mode: update the \
+                 tool, press Install again, and check the Setup line says \"helper mode\" (#114)."
+            }));
+        }
         // 32-bit games: the work happens in host64\, and its own log names the reason.
         if let Some(hl) = read(&d.join(game::HOST_DIR), "dlss5-feed-host.log") {
             if hl.contains("feature ready") {
@@ -695,7 +751,7 @@ fn diagnose_with(st: &GameStatus, proton: bool) -> Vec<Finding> {
                 ));
             }
             ngx_init_failure_for(&hl, Some(&st.consumer_dir().join(game::HOST_EXE)), &mut out);
-        } else if st.is32() {
+        } else if st.uses_host() {
             out.push(warn(
                 "No host64\\dlss5-feed-host.log yet: the 64-bit helper has not started. It is \
                  spawned by the first fed frame, so enable Lumenite_Kernel + DLSS5_Feed in \
@@ -1086,6 +1142,76 @@ pub fn host_findings(st: &GameStatus, ctx: &HostContext) -> Vec<Finding> {
                  tick RTX 40 multi-frame generation and run Install to replace it.",
             )),
         }
+    }
+    out
+}
+
+/// ShortFuse's add-on (`renodx-dlss.addon64`), read by its own log lines.
+fn sf_findings(rs: &str) -> Vec<Finding> {
+    let mut out = Vec::new();
+    if let Some(l) = rs
+        .lines()
+        .find(|l| l.contains("Failed to load add-on") && l.contains("renodx-dlss.addon64"))
+    {
+        let code = l
+            .split("error code ")
+            .nth(1)
+            .map(|c| c.trim().trim_end_matches('!'))
+            .unwrap_or("unknown");
+        out.push(bad(format!(
+            "ReShade refused to load renodx-dlss.addon64 (ShortFuse's add-on), error code {code}."
+        )));
+        return out;
+    }
+    if rs.contains("failed to register RenoDX DLSS") {
+        out.push(bad(
+            "ShortFuse's add-on loaded but could not register with ReShade.",
+        ));
+        return out;
+    }
+    if rs.contains("RenoDX DLSS attached") {
+        out.push(ok("ShortFuse's DLSS add-on attached."));
+    } else {
+        out.push(bad(
+            "ShortFuse's add-on never attached. renodx-dlss.addon64 is missing from the game              folder, disabled in ReShade's Add-ons tab, or quarantined by antivirus.",
+        ));
+        return out;
+    }
+    if rs.contains("could not attach the direct nvngx_dlssnr.dll runtime")
+        || rs.contains("nvngx_dlssnr.dll missing")
+    {
+        out.push(bad(
+            "ShortFuse's add-on could not load the DLSS 5 model (nvngx_dlssnr.dll). Install              again to put it back beside the game.",
+        ));
+    }
+    if rs.contains("NR device feature initialization failed") {
+        out.push(bad(
+            "The neural rendering feature failed to start in ShortFuse's add-on. The driver              must be recent (616 or later) and the card an RTX one.",
+        ));
+    }
+    let failed = rs.matches("NR evaluation failed").count();
+    let ran: u64 = rs
+        .lines()
+        // "detached signed snippet after N successful evaluations"
+        .filter_map(|l| {
+            let rest = l.split("snippet after ").nth(1)?;
+            let (n, _) = rest.split_once(" successful evaluations")?;
+            n.trim().parse().ok()
+        })
+        .max()
+        .unwrap_or(0);
+    if ran > 0 {
+        out.push(ok(format!(
+            "Neural rendering ran: {ran} successful evaluations in the last session."
+        )));
+    } else if failed > 0 {
+        out.push(bad(format!(
+            "Neural rendering evaluation failed {failed} times in ShortFuse's add-on."
+        )));
+    } else {
+        out.push(warn(
+            "No finished evaluation in the log yet. Turn the pass on in ShortFuse's panel              (Home, Add-ons tab), play a minute, close the game, and run Diagnose again.",
+        ));
     }
     out
 }
@@ -2083,5 +2209,55 @@ Registered add-on \"DLSS 5 Neural Rendering\"
             "{f:?}"
         );
         assert!(f.iter().any(|x| x.text.contains("Depth is flat")), "{f:?}");
+    }
+
+    /// ShortFuse's add-on is read by its own log lines: attached, model
+    /// missing, and the evaluation count it prints when it detaches.
+    #[test]
+    fn shortfuse_log_is_read_by_its_own_lines() {
+        let good = "RenoDX DLSS attached.
+Init_Ext succeeded for device 1
+detached signed snippet after 4312 successful evaluations
+";
+        let f = sf_findings(good);
+        assert!(f.iter().any(|x| x.text.contains("4312")), "{f:?}");
+        let nomodel = "RenoDX DLSS attached.
+RenoDX DLSS could not attach the direct nvngx_dlssnr.dll runtime.
+";
+        assert!(sf_findings(nomodel)
+            .iter()
+            .any(|x| x.text.contains("nvngx_dlssnr.dll")));
+        assert!(sf_findings(
+            "Initializing crosire's ReShade
+"
+        )
+        .iter()
+        .any(|x| x.text.contains("never attached")));
+    }
+
+    /// Only ShortFuse's own detach line counts as an evaluation total.
+    #[test]
+    fn shortfuse_evaluations_come_only_from_the_detach_line() {
+        let other = "RenoDX DLSS attached.
+retry after 30
+";
+        assert!(!sf_findings(other).iter().any(|x| x.text.contains("ran:")));
+    }
+
+    /// The lines from the Kingdom Come: Deliverance II report in #118: the
+    /// Feeder's own session renders at the output size, the game's own does not.
+    #[test]
+    fn a_game_side_dlss_session_beside_the_feeder_is_named() {
+        let feeder = "16:13:41:349 [41212] | INFO  | [DLSS 5 Neural Rendering] DLSS5 Generic: NGX create contract: handle=0x1bbd3fa5b30 feature=1 (DLSS/DLAA) source=create flags=0x4a [MVLowRes DepthInverted AutoExposure] render=3440x1440 out=3440x1440";
+        let game = "16:14:38:240 [41204] | INFO  | [DLSS 5 Neural Rendering] DLSS5 Generic: NGX create contract: handle=0x1ba974d9570 feature=1 (DLSS/DLAA) source=create flags=0x6b [IsHDR MVLowRes DepthInverted DoSharpening AutoExposure] render=2293x960 out=3440x1440";
+        assert!(super::game_own_dlss_note(feeder, None).is_none());
+        let note =
+            super::game_own_dlss_note(&format!("{feeder}\n{game}"), Some("work_resolution=100\n"));
+        assert!(note
+            .as_deref()
+            .is_some_and(|n| n.contains("2293x960") && n.contains("Force native DLSS")));
+        // The Feeder's own session is smaller than the output when work_resolution is.
+        assert!(super::game_own_dlss_note(game, Some("work_resolution=75\n")).is_none());
+        assert!(super::game_own_dlss_note("nothing here", None).is_none());
     }
 }

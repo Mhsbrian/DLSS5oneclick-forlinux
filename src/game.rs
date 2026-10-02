@@ -15,10 +15,28 @@ pub const FEEDER_ADDON: &str = "dlss5-feed.addon64";
 /// beside the exe that holds everything a 32-bit process cannot load
 /// (a 64-bit ReShade, the DLSS 5 add-on, the two NVIDIA DLLs, the helper exe).
 pub const FEEDER_ADDON32: &str = "dlss5-feed.addon32";
+/// The Feeder's 64-bit helper mode (1.18.0-beta.1): the 32-bit add-on's in-game
+/// half built as 64-bit code, for a 64-bit game that cannot take the normal
+/// add-on. It has the Direct3D 10 backend the normal one lacks, so it is the
+/// only route for a 64-bit DirectX 10 game (Crysis, #134). NGX runs in the
+/// same `host64\` helper as for a 32-bit game.
+pub const FEEDER_HELPER_ADDON: &str = "dlss5-feed-helper.addon64";
 pub const HOST_DIR: &str = "host64";
 pub const HOST_EXE: &str = "dlss5-feed-host64.exe";
 pub const FEEDER_FX: &str = "DLSS5_Feed.fx";
 pub const DLSS5_ADDON: &str = "renodx-dlss5.addon64";
+/// ShortFuse's own DLSS add-on (`renodx-dlss-SF-*` on rhi-repo): the RenoDX
+/// author's neural consumer, which hooks the game's NGX calls in D3D11 and
+/// D3D12 itself. It takes the place of `renodx-dlss5.addon64`; the two cannot
+/// run together.
+pub const SF_ADDON: &str = "renodx-dlss.addon64";
+/// The ShortFuse add-on release tag this tool placed.
+pub const SF_ADDON_MARKER: &str = "renodx-dlss.addon64.dlss5oneclick";
+/// Beside a ShortFuse add-on placed from 0.14.3 on, when ShortFuse stopped
+/// being the first setup: this one was chosen (the next setup after the DLSS 5
+/// add-on, or Advanced), so Update keeps it. One without it was the old
+/// default and moves to the DLSS 5 add-on.
+pub const SF_CHOSEN_MARKER: &str = "renodx-dlss.addon64.chosen.dlss5oneclick";
 pub const DLSSNR_DLL: &str = "nvngx_dlssnr.dll";
 pub const DLSS_DLL: &str = "nvngx_dlss.dll";
 pub const LUMENITE_KERNEL_FX: &str = "lumenite_Kernel.fx";
@@ -53,6 +71,10 @@ pub const UPSTREAM_ADDON: &str = "nvngx.dll.addon64";
 pub const AIO_ADDON: &str = "standalone-dlssnr.addon64";
 /// Files this tool wrote for an AIO install, one path per line, tag in the header.
 pub const AIO_MANIFEST: &str = ".dlss5oneclick-aio-manifest";
+/// dashdogy's Universal RTXMFG placed as a proxy DLL. Two lines: the release
+/// tag, the file name it was given in the game folder (`dxgi.dll`, or
+/// `version.dll` in a Vulkan game), and the size of that file as written.
+pub const RTXMFG_MARKER: &str = "RTXMFG.dll.dlss5oneclick";
 /// Files this tool wrote for an OptiScaler install, one path per line.
 pub const OPTI_MANIFEST: &str = ".dlss5oneclick-optiscaler-manifest";
 /// Sidecar written next to an `nvngx_dlss.dll` this tool placed, so it is never mistaken for the game's own.
@@ -66,6 +88,11 @@ pub const RESHADE_MARKER: &str = "dxgi.dll.dlss5oneclick";
 /// Feeder's host names them all "v4.6 engine" and warns about a combination the
 /// classic build is not part of. The tag is the only way to tell them apart.
 pub const DLSS5_ADDON_MARKER: &str = "renodx-dlss5.addon64.dlss5oneclick";
+/// Written once the 8.x add-on's faster settings went into this game's
+/// ReShade.ini: they are the tool's starting point, not something it keeps
+/// putting back, so a later Install leaves the player's choices alone even when
+/// the add-on stores a default by leaving its key out.
+pub const DLSS5_SETTINGS_MARKER: &str = "renodx-dlss5.settings.dlss5oneclick";
 /// The DLSS5-Feeder release tag this tool placed, so a stale install can be
 /// spotted without downloading the zip to compare sizes.
 pub const FEEDER_MARKER: &str = "dlss5-feed.dlss5oneclick";
@@ -199,7 +226,7 @@ pub enum Api {
     /// Direct3D 9. DLSS 5 needs a D3D11/12 device; the supported path is
     /// dgVoodoo2 translating D3D9 to D3D11 so this tool's `dxgi.dll` ReShade
     /// can load (verified on Dead or Alive 5 Last Round, #17, #37). Install
-    /// downloads official dgVoodoo 2.87.3 into the game folder when missing.
+    /// downloads official dgVoodoo 2.87.5 into the game folder when missing.
     /// Aion loads system d3d9.dll by name (#16) so local ReShade d3d9.dll hooks it.
     Dx9,
     /// Direct3D 10/10.1. The 32-bit Feeder add-on runs these natively from
@@ -367,7 +394,7 @@ pub fn pe_import_fns(exe: &Path, dll: &str) -> Vec<String> {
             if name_rva == 0 && rd32(desc)? == 0 {
                 break;
             }
-            let is_ours = to_off(name_rva).map(&cstr).is_some_and(|n| n == want);
+            let is_ours = to_off(name_rva).map(cstr).is_some_and(|n| n == want);
             if is_ours {
                 // OriginalFirstThunk when present, else FirstThunk.
                 let thunk_rva = match rd32(desc)? {
@@ -544,7 +571,231 @@ fn d3d9_is_the_renderer(pe: &Path) -> bool {
     fns.is_empty() || fns.iter().any(|f| !f.starts_with("d3dperf_"))
 }
 
+/// The API from static imports, else from what the game itself logged the last
+/// time it ran (Unity's `Player.log`, Unreal's `Saved\\Logs`): Unity and Unreal
+/// load Direct3D at run time, so the exe shows nothing, and an unknown API was
+/// assumed to be DirectX 12, which Unity's own logs on one machine said it
+/// mostly was not (22 of 26 ran Direct3D 11).
 pub fn detect_api(exe: &Path) -> Api {
+    let a = detect_api_static(exe);
+    if a != Api::Unknown {
+        return a;
+    }
+    // Last, what PCGamingWiki says for a Steam game (cached; the lookup itself
+    // runs on a background thread or the command line, never here).
+    api_from_last_run(exe)
+        .or_else(|| crate::pcgw::cached_api(exe))
+        .unwrap_or(Api::Unknown)
+}
+
+/// Start of a log, as lossy text.
+fn read_log_head(p: &Path, max: u64) -> Option<String> {
+    let f = fs::File::open(p).ok()?;
+    let mut buf = Vec::new();
+    f.take(max).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+fn slash_lower(s: &str) -> String {
+    s.replace('\\', "/").to_ascii_lowercase()
+}
+
+/// `(AppData\LocalLow, AppData\Local)` for this game. On Windows they are
+/// this user's own; under Proton each game keeps its own set inside its prefix.
+#[cfg(target_os = "linux")]
+fn windows_user_dirs(game_dir: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
+    crate::platform::prefix_appdata(game_dir)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn windows_user_dirs(_game_dir: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
+    (
+        std::env::var_os("USERPROFILE")
+            .map(|h| PathBuf::from(h).join("AppData").join("LocalLow")),
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+    )
+}
+
+fn api_from_last_run(exe: &Path) -> Option<Api> {
+    let dir = exe.parent()?;
+    let (local_low, local) = windows_user_dirs(dir);
+    let unity = fs::read_dir(dir).ok().is_some_and(|rd| {
+        rd.flatten().any(|e| {
+            let n = e.file_name().to_string_lossy().to_ascii_lowercase();
+            n == "unityplayer.dll" || n.ends_with("_data")
+        })
+    });
+    if unity {
+        if let Some(a) = local_low.as_deref().and_then(|l| unity_logged_api(dir, l)) {
+            return Some(a);
+        }
+    }
+    local.and_then(|l| unreal_logged_api(exe, &l))
+}
+
+/// `Direct3D 11` / `Direct3D 12` / `Vulkan` from the "Version:" line of Unity's
+/// graphics section ("Direct3D:\n    Version:  Direct3D 11.0 [level 11.1]").
+fn unity_api_in(log: &str) -> Option<Api> {
+    log.lines().find_map(|l| {
+        let v = l.trim().strip_prefix("Version:")?.trim();
+        if v.starts_with("Direct3D 12") {
+            Some(Api::Dx12)
+        } else if v.starts_with("Direct3D 11") {
+            Some(Api::Dx11)
+        } else if v.starts_with("Vulkan") {
+            Some(Api::Vulkan)
+        } else {
+            None
+        }
+    })
+}
+
+/// What to look for in a game's own log to tell this install from another copy
+/// of the same game.
+///
+/// On Windows the game logs the same absolute path this tool sees. Under Proton
+/// it logs the path as Wine hands it over — a drive letter mapped to the Steam
+/// library, `S:/steamapps/common/<game>/…` — which shares no prefix with the
+/// Linux path at all, so matching the whole path there finds nothing and every
+/// Unity and Unreal game keeps reading as "unknown, assume DX12". The part both
+/// spell the same way is the library-relative tail, and that is what is matched.
+#[cfg(target_os = "linux")]
+fn install_needle(dir: &Path) -> String {
+    let full = slash_lower(&dir.to_string_lossy());
+    let full = full.trim_end_matches('/');
+    match full.rfind("/steamapps/") {
+        // Steam maps the library to a drive letter of its own, so only the
+        // library-relative tail survives: "S:/steamapps/common/<game>".
+        Some(i) => full[i + 1..].to_owned(),
+        // Everywhere else Wine maps `Z:` to the Linux root, so the whole path
+        // is still in there — and matching all of it keeps one install from
+        // being mistaken for another.
+        None => full.to_owned(),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_needle(dir: &Path) -> String {
+    let full = slash_lower(&dir.to_string_lossy());
+    full.trim_end_matches('/').to_owned()
+}
+
+/// The Unity log of this install: `LocalLow\<company>\<product>\Player.log`,
+/// told from another install of the same game by the install path on its first
+/// line (`Mono path[0] = '<dir>/<name>_Data/Managed'`).
+fn unity_logged_api(exe_dir: &Path, locallow: &Path) -> Option<Api> {
+    let want = install_needle(exe_dir);
+    let want = want.as_str();
+    for company in fs::read_dir(locallow).ok()?.flatten() {
+        let Ok(products) = fs::read_dir(company.path()) else {
+            continue;
+        };
+        for product in products.flatten() {
+            for name in ["Player.log", "Player-prev.log"] {
+                let Some(txt) = read_log_head(&product.path().join(name), 128 * 1024) else {
+                    continue;
+                };
+                if slash_lower(&txt).contains(want) {
+                    if let Some(a) = unity_api_in(&txt) {
+                        return Some(a);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The RHI an Unreal log says the game ran on: the plug-in's "selected dynamic
+/// RHI" line, else the last RHI module loaded (a failed Direct3D 12 falls back
+/// to Direct3D 11 and loads it second), else the default it announced.
+fn unreal_api_in(log: &str) -> Option<Api> {
+    let map = |n: &str| {
+        if n.starts_with("D3D12") {
+            Some(Api::Dx12)
+        } else if n.starts_with("D3D11") {
+            Some(Api::Dx11)
+        } else if n.starts_with("Vulkan") {
+            Some(Api::Vulkan)
+        } else {
+            None
+        }
+    };
+    let last = |key: &str| {
+        log.lines()
+            .filter_map(|l| l.find(key).map(|i| l[i + key.len()..].trim()))
+            .filter_map(map)
+            .next_back()
+    };
+    last("GetSelectedDynamicRHIModuleName = ")
+        .or_else(|| last("Loading RHI module "))
+        .or_else(|| last("Using Default RHI: "))
+}
+
+/// The Unreal log of this install: `%LOCALAPPDATA%\<Project>\Saved\Logs\<Project>.log`,
+/// where the project is read from the exe (`<Project>-Win64-Shipping.exe`, or
+/// the folder above `Binaries`) and the log is confirmed by its "Base
+/// Directory" line being inside the exe's folder.
+fn unreal_logged_api(exe: &Path, local: &Path) -> Option<Api> {
+    let dir = exe.parent()?;
+    let stem = exe.file_stem()?.to_string_lossy().into_owned();
+    let mut names = vec![stem
+        .split("-Win64-")
+        .next()
+        .unwrap_or(&stem)
+        .split("-WinGDK-")
+        .next()
+        .unwrap_or(&stem)
+        .to_owned()];
+    // <Project>\Binaries\Win64\x.exe
+    if let Some(p) = dir
+        .ancestors()
+        .find(|a| {
+            a.file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("binaries"))
+        })
+        .and_then(|b| b.parent())
+        .and_then(|p| p.file_name())
+    {
+        names.push(p.to_string_lossy().into_owned());
+    }
+    let names: Vec<String> = names
+        .iter()
+        .map(|n| norm(n))
+        .filter(|n| n.len() >= 4)
+        .collect();
+    let want = install_needle(dir);
+    let want = want.as_str();
+    for e in fs::read_dir(local).ok()?.flatten() {
+        let folder = e.file_name().to_string_lossy().into_owned();
+        let f = norm(&folder);
+        // The project folder is named after the project; a store suffix on the
+        // exe ("CrimsonMoonNGSteam" for "CrimsonMoonNG") makes it a prefix.
+        if !names.iter().any(|n| {
+            *n == f || (f.len() >= 5 && n.starts_with(&f)) || (n.len() >= 5 && f.starts_with(n))
+        }) {
+            continue;
+        }
+        let logs = e.path().join("Saved").join("Logs");
+        for name in [format!("{folder}.log"), format!("{folder}-backup.log")] {
+            let Some(txt) = read_log_head(&logs.join(&name), 2 * 1024 * 1024) else {
+                continue;
+            };
+            let in_dir = txt
+                .lines()
+                .find(|l| l.contains("Base Directory:"))
+                .is_some_and(|l| slash_lower(l).contains(want));
+            if in_dir {
+                if let Some(a) = unreal_api_in(&txt) {
+                    return Some(a);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn detect_api_static(exe: &Path) -> Api {
     use classify_imports as classify;
     let mut api = classify(&pe_imports(exe));
     if api == Api::Dx9 && !d3d9_is_the_renderer(exe) {
@@ -589,23 +840,40 @@ pub fn detect_api(exe: &Path) -> Api {
         .collect();
     dlls.sort_by_key(|(size, _)| std::cmp::Reverse(*size));
     let mut seen_dx11 = false;
+    let mut seen_dx10 = false;
     let mut seen_dx9 = false;
     for (_, dll) in dlls.into_iter().take(12) {
         match classify_imports(&pe_imports(&dll)) {
             Api::Dx12 => return Api::Dx12,
             Api::Dx11 => seen_dx11 = true,
+            // CryEngine 1 (Crysis) ships one renderer DLL per API and picks
+            // at run time, so a Direct3D 10 renderer is the only place the
+            // API shows (#114). Only a DLL named like a renderer counts: a
+            // stray d3d10 import in some other module must not turn a
+            // Direct3D 11 game's unknown exe into a DirectX 10 one.
+            Api::Dx10 => {
+                let n = dll
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                seen_dx10 |= n.contains("render") || n.contains("d3d10");
+            }
             // Aion renders through XRenderD3D9.dll rather than from the exe,
             // so the renderer DLL is the only place the API shows (#16). The
             // marker-only case is excluded here too (#53).
             Api::Dx9 => seen_dx9 |= d3d9_is_the_renderer(&dll),
-            Api::Dx10 | Api::Vulkan | Api::Unknown => {}
+            Api::Vulkan | Api::Unknown => {}
         }
-    }
-    if seen_dx9 && !seen_dx11 {
-        return Api::Dx9;
     }
     if seen_dx11 {
         Api::Dx11
+    } else if seen_dx10 {
+        // Beside a Direct3D 9 renderer too (Crysis ships both), the game runs
+        // DirectX 10 unless it is started with -dx9.
+        Api::Dx10
+    } else if seen_dx9 {
+        Api::Dx9
     } else {
         Api::Unknown
     }
@@ -691,7 +959,7 @@ fn anticheat_marker(n: &str, is_dir: bool) -> Option<&'static str> {
     }
     // ACE — Anti-Cheat Expert (ACE-BASE.sys / ACE-GAME.sys, anticheatexpert/).
     if n.contains("anticheatexpert") || n.starts_with("ace-base") {
-        return Some("Anti-Cheat Expert");
+        return Some("Anti-Cheat Expert (ACE)");
     }
     None
 }
@@ -725,7 +993,7 @@ pub(crate) fn dll_mentions_dgvoodoo(b: &[u8]) -> bool {
 /// BattlEye `BattlEye/BEService_x64.exe`, `Install_BattlEye.bat`, `*_BE.exe`,
 /// GameGuard `tools/GGSetup.exe` or a `GameGuard` folder, EA Javelin an
 /// `EAAntiCheat` folder or `EAAntiCheat.GameServiceLauncher.exe/.dll` beside
-/// the exe.
+/// the exe, Tencent ACE an `AntiCheatExpert` folder.
 /// A folder with thousands of entries is an asset store (extracted game
 /// archives, a texture dump), never where a DLL, an anti-cheat, or an exe
 /// lives. Crimson Desert's bin64 carried 318,000 files in two such folders
@@ -987,6 +1255,8 @@ pub struct GameStatus {
     pub feeder: bool,
     pub lumenite: bool,
     pub dlss5_addon: bool,
+    /// ShortFuse's add-on (`renodx-dlss.addon64`) is beside the game.
+    pub sf: bool,
     pub dlssnr: bool,
     pub dlss: bool,
     /// What the folder scan said, before any override.
@@ -996,6 +1266,11 @@ pub struct GameStatus {
     /// 32-bit only: `host64\dlss5-feed-host64.exe` and a 64-bit ReShade beside it.
     pub host_exe: bool,
     pub host_reshade: bool,
+    /// A 64-bit game on the Feeder's helper mode: the in-game half is
+    /// `dlss5-feed-helper.addon64` and the rest lives in `host64\`, as for a
+    /// 32-bit game. A 64-bit DirectX 10 game with no DLSS of its own, or a game
+    /// that already carries the helper add-on.
+    pub helper: bool,
     /// Capcom RE Engine (needs REFramework before ReShade will run).
     pub re_engine: bool,
     pub reframework: bool,
@@ -1003,6 +1278,8 @@ pub struct GameStatus {
     pub upstream: bool,
     /// kibblerz's standalone AIO add-on is in the folder.
     pub aio: bool,
+    /// Universal RTXMFG alone: no ReShade, no DLSS 5 (the "MFG only" setup).
+    pub rtxmfg: bool,
     /// The RTX 40 multi-frame-generation add-on is already beside the game.
     pub mfg: bool,
     /// Unreal-style layout / Shipping exe (heuristic).
@@ -1054,16 +1331,19 @@ pub(crate) fn stub_status(mode: Mode, api: Api) -> GameStatus {
         feeder: false,
         lumenite: false,
         dlss5_addon: false,
+        sf: false,
         dlssnr: false,
         dlss: false,
         mode_detected: mode,
         api_detected: api,
         host_exe: false,
         host_reshade: false,
+        helper: false,
         re_engine: false,
         reframework: false,
         upstream: false,
         aio: false,
+        rtxmfg: false,
         mfg: false,
         unreal_likely: false,
         unity_likely: false,
@@ -1234,6 +1514,21 @@ impl GameStatus {
     pub fn is32(&self) -> bool {
         self.bitness == 32
     }
+    /// The layout with a `host64\` helper folder: a 32-bit game, or a 64-bit one
+    /// on the Feeder's helper mode.
+    pub fn uses_host(&self) -> bool {
+        self.is32() || self.helper
+    }
+    /// The Feeder's in-game add-on for this game.
+    pub fn feeder_addon(&self) -> &'static str {
+        if self.is32() {
+            FEEDER_ADDON32
+        } else if self.helper {
+            FEEDER_HELPER_ADDON
+        } else {
+            FEEDER_ADDON
+        }
+    }
     /// DX9 without dgVoodoo2 yet: Install will download it into the game folder.
     pub fn needs_dgvoodoo(&self) -> bool {
         // A Remix game renders through its own d3d9 bridge, which dgVoodoo's
@@ -1243,11 +1538,23 @@ impl GameStatus {
     /// Where the DLSS 5 add-on and the NVIDIA DLLs live: beside the exe for a
     /// 64-bit game, in `host64\` for a 32-bit one.
     pub fn consumer_dir(&self) -> PathBuf {
-        if self.is32() {
+        if self.uses_host() {
             self.game_dir().join(HOST_DIR)
         } else {
             self.game_dir().to_path_buf()
         }
+    }
+    /// A Direct3D 11 game with its own DLSS: the one kind that has a bridge step.
+    pub fn dx11_native(&self) -> bool {
+        self.mode == Mode::Native && self.api == Api::Dx11
+    }
+
+    /// The DLSS 5 add-on this tool placed is an 8.x build. Those carry their own
+    /// Direct3D 11 bridge and, when another project's bridge is loaded, switch
+    /// to serving only that tool's D3D12 calls: the game's own DLSS gets no NR.
+    pub fn dlss5_own_bridge(&self) -> bool {
+        fs::read_to_string(self.consumer_dir().join(DLSS5_ADDON_MARKER))
+            .is_ok_and(|t| crate::installer::dlss5_has_fast_settings(t.trim()))
     }
     pub fn needs_bridge(&self) -> bool {
         self.needs_bridge_with(bridge_override())
@@ -1255,9 +1562,11 @@ impl GameStatus {
 
     /// `needs_bridge` with the `--bridge` override given rather than read, so
     /// a test can exercise it without setting the process-wide variable that
-    /// every test running alongside would see.
+    /// every test running alongside would see. The override cannot force a
+    /// bridge onto an 8.x add-on: that build bridges D3D11 itself and idles
+    /// the game's own DLSS when it finds another bridge loaded.
     fn needs_bridge_with(&self, forced: bool) -> bool {
-        self.mode == Mode::Native && (self.api == Api::Dx11 || forced)
+        (self.dx11_native() || (self.mode == Mode::Native && forced)) && !self.dlss5_own_bridge()
     }
     pub fn complete(&self) -> bool {
         // The Remix route is its own thing: the model inside `.trex/` and the
@@ -1270,6 +1579,10 @@ impl GameStatus {
         if self.aio && !self.opti {
             return self.reshade && self.dlssnr && self.dlss;
         }
+        // Nothing else belongs to this setup: the one DLL is all of it.
+        if self.rtxmfg {
+            return true;
+        }
         match self.mode {
             Mode::Feeder => {
                 self.reshade
@@ -1279,12 +1592,15 @@ impl GameStatus {
                     && self.dlss5_addon
                     && self.dlssnr
                     && self.dlss
-                    && (!self.is32() || (self.host_exe && self.host_reshade))
+                    && (!self.uses_host() || (self.host_exe && self.host_reshade))
             }
             Mode::Native => {
-                // Either neural consumer counts: the RenoDX add-on, or the
-                // experimental Neural Upstream one that stands in its place.
+                // Any neural consumer counts: the RenoDX DLSS 5 add-on,
+                // ShortFuse's, or the experimental Neural Upstream one. Only
+                // the DLSS 5 add-on needs the bridge in a DX11 game; ShortFuse's
+                // hooks D3D11's NGX calls itself.
                 (self.opti && self.dlssnr)
+                    || (self.reshade && self.sf && self.dlssnr)
                     || (self.reshade
                         && (self.dlss5_addon || self.upstream)
                         && self.dlssnr
@@ -1301,6 +1617,22 @@ pub fn game_pass_content_dir(d: &Path) -> Option<PathBuf> {
         .take(4)
         .find(|a| a.join("MicrosoftGame.config").is_file())
         .map(Path::to_path_buf)
+}
+
+/// What to tell the user about a Game Pass copy Windows has locked.
+fn game_pass_locked_message(content: &Path) -> String {
+    let native = if game_pass_ships_dlss(content) {
+        "The game itself ships DLSS (nvngx_dlss.dll is in its folder), so it supports DLSS natively; only this install cannot be modified."
+    } else {
+        "No nvngx_dlss.dll anywhere in its folder, so this game has no DLSS of its own either."
+    };
+    format!(
+        "Game Pass / Microsoft Store copy ({}): Windows protects this install — the \
+         executable is locked or the folder refuses writes — so DLSS 5 cannot be \
+         installed on this copy. Some Store games are installed unprotected and work; \
+         this one is not. The same game from Steam, Epic or GOG works. {native}",
+        content.display()
+    )
 }
 
 /// Whether a file can be created in `d`: the one test that separates a
@@ -1355,18 +1687,7 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     if let Some(content) = game_pass_content_dir(d) {
         let locked = fs::File::open(exe).is_err() || !dir_writable(d);
         if locked {
-            let native = if game_pass_ships_dlss(&content) {
-                "The game itself ships DLSS (nvngx_dlss.dll is in its folder), so it supports DLSS natively; only this install cannot be modified."
-            } else {
-                "No nvngx_dlss.dll anywhere in its folder, so this game has no DLSS of its own either."
-            };
-            bail!(
-                "Game Pass / Microsoft Store copy ({}): Windows protects this install — the \
-                 executable is locked or the folder refuses writes — so DLSS 5 cannot be \
-                 installed on this copy. Some Store games are installed unprotected and work; \
-                 this one is not. The same game from Steam, Epic or GOG works. {native}",
-                content.display()
-            );
+            bail!("{}", game_pass_locked_message(&content));
         }
     }
 
@@ -1414,14 +1735,14 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     // Feeder (verified working on Dead or Alive 5 Last Round, #17).
     if remix.is_none() && file_ci(d, "d3d9.dll") && !file_ci(d, RESHADE_PROXY) && !is_dgvoodoo(d) {
         problems.push(
-            "A d3d9.dll proxy is present that is not dgVoodoo2. DirectX 9 itself is not a dead              end -- DLSS 5 needs a D3D11/12 device, and dgVoodoo2 provides one, which is how a              D3D9 game can work here (#17, #37) -- but this tool cannot install behind another              wrapper. Replace it with dgVoodoo 2.87.3 (MS\\x86 or MS\\x64\\D3D9.dll plus              dgVoodoo.conf, OutputAPI = d3d11_fl11_0, VRAM >= 4096) and run Install again."
+            "A d3d9.dll proxy is present that is not dgVoodoo2. DirectX 9 itself is not a dead              end -- DLSS 5 needs a D3D11/12 device, and dgVoodoo2 provides one, which is how a              D3D9 game can work here (#17, #37) -- but this tool cannot install behind another              wrapper. Replace it with dgVoodoo 2.87.5 (MS\\x86 or MS\\x64\\D3D9.dll plus              dgVoodoo.conf, OutputAPI = d3d11_fl11_0, VRAM >= 4096) and run Install again."
                 .into(),
         );
     }
     let api_detected = detect_api(exe);
     let api = api_override().unwrap_or(api_detected);
     // Plain D3D9 (Gothic 3, Aion, etc.): ReShade is dxgi.dll here, which a
-    // D3D9 process never loads. Install adds official dgVoodoo 2.87.3 so DX9
+    // D3D9 process never loads. Install adds official dgVoodoo 2.87.5 so DX9
     // is not a hard refuse. A foreign non-dgVoodoo d3d9.dll still blocks above.
     let is32 = bitness == 32;
     if is32 && api == Api::Dx12 {
@@ -1430,18 +1751,6 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
                 .into(),
         );
     }
-    // 32-bit: NGX is 64-bit only, so the game can never carry its own DLSS;
-    // everything 64-bit goes to host64\ and the Feeder's addon32 sits in-game.
-    let cdir = if is32 {
-        join_ci(d, &[HOST_DIR])
-    } else {
-        d.to_path_buf()
-    };
-    let feeder = if is32 {
-        file_ci(d, FEEDER_ADDON32) && file_ci(&shaders, FEEDER_FX)
-    } else {
-        file_ci(d, FEEDER_ADDON) && file_ci(&shaders, FEEDER_FX)
-    };
     let mode_detected = if !is32 && game_ships_dlss(d) {
         Mode::Native
     } else {
@@ -1452,6 +1761,29 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     } else {
         mode_override().unwrap_or(mode_detected)
     };
+    // A 64-bit DirectX 10 game with no DLSS of its own: the Feeder's normal
+    // 64-bit add-on has no Direct3D 10 backend, so it goes on the helper mode.
+    // A folder that already carries the helper add-on stays on it.
+    let helper = !is32
+        && mode == Mode::Feeder
+        && (api == Api::Dx10 || file_ci(d, FEEDER_HELPER_ADDON));
+    // 32-bit: NGX is 64-bit only, so the game can never carry its own DLSS;
+    // everything 64-bit goes to host64\ and the Feeder's addon32 sits in-game.
+    // The helper mode lays out the same way with its own in-game add-on.
+    let host = is32 || helper;
+    let cdir = if host {
+        join_ci(d, &[HOST_DIR])
+    } else {
+        d.to_path_buf()
+    };
+    let feeder_addon = if is32 {
+        FEEDER_ADDON32
+    } else if helper {
+        FEEDER_HELPER_ADDON
+    } else {
+        FEEDER_ADDON
+    };
+    let feeder = file_ci(d, feeder_addon) && file_ci(&shaders, FEEDER_FX);
     let renodx_mod = fs::read_to_string(d.join(RENODX_MANIFEST))
         .ok()
         .map(|s| s.trim().to_owned())
@@ -1463,21 +1795,28 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         opti: file_ci(d, OPTI_MANIFEST),
         upstream: file_ci(d, UPSTREAM_ADDON),
         aio: file_ci(d, AIO_ADDON),
+        rtxmfg: rtxmfg_proxy(d).is_some(),
         mfg: file_ci(d, MFG_ADDON),
         gpu,
         exe: exe.to_path_buf(),
         bitness,
-        reshade: !file_ci(d, OPTI_MANIFEST) && is_reshade_dll(&join_ci(d, &[RESHADE_PROXY])),
+        // RTXMFG's DLL carries ReShade's name inside it, so a proxy this tool
+        // placed from that release is not a ReShade.
+        reshade: !file_ci(d, OPTI_MANIFEST)
+            && rtxmfg_proxy(d).as_deref() != Some(RESHADE_PROXY)
+            && is_reshade_dll(&join_ci(d, &[RESHADE_PROXY])),
         headers: RESHADE_HEADERS.iter().all(|h| file_ci(&shaders, h)),
         feeder,
         lumenite: file_ci(&shaders, LUMENITE_KERNEL_FX) && file_ci(&textures, LUMENITE_BLUENOISE),
         dlss5_addon: file_ci(&cdir, DLSS5_ADDON),
+        sf: file_ci(&cdir, SF_ADDON),
         dlssnr: file_ci(&cdir, DLSSNR_DLL),
         dlss: file_ci(&cdir, DLSS_DLL),
         mode_detected,
         api_detected,
-        host_exe: is32 && file_ci(&cdir, HOST_EXE),
-        host_reshade: is32 && is_reshade_dll(&join_ci(&cdir, &[RESHADE_PROXY])),
+        host_exe: host && file_ci(&cdir, HOST_EXE),
+        host_reshade: host && is_reshade_dll(&join_ci(&cdir, &[RESHADE_PROXY])),
+        helper,
         re_engine: file_ci(d, RE_ENGINE_PAK),
         reframework: is_reframework_dll(&join_ci(d, &[REFRAMEWORK_DLL])),
         unreal_likely: unreal_likely(exe, d),
@@ -1496,7 +1835,7 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
 }
 
 /// Helper/launcher executables that are never the game.
-const NOT_GAME: [&str; 17] = [
+const NOT_GAME: [&str; 18] = [
     "unitycrashhandler",
     "unrealcefsubprocess",
     "crashreportclient",
@@ -1516,6 +1855,11 @@ const NOT_GAME: [&str; 17] = [
     "install",
     // Rockstar's 64-bit PlayGTAIV.exe launcher outranked the 32-bit game (#94).
     "playgtaiv",
+    // Game Pass's launch stub. It is the one readable exe in a protected
+    // install, so it was picked as "the game", read as an unknown API, and let a
+    // protected copy past the lock check: the real exe under WinGDK is the one
+    // Windows locks.
+    "gamelaunchhelper",
 ];
 
 fn is_helper_name(stem_lower: &str) -> bool {
@@ -1701,7 +2045,14 @@ pub fn resolve_target(input: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
         let c = find_game_exes(input);
         return match c.first() {
             Some(first) => Ok((first.clone(), c)),
-            None => bail!("no 64-bit game executable found in {}", input.display()),
+            None => {
+                // A Game Pass folder whose real exe is locked has nothing
+                // readable but the launch stub, which is skipped: say why.
+                if let Some(content) = game_pass_content_dir(input) {
+                    bail!("{}", game_pass_locked_message(&content));
+                }
+                bail!("no 64-bit game executable found in {}", input.display())
+            }
         };
     }
     bail!("not found: {}", input.display())
@@ -1753,11 +2104,93 @@ pub fn shaders_missing(game_dir: &Path) -> bool {
         && file_ci(game_dir, RESHADE_PROXY)
 }
 
+/// The file name RTXMFG goes in as, by graphics API: a DirectX 11/12 game loads
+/// `dxgi.dll` from its folder; a Vulkan game does not, so `version.dll` there.
+/// `None` for the APIs RTXMFG does not cover (it needs Streamline frame
+/// generation, which DirectX 9/10 games do not have).
+pub fn rtxmfg_proxy_name(api: Api) -> Option<&'static str> {
+    match api {
+        Api::Dx11 | Api::Dx12 | Api::Unknown => Some("dxgi.dll"),
+        Api::Vulkan => Some("version.dll"),
+        Api::Dx9 | Api::Dx10 => None,
+    }
+}
+
+/// The names the RTXMFG release says it can be loaded under (its README's list,
+/// less the two Bink names, which need the game's own DLL kept beside them).
+const RTXMFG_NAMES: [&str; 15] = [
+    "version.dll",
+    "dinput8.dll",
+    "winmm.dll",
+    "d3d9.dll",
+    "d3d10.dll",
+    "d3d11.dll",
+    "d3d12.dll",
+    "dxgi.dll",
+    "dsound.dll",
+    "wininet.dll",
+    "winhttp.dll",
+    "xinput1_1.dll",
+    "xinput1_3.dll",
+    "xinput1_4.dll",
+    "xinput9_1_0.dll",
+];
+
+/// The name RTXMFG goes in as for this game: `winmm.dll` for The Witcher 3 on
+/// DirectX (its README asks for that name there, and the hair support needs
+/// it), else the API's default.
+pub fn rtxmfg_proxy_for(exe: &Path, api: Api) -> Option<&'static str> {
+    let base = rtxmfg_proxy_name(api)?;
+    let witcher = exe
+        .file_stem()
+        .is_some_and(|s| s.eq_ignore_ascii_case("witcher3"));
+    Some(if witcher && api != Api::Vulkan {
+        "winmm.dll"
+    } else {
+        base
+    })
+}
+
+/// True for an RTXMFG DLL, whoever placed it and whatever it is called: the
+/// release carries its own name as a wide string.
+pub fn is_rtxmfg_dll(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() < (1 << 20) || meta.len() > (64 << 20) {
+        return false;
+    }
+    let needle: Vec<u8> = "RTXMFG-Universal"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    fs::read(path).is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle.as_slice()))
+}
+
+/// An RTXMFG DLL already in the game folder under one of its supported names:
+/// one the user placed or renamed, which Install then updates in place instead
+/// of putting a second copy beside it.
+pub fn find_rtxmfg_copy(dir: &Path) -> Option<String> {
+    RTXMFG_NAMES
+        .iter()
+        .find(|n| is_rtxmfg_dll(&dir.join(n)))
+        .map(|n| (*n).to_owned())
+}
+
+/// The RTXMFG proxy this tool placed in `dir`: its marker's second line, when
+/// that file is still there.
+pub fn rtxmfg_proxy(dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(dir.join(RTXMFG_MARKER)).ok()?;
+    let name = text.lines().nth(1)?.trim().to_owned();
+    (!name.is_empty() && !name.contains(['/', '\\']) && dir.join(&name).is_file()).then_some(name)
+}
+
 /// Sidecar markers this tool leaves so Install / Update / Remove know the folder.
 pub fn installed_by_tool(dir: &Path) -> bool {
     [
         OPTI_MANIFEST,
         AIO_MANIFEST,
+        RTXMFG_MARKER,
         RENODX_MANIFEST,
         REFRAMEWORK_MARKER,
         DLSS_MARKER,
@@ -2717,7 +3150,7 @@ mod tests {
     fn dll_mentions_dgvoodoo_ascii_and_utf16() {
         assert!(dll_mentions_dgvoodoo(b"MZ...dgVoodoo2 wrapper..."));
         assert!(!dll_mentions_dgvoodoo(b"MZ some other wrapper"));
-        // Official 2.87.3 MS/x86/D3D9.dll embeds the name as UTF-16LE only.
+        // Official MS/x86/D3D9.dll (2.87.3 and 2.87.5) embeds the name as UTF-16LE only.
         let mut utf16 = b"MZ\0\0".to_vec();
         for &c in b"dgVoodoo" {
             utf16.push(c);
@@ -2800,6 +3233,10 @@ mod tests {
         fs::remove_dir_all(d.join("Game")).unwrap();
         fs::write(d.join("Foo_BE.exe"), b"x").unwrap();
         assert_eq!(detect_anticheat(d), Some("BattlEye"));
+        fs::remove_file(d.join("Foo_BE.exe")).unwrap();
+        // Arknights: Endfield's layout (#113).
+        fs::create_dir_all(d.join("AntiCheatExpert")).unwrap();
+        assert_eq!(detect_anticheat(d), Some("Anti-Cheat Expert (ACE)"));
     }
 
     /// The broader anti-cheat set fires on the new systems and — importantly —
@@ -2817,7 +3254,7 @@ mod tests {
             ("FACEIT", true, Some("FACEIT Anti-Cheat")),
             ("EAAntiCheat.Installer.exe", false, Some("EA Javelin Anticheat")),
             ("mhyprot3.sys", false, Some("HoYoverse anti-cheat")),
-            ("ACE-BASE.sys", false, Some("Anti-Cheat Expert")),
+            ("ACE-BASE.sys", false, Some("Anti-Cheat Expert (ACE)")),
             ("BEClient_x64.dll", false, Some("BattlEye")),
             ("EAC_launcher.exe", false, Some("Easy Anti-Cheat")),
             // Must NOT fire: Denuvo DRM, and ordinary files.
@@ -2992,5 +3429,147 @@ mod tests {
         assert!(!game_ships_dlss(d));
         fs::write(d.join(DLSS_DLL), b"x").unwrap();
         assert!(game_ships_dlss(d));
+    }
+
+    /// Crysis ships one renderer DLL per API and loads one at run time, so the
+    /// exe shows nothing. A Direct3D 10 renderer beside a Direct3D 9 one reads
+    /// as DirectX 10 (#114); a Direct3D 10 import in a DLL that is not a
+    /// renderer does not.
+    #[test]
+    fn a_direct3d10_renderer_dll_makes_the_game_directx_10() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe(&d.join("Crysis.exe"), PE_X64);
+        make_pe_with_imports(&d.join("CryRenderD3D9.dll"), PE_X64, &["d3d9.dll"]);
+        assert_eq!(detect_api(&exe), Api::Dx9);
+        make_pe_with_imports(&d.join("CryRenderD3D10.dll"), PE_X64, &["d3d10.dll"]);
+        assert_eq!(detect_api(&exe), Api::Dx10);
+        let t2 = tempfile::tempdir().unwrap();
+        let d2 = t2.path();
+        let exe2 = make_pe(&d2.join("game.exe"), PE_X64);
+        make_pe_with_imports(&d2.join("helper.dll"), PE_X64, &["d3d10.dll"]);
+        assert_eq!(detect_api(&exe2), Api::Unknown);
+    }
+
+    /// Unity says its API on the "Version:" line of its graphics section, and
+    /// Unreal in its RHI lines; only the log of this install counts (#api).
+    /// Under Proton a Steam game logs the path Wine hands it — the library on
+    /// a drive letter of its own ("S:/steamapps/common/<game>") — which shares
+    /// no prefix with the Linux path. Matching the library-relative tail is
+    /// what makes the log step work at all here; without it every Unity game
+    /// keeps reading as "unknown, assume DX12" (verified on Shadows of Doubt).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_proton_games_own_log_is_matched_through_the_wine_drive_letter() {
+        let t = tempfile::tempdir().unwrap();
+        let game = t.path().join("steamapps").join("common").join("Fell");
+        fs::create_dir_all(game.join("Fell_Data")).unwrap();
+        let ll = t.path().join("LocalLow");
+        let prod = ll.join("Studio").join("Fell");
+        fs::create_dir_all(&prod).unwrap();
+        fs::write(
+            prod.join("Player.log"),
+            "[Subsystems] Discovering subsystems at path S:/steamapps/common/Fell/Fell_Data/UnitySubsystems\nDirect3D:\n    Version:  Direct3D 11.0 [level 11.1]\n",
+        )
+        .unwrap();
+        assert_eq!(unity_logged_api(&game, &ll), Some(Api::Dx11));
+        // Another game in the same library is still told apart.
+        let other = t.path().join("steamapps").join("common").join("Else");
+        assert_eq!(unity_logged_api(&other, &ll), None);
+    }
+
+    #[test]
+    fn the_games_own_log_names_an_api_the_exe_hides() {
+        let unity = "Mono path[0] = 'F:/Games/Fell/Fell_Data/Managed'\nDirect3D:\n    Version:  Direct3D 11.0 [level 11.1]\n";
+        assert_eq!(unity_api_in(unity), Some(Api::Dx11));
+        assert_eq!(
+            unity_api_in(
+                "Direct3D:\n    Version:         Direct3D 12 [level 12.1]\nVulkan PSO LRU decision"
+            ),
+            Some(Api::Dx12)
+        );
+        assert_eq!(unity_api_in("nothing"), None);
+        // A Direct3D 11 RHI that enumerates Direct3D 12 adapters for DLSS is not Direct3D 12.
+        let ue4 = "LogD3D11RHI: D3D11 adapters:\nLogDLSSNGXVulkanRHIPreInit: GetSelectedDynamicRHIModuleName = D3D11RHI\nLogD3D12RHI: Found D3D12 adapter 0: X";
+        assert_eq!(unreal_api_in(ue4), Some(Api::Dx11));
+        let ue5 = "LogRHI: Using Default RHI: D3D12\nLogRHI: Loading RHI module D3D12RHI\nLogRHI: Loading RHI module D3D11RHI\n";
+        assert_eq!(unreal_api_in(ue5), Some(Api::Dx11));
+        assert_eq!(
+            unreal_api_in("LogRHI: Using Default RHI: D3D12\n"),
+            Some(Api::Dx12)
+        );
+
+        let t = tempfile::tempdir().unwrap();
+        let game = t.path().join("Games").join("Fell");
+        fs::create_dir_all(game.join("Fell_Data")).unwrap();
+        let ll = t.path().join("LocalLow");
+        let prod = ll.join("Studio").join("Fell");
+        fs::create_dir_all(&prod).unwrap();
+        let other = ll.join("Studio").join("Other");
+        fs::create_dir_all(&other).unwrap();
+        let line = format!(
+            "Mono path[0] = '{}/Fell_Data/Managed'\nDirect3D:\n    Version:  Direct3D 11.0 [level 11.1]\n",
+            game.to_string_lossy().replace('\\', "/")
+        );
+        fs::write(prod.join("Player.log"), line).unwrap();
+        fs::write(
+            other.join("Player.log"),
+            "Mono path[0] = 'Z:/elsewhere/Other_Data/Managed'\nDirect3D:\n    Version:  Direct3D 12 [level 12.1]\n",
+        )
+        .unwrap();
+        assert_eq!(unity_logged_api(&game, &ll), Some(Api::Dx11));
+        assert_eq!(
+            unity_logged_api(&t.path().join("Games").join("Else"), &ll),
+            None
+        );
+
+        let bin = t
+            .path()
+            .join("Steam")
+            .join("Proj")
+            .join("Binaries")
+            .join("Win64");
+        fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("Proj-Win64-Shipping.exe");
+        let local = t.path().join("Local");
+        let logs = local.join("Proj").join("Saved").join("Logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(
+            logs.join("Proj.log"),
+            format!(
+                "LogInit: Base Directory: {}/\nLogRHI: Loading RHI module D3D12RHI\n",
+                bin.to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        assert_eq!(unreal_logged_api(&exe, &local), Some(Api::Dx12));
+        // The same project installed somewhere else is not this one.
+        let elsewhere = t
+            .path()
+            .join("Other")
+            .join("Proj")
+            .join("Binaries")
+            .join("Win64");
+        fs::create_dir_all(&elsewhere).unwrap();
+        assert_eq!(
+            unreal_logged_api(&elsewhere.join("Proj-Win64-Shipping.exe"), &local),
+            None
+        );
+    }
+
+    /// The Game Pass launch stub is never the game (it was the only readable exe
+    /// in a protected install), and a folder with nothing else says why.
+    #[test]
+    fn the_game_pass_launch_stub_is_not_a_game() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("Content");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("MicrosoftGame.config"), "<Game/>").unwrap();
+        make_pe(&d.join("gamelaunchhelper.exe"), PE_X64);
+        assert!(find_game_exes(&d).is_empty());
+        let err = resolve_target(&d).unwrap_err().to_string();
+        assert!(err.contains("Game Pass"), "{err}");
+        make_pe(&d.join("RealGame.exe"), PE_X64);
+        assert_eq!(find_game_exes(&d).len(), 1);
     }
 }

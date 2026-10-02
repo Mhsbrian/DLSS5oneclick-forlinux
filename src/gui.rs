@@ -13,12 +13,14 @@ use crate::quality_preset::QualityChoice;
 use crate::renodx;
 use crate::reshade_ini;
 use crate::settings::Settings;
+use crate::setup;
 use crate::text;
 use crate::theme::{self as t};
 use crate::update;
 use eframe::egui::{
     self, Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, Stroke, StrokeKind, Vec2,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -118,6 +120,9 @@ pub struct App {
     skipped_version: String,
     /// A card whose install just finished and whose state has to be re-read.
     pending_refresh: Option<usize>,
+    /// Games waiting for "Update all": started one at a time, each when the
+    /// previous install has finished.
+    update_queue: Vec<usize>,
     /// The card being installed from the Games page, so the progress is shown
     /// where the user started it instead of throwing them onto another page.
     updating: Option<usize>,
@@ -157,7 +162,13 @@ pub struct App {
     /// host measured to work on NVIDIA 616.64 where the current one faults (#69).
     renodx_classic: bool,
     /// Ask for the newest DLSS 5 add-on build instead of the default 4.70.
-    renodx_newest: bool,
+    /// Pin the DLSS 5 add-on at 4.70 (the steady build, with Enable Upscaling).
+    renodx_steady: bool,
+    /// Which neural consumer on the ReShade route when Advanced is open.
+    consumer: installer::Consumer,
+    /// The Advanced section is open: what it shows is what gets installed.
+    /// Closed, the setup picker decides.
+    advanced: bool,
     /// RTX 40 multi-frame generation (#83): mavismmg's add-on on the ReShade
     /// route, the pre-SR OptiScaler build's own unlock there. Opens on what the
     /// game already has.
@@ -217,13 +228,13 @@ enum CardAction {
 }
 
 /// What the tool knows about an installed game without touching it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct GameMeta {
-    api: &'static str,
+    api: String,
     /// Game ships its own DLSS (Mode::Native).
     has_dlss: bool,
     /// Feeder / Native / Opti path label.
-    engine_path: &'static str,
+    engine_path: String,
     addon: bool,
     ready: bool,
     /// This tool installed into that folder.
@@ -250,7 +261,8 @@ fn meta_from_status(st: &GameStatus, latest: &installer::Latest) -> GameMeta {
             game::Api::Dx11 => "DirectX 11",
             game::Api::Dx12 => "DirectX 12",
             game::Api::Unknown => "Unknown",
-        },
+        }
+        .into(),
         has_dlss: st.mode == game::Mode::Native,
         engine_path: if st.opti {
             "Opti"
@@ -258,11 +270,12 @@ fn meta_from_status(st: &GameStatus, latest: &installer::Latest) -> GameMeta {
             "Native"
         } else {
             "Feeder"
-        },
+        }
+        .into(),
         addon: st.dlss5_addon || st.opti,
         ready: st.complete(),
         installed: game::installed_by_tool(dir),
-        stale: installer::stale_components(dir, latest),
+        stale: setup::stale(st, latest),
         rt_likely: st.rt_likely,
         unreal_likely: st.unreal_likely,
         unity_likely: st.unity_likely,
@@ -270,6 +283,34 @@ fn meta_from_status(st: &GameStatus, latest: &installer::Latest) -> GameMeta {
         shaders_missing: game::shaders_missing(dir),
         wrong_folder: game::install_folder_mismatch(&st.exe),
         exe: st.exe.clone(),
+    }
+}
+
+/// Last known state of every game, kept on disk so the cards (above all
+/// "Installed by this tool") show the moment the window opens instead of after
+/// a full re-inspection of the library.
+fn meta_cache_path() -> PathBuf {
+    library::poster_cache_dir().with_file_name("library-cache.json")
+}
+
+fn cache_key(dir: &Path) -> String {
+    dir.to_string_lossy().to_ascii_lowercase()
+}
+
+fn load_meta_cache() -> HashMap<String, GameMeta> {
+    std::fs::read_to_string(meta_cache_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_meta_cache(m: &HashMap<String, GameMeta>) {
+    let p = meta_cache_path();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(t) = serde_json::to_string(m) {
+        let _ = std::fs::write(p, t);
     }
 }
 
@@ -317,7 +358,9 @@ impl App {
             opti_presr: false,
             ampere_mfg: false,
             renodx_classic: false,
-            renodx_newest: false,
+            renodx_steady: false,
+            consumer: installer::Consumer::Dlss5,
+            advanced: false,
             ada_mfg: false,
             renodx: RenodxLookup::Idle,
             renodx_rx: None,
@@ -334,6 +377,7 @@ impl App {
             store_icons: HashMap::new(),
             kofi_icon: None,
             updating: None,
+            update_queue: Vec::new(),
             pending_refresh: None,
             meta_one_rx: None,
             checked_manually: false,
@@ -403,50 +447,130 @@ impl App {
         if self.resolved_exe != self.renodx_for {
             self.renodx_for = self.resolved_exe.clone();
             self.renodx_on = false;
-            self.fg_on = false;
-            // The dial and the OptiScaler build open on what this game already
-            // has, so a reinstall keeps hand tuning and the fork it runs.
-            let dir = self.resolved_exe.as_deref().and_then(Path::parent);
-            self.working_scale = dir.and_then(installer::opti_working_scale).unwrap_or(1.0);
-            self.opti_presr = dir.is_some_and(installer::installed_opti_presr);
             self.remix_swap_on = false;
-            // The MFG tick belongs to the game, not to the session: a game that
-            // already has the add-on comes back ticked, so re-running Install
-            // does not silently drop it (#83). Remove takes the file away, and
-            // the tick follows it.
-            // The older dashdogy unlock counts too, so re-running Install
-            // replaces it rather than dropping MFG; so does the pre-SR build's
-            // own switch in OptiScaler.ini.
-            self.ada_mfg = matches!(&self.status, Some(Ok(s)) if s.mfg || s.mfg_asi)
-                || dir.is_some_and(installer::opti_ada_mfg);
-            self.ampere_mfg = self
-                .status
-                .as_ref()
-                .and_then(|r| r.as_ref().ok())
-                .and_then(|s| std::fs::read_to_string(s.game_dir().join(game::OPTI_MANIFEST)).ok())
-                .is_some_and(|m| {
-                    m.lines()
-                        .any(|l| l.trim() == format!("# repo {}", installer::OPTI_UNLOCKED_REPO))
-                });
-            // Same for the add-on build ticks: the tag recorded beside the
-            // add-on says which build is in, so the ticks come back the way
-            // the last Install left them instead of clearing on every
-            // reselect (#101).
-            let tag = self
-                .status
-                .as_ref()
-                .and_then(|r| r.as_ref().ok())
-                .and_then(|s| {
-                    std::fs::read_to_string(s.consumer_dir().join(game::DLSS5_ADDON_MARKER)).ok()
-                })
-                .map(|t| t.trim().to_owned());
-            self.renodx_classic = tag.as_deref() == Some(installer::RENODX_CLASSIC_TAG);
-            self.renodx_newest = tag.as_deref().is_some_and(|t| {
-                t != installer::RENODX_CLASSIC_TAG && t != installer::RENODX_DEFAULT_TAG
-            });
+            self.load_game_options();
+            self.sync_setup(true);
             self.start_renodx_lookup();
+        } else if !self.advanced {
+            self.sync_setup(false);
         }
         self.reload_knobs_and_perf();
+    }
+
+    /// Put the setup controls where this game is: the picker's setup, or,
+    /// for a setup picked by hand, what is installed. `first` is a newly
+    /// opened game, which also decides whether Advanced opens; afterwards
+    /// (after an install, or when Advanced closes) only the picker's setup is
+    /// re-read, so the tiles and the Advanced controls never lag behind what
+    /// Install will do.
+    /// The per-game options that live in the game's own folder: the MFG
+    /// add-on, OptiScaler's build, frame generation and model resolution. Read
+    /// on a game change and when Advanced closes, so nothing ticked for one
+    /// game, or left in Advanced, carries into an automatic install.
+    fn load_game_options(&mut self) {
+        // The MFG tick belongs to the game, not to the session: a game that
+        // already has the add-on comes back ticked, so re-running Install
+        // does not silently drop it (#83). Remove takes the file away, and
+        // the tick follows it.
+        // The older dashdogy unlock counts too, so re-running Install replaces
+        // it rather than dropping MFG; so does the pre-SR build's own switch
+        // in OptiScaler.ini.
+        let dir = self.resolved_exe.as_deref().and_then(Path::parent);
+        self.ada_mfg = matches!(&self.status, Some(Ok(s)) if s.mfg || s.mfg_asi)
+            || dir.is_some_and(installer::opti_ada_mfg);
+        self.ampere_mfg = self
+            .status
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .and_then(|s| std::fs::read_to_string(s.game_dir().join(game::OPTI_MANIFEST)).ok())
+            .is_some_and(|m| {
+                m.lines()
+                    .any(|l| l.trim() == format!("# repo {}", installer::OPTI_UNLOCKED_REPO))
+            });
+        // OptiScaler's per-game choices come from that game's folder, not
+        // from whatever game was open before: the pre-SR build from the
+        // manifest's repo line, frame generation and the model resolution
+        // from its OptiScaler.ini.
+        let st = self.status.as_ref().and_then(|r| r.as_ref().ok()).cloned();
+        let manifest = st
+            .as_ref()
+            .and_then(|s| std::fs::read_to_string(s.game_dir().join(game::OPTI_MANIFEST)).ok())
+            .unwrap_or_default();
+        self.opti_presr = manifest
+            .lines()
+            .any(|l| l.trim() == format!("# repo {}", installer::OPTI_PRESR_REPO));
+        let ini = st
+            .as_ref()
+            .and_then(|s| std::fs::read_to_string(s.game_dir().join(installer::OPTI_INI)).ok())
+            .unwrap_or_default();
+        self.fg_on = installer::ini_value(&ini, "FrameGen", "Enabled")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+            && installer::ini_value(&ini, "FrameGen", "FGOutput")
+                .is_some_and(|v| v.eq_ignore_ascii_case("fsrfg"));
+        // Model resolution: what the game already runs at, else 75% on
+        // RTX 20/30 (the full-size pass costs them the most frame time and
+        // input latency, #112), except on the pre-SR and RTX 20/30 builds,
+        // which flicker below 100%.
+        let recorded = st
+            .as_ref()
+            .map(|g| g.game_dir().to_path_buf())
+            .as_deref()
+            .and_then(installer::opti_working_scale);
+        let tier = st.as_ref().and_then(|s| s.gpu.as_ref().map(|(_, t)| *t));
+        self.working_scale = match recorded {
+            Some(v) => v,
+            None if tier == Some(crate::gpu::Tier::Rtx2030)
+                && !self.opti_presr
+                && !self.ampere_mfg =>
+            {
+                0.75
+            }
+            None => 1.0,
+        };
+    }
+
+    fn sync_setup(&mut self, first: bool) {
+        let Some(st) = self.status.as_ref().and_then(|r| r.as_ref().ok()).cloned() else {
+            return;
+        };
+        // The build ticks come back the way the last Install left them (#101).
+        let tag = std::fs::read_to_string(st.consumer_dir().join(game::DLSS5_ADDON_MARKER))
+            .ok()
+            .map(|t| t.trim().to_owned());
+        if setup::hand_chosen(&st) {
+            self.advanced = true;
+            self.upstream_on = st.upstream;
+            self.consumer = installer::Consumer::Dlss5;
+            self.engine = if st.rtxmfg {
+                Engine::Mfg
+            } else if st.opti {
+                Engine::Opti
+            } else if st.aio {
+                Engine::Aio
+            } else {
+                Engine::ReShade
+            };
+            self.renodx_classic = tag.as_deref() == Some(installer::RENODX_CLASSIC_TAG);
+            self.renodx_steady = tag.as_deref() == Some(installer::RENODX_STEADY_TAG);
+        } else if let Some(p) = setup::current(&st) {
+            if first {
+                self.advanced = self.settings.advanced_open;
+            }
+            self.engine = p.engine;
+            self.consumer = p.consumer;
+            self.upstream_on = false;
+            self.renodx_classic = p.addon_tag == Some(installer::RENODX_CLASSIC_TAG);
+            self.renodx_steady = p.addon_tag == Some(installer::RENODX_STEADY_TAG);
+        } else if first {
+            // Nothing on the ladder fits (a Vulkan game with no DLSS of its
+            // own): nothing from the previous game carries over.
+            self.advanced = self.settings.advanced_open;
+            self.engine = Engine::ReShade;
+            self.upstream_on = false;
+            self.consumer = installer::Consumer::Dlss5;
+            self.renodx_classic = false;
+            self.renodx_steady = false;
+        }
     }
 
     fn reload_knobs_and_perf(&mut self) {
@@ -542,7 +666,12 @@ impl App {
             remix_swap: self.remix_swap_on,
             opti_presr: self.opti_presr,
             classic_addon: self.renodx_classic,
-            newest_addon: self.renodx_newest,
+            steady_addon: self.renodx_steady,
+            stable_only: self.settings.renodx_stable_only,
+            consumer: self.consumer,
+            // start_with decides whether a pin is the picker's; this base is
+            // only what the controls say.
+            picker_tag: None,
             ada_mfg: self.ada_mfg,
             ampere_mfg: self.ampere_mfg,
             upstream_preset: if self.upstream_on {
@@ -596,6 +725,38 @@ impl App {
     }
 
     fn start(&mut self, remove: Option<bool>) {
+        self.start_with(remove, None);
+    }
+
+    /// "Try the next setup": one rung down this game's ladder. A change of
+    /// engine takes the old one out first, since both load as dxgi.dll.
+    fn try_next_setup(&mut self) {
+        let Some(st) = self.status.as_ref().and_then(|r| r.as_ref().ok()) else {
+            return;
+        };
+        let Some((_, next)) = setup::next(st) else {
+            return;
+        };
+        let switch = setup::current(st).map(|c| c.engine) != Some(next.engine);
+        if switch {
+            // Taking ReShade out would strip add-ons this tool did not put
+            // there, and OptiScaler cannot go in beside ReShade: say so first,
+            // before anything is removed.
+            let foreign = installer::foreign_addons(st.game_dir());
+            if !foreign.is_empty() {
+                self.last_error = Some(format!(
+                    "The next setup is {}, a different engine, and switching takes ReShade out of this game, but it has ReShade add-ons this tool did not install ({}). Remove those by hand first, or choose a setup under Show advanced options.",
+                    setup::label(&next),
+                    foreign.join(", ")
+                ));
+                return;
+            }
+        }
+        self.advanced = false;
+        self.start_with(None, Some((next, switch)));
+    }
+
+    fn start_with(&mut self, remove: Option<bool>, forced: Option<(setup::Setup, bool)>) {
         // One install at a time: a second worker on the same folder would race
         // the first, and its channel would replace the first one's.
         if self.running {
@@ -604,8 +765,79 @@ impl App {
         let Some(exe) = self.exe() else { return };
         self.finishing_install = remove.is_none();
         self.launch_panel = None;
-        let engine = self.engine;
-        let extras = self.extras();
+        let st = self.status.as_ref().and_then(|r| r.as_ref().ok()).cloned();
+        let mut engine = self.engine;
+        let mut with_renodx = self.renodx_on;
+        let mut upstream = self.upstream_on;
+        let mut switch_engine = false;
+        // A build ticked under Advanced is the user's pin and holds against the
+        // driver-fault fallback; the picker's own pin gives way to it (#69).
+        let manual_tag = if self.renodx_classic {
+            Some(installer::RENODX_CLASSIC_TAG)
+        } else if self.renodx_steady {
+            Some(installer::RENODX_STEADY_TAG)
+        } else {
+            None
+        };
+        // Advanced closed: the picker's setup. Open: what the controls say.
+        let (chosen, picked) = match (&forced, &st) {
+            (Some((s, sw)), _) => {
+                switch_engine = *sw;
+                upstream = false;
+                (Some(*s), true)
+            }
+            (None, Some(g)) if remove.is_none() && !self.advanced => match setup::current(g) {
+                Some(s) => {
+                    upstream = false;
+                    (Some(s), true)
+                }
+                // Nothing on the ladder fits: install nothing the previous
+                // game's choice would have picked.
+                None => (None, true),
+            },
+            _ => (
+                Some(setup::Setup {
+                    engine,
+                    consumer: self.consumer,
+                    addon_tag: manual_tag,
+                }),
+                false,
+            ),
+        };
+        if let Some(s) = chosen {
+            engine = s.engine;
+        }
+        // A switch takes the RenoDX HDR mod out with everything else; put it
+        // back on the new setup when it was there. Only then: re-running the
+        // mod step on every Install would fail the install whenever the mod
+        // lookup does.
+        if switch_engine && st.as_ref().is_some_and(|g| g.renodx_mod.is_some()) {
+            with_renodx = true;
+        }
+        // Every choice reaches the steps through Extras. Nothing is written to
+        // the environment here: this runs while the UI thread reads it.
+        let extras = installer::Extras {
+            with_renodx,
+            upstream,
+            consumer: chosen
+                .map(|s| s.consumer)
+                .unwrap_or(installer::Consumer::Dlss5),
+            picker_tag: if picked {
+                chosen.and_then(|s| s.addon_tag)
+            } else {
+                None
+            },
+            classic_addon: !picked && self.renodx_classic,
+            steady_addon: !picked && self.renodx_steady,
+            stable_only: self.settings.renodx_stable_only,
+            ..self.extras()
+        };
+        let sf_route = engine == Engine::ReShade
+            && !upstream
+            && extras.consumer == installer::Consumer::ShortFuse
+            && st
+                .as_ref()
+                .is_some_and(|g| g.mode == game::Mode::Native && !g.is32());
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
         self.rx = Some(rx);
         self.running = true;
@@ -640,6 +872,14 @@ impl App {
             } else {
                 let p_tx = tx.clone();
                 let s_tx = tx.clone();
+                if switch_engine {
+                    if let Err(e) = installer::uninstall_all(&exe) {
+                        let _ = tx.send(Msg::Finished(Err(format!(
+                            "Could not take the previous setup out: {e:#}"
+                        ))));
+                        return;
+                    }
+                }
                 match installer::run_all(
                     &exe,
                     engine,
@@ -672,15 +912,23 @@ impl App {
                                 let _ = d_tx.send(Msg::Log(line));
                             }
                         }
-                        Ok(if engine == Engine::Opti {
+                        Ok(if engine == Engine::Mfg {
+                            "Done. In game: turn on the game's own DLSS Frame Generation; Backspace opens the RTXMFG menu.".to_owned()
+                        } else if engine == Engine::Opti {
                             "Done. In game: Insert opens the OptiScaler overlay → enable Neural Rendering.".to_owned()
+                        } else if sf_route {
+                            "Done. In game: Home opens ReShade → Add-ons tab → RenoDX DLSS → turn Neural Rendering on.".to_owned()
                         } else if engine == Engine::Aio {
                             "Done. In game: turn the game's own upscaling, anti-aliasing and frame generation off, run windowed; Home opens ReShade → Add-ons tab → Standalone DLSS-NR + SR.".to_owned()
                         } else {
                             "Done. In game: Home opens ReShade → Add-ons tab → DLSS 5 Neural Rendering → enable. (Home tab saying \"no effect files\" is normal on games with their own DLSS.)".to_owned()
                         })
                     }
-                    Err(e) => Err(format!("{e:#}")),
+                    Err(e) => Err(if switch_engine {
+                        format!("{e:#}\n\nThe previous setup was already taken out, so this game has none now. Press Install to set it up again from the top of its list, or open Show advanced options to choose one.")
+                    } else {
+                        format!("{e:#}")
+                    }),
                 }
             };
             let _ = tx.send(Msg::Finished(out));
@@ -744,24 +992,43 @@ impl App {
         self.meta_rx = Some(mrx);
         let ctx2 = ctx.clone();
         let g2 = games.clone();
+        let cached = load_meta_cache();
+        for (i, g) in games.iter().enumerate() {
+            if let Some(m) = cached.get(&cache_key(&g.dir)) {
+                self.meta.insert(i, m.clone());
+            }
+        }
         thread::spawn(move || {
             // One lookup for the whole scan; every game is then compared
             // against it by reading the markers this tool wrote.
             let latest = net::client()
                 .map(|c| installer::Latest::fetch(&c))
                 .unwrap_or_default();
-            for (i, g) in g2.iter().enumerate() {
+            // Games this tool changed last time go first, so their state is
+            // re-read before the long tail of untouched ones.
+            let mut order: Vec<usize> = (0..g2.len()).collect();
+            order.sort_by_key(|&i| {
+                !cached
+                    .get(&cache_key(&g2[i].dir))
+                    .is_some_and(|m| m.installed)
+            });
+            let mut fresh = HashMap::new();
+            for (n, i) in order.into_iter().enumerate() {
+                let g = &g2[i];
                 let meta = game::resolve_target(&g.dir)
+                    .inspect(|(exe, _)| crate::pcgw::warm(exe))
                     .and_then(|(exe, _)| game::inspect(&exe))
                     .ok()
                     .map(|st| meta_from_status(&st, &latest));
                 if let Some(m) = meta {
+                    fresh.insert(cache_key(&g.dir), m.clone());
                     let _ = mtx.send((i, m));
                 }
-                if i % 8 == 7 {
+                if n % 8 == 7 {
                     ctx2.request_repaint();
                 }
             }
+            save_meta_cache(&fresh);
             ctx2.request_repaint();
         });
         let ctx3 = ctx.clone();
@@ -842,9 +1109,11 @@ impl App {
     }
 
     /// Install / Update from a Games card: resolve Shipping exe, keep progress on the card.
-    fn update_game(&mut self, path: PathBuf, index: usize) {
+    /// Returns whether the install started; a game with problems does not, and
+    /// is left for the user to open on its Setup page.
+    fn update_game(&mut self, path: PathBuf, index: usize) -> bool {
         if self.running {
-            return;
+            return false;
         }
         // Prefer the canonical Shipping exe from meta when we already inspected it.
         let target = self.meta.get(&index).map(|m| m.exe.clone()).unwrap_or(path);
@@ -853,9 +1122,11 @@ impl App {
         if let Some(Ok(st)) = &self.status {
             if !st.problems.is_empty() {
                 self.page = Page::Setup;
-                return;
+                return false;
             }
-            self.engine = if st.opti {
+            self.engine = if st.rtxmfg {
+                Engine::Mfg
+            } else if st.opti {
                 Engine::Opti
             } else if st.aio {
                 Engine::Aio
@@ -868,8 +1139,40 @@ impl App {
             }
             self.updating = Some(index);
             self.start(None);
+            true
         } else {
             self.page = Page::Setup;
+            false
+        }
+    }
+
+    /// The folder (or exe) to install into for a library game: the folder, so
+    /// the exe finder ranks every candidate (a store's launch exe can be a
+    /// bootstrapper, #29), and the store's exe when nothing is found.
+    fn launch_path(g: &library::Game) -> PathBuf {
+        match game::resolve_target(&g.dir) {
+            Ok(_) => g.dir.clone(),
+            Err(_) => match &g.exe_hint {
+                Some(e) if e.is_file() && game::exe_bitness(e).is_ok() => e.clone(),
+                _ => g.dir.clone(),
+            },
+        }
+    }
+
+    /// Run the next game of "Update all" once nothing else is installing.
+    fn step_update_queue(&mut self) {
+        if self.running || self.update_queue.is_empty() {
+            return;
+        }
+        let i = self.update_queue.remove(0);
+        let Some(path) = self.games.get(i).map(Self::launch_path) else {
+            return;
+        };
+        let page = self.page;
+        // A game that cannot start (problems) must not pull the user off the
+        // Games page in the middle of a batch.
+        if !self.update_game(path, i) {
+            self.page = page;
         }
     }
 
@@ -887,6 +1190,7 @@ impl App {
                 .map(|c| installer::Latest::fetch(&c))
                 .unwrap_or_default();
             if let Some(m) = game::resolve_target(&g.dir)
+                .inspect(|(exe, _)| crate::pcgw::warm(exe))
                 .and_then(|(exe, _)| game::inspect(&exe))
                 .ok()
                 .map(|st| meta_from_status(&st, &latest))
@@ -1188,7 +1492,15 @@ impl App {
         if let Some(r) = finished {
             self.rx = None;
             self.running = false;
-            if let Some(i) = self.updating.take() {
+            // The card to re-read: the one the install was started from, else
+            // the one for the game on the Setup page (an install or Remove
+            // started there used to leave its card showing the old setup until
+            // a full rescan).
+            let current = match &self.status {
+                Some(Ok(st)) => card_for_exe(&st.exe, &self.games),
+                _ => None,
+            };
+            if let Some(i) = self.updating.take().or(current) {
                 self.pending_refresh = Some(i);
             }
             match r {
@@ -1216,6 +1528,24 @@ impl App {
             self.refresh();
         }
     }
+}
+
+/// The library card a game exe belongs to: the one whose folder holds it, and
+/// the deepest such folder when one library folder sits inside another.
+fn card_for_exe(exe: &Path, games: &[library::Game]) -> Option<usize> {
+    let norm = |p: &Path| p.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+    let e = norm(exe);
+    games
+        .iter()
+        .enumerate()
+        .filter_map(|(i, g)| {
+            let d = norm(&g.dir);
+            let d = d.trim_end_matches('/');
+            (e.len() > d.len() && e.starts_with(d) && e.as_bytes()[d.len()] == b'/')
+                .then_some((d.len(), i))
+        })
+        .max()
+        .map(|(_, i)| i)
 }
 
 struct Tile {
@@ -1265,6 +1595,12 @@ const TILES_FEEDER: [Tile; 6] = [
 ];
 
 /// Same Feeder row as above, but the in-game half is addon32 on 32-bit titles.
+const TILE_FEEDER_HELPER: Tile = Tile {
+    title: "DLSS5-Feeder",
+    detail: "dlss5-feed-helper.addon64 (64-bit helper mode) \u{00b7} DLSS5_Feed.fx",
+    ok: |s| s.feeder,
+    optional: false,
+};
 const TILE_FEEDER32: Tile = Tile {
     title: "DLSS5-Feeder",
     detail: "dlss5-feed.addon32 · DLSS5_Feed.fx (detail residual + Optical Flow)",
@@ -1276,6 +1612,13 @@ const TILE_AIO: Tile = Tile {
     title: "Standalone AIO \u{00b7} experimental",
     detail: "standalone-dlssnr.addon64 + nvngx.dll (kibblerz) \u{00b7} nvngx_dlssnr.dll",
     ok: |s| s.aio && s.dlssnr,
+    optional: false,
+};
+
+const TILE_RTXMFG: Tile = Tile {
+    title: "Universal RTXMFG \u{00b7} experimental",
+    detail: "RTXMFG.dll (dashdogy) under the game's proxy name \u{00b7} no ReShade, no DLSS 5",
+    ok: |s| s.rtxmfg,
     optional: false,
 };
 
@@ -1340,6 +1683,13 @@ const TILE_UPSTREAM: Tile = Tile {
     optional: false,
 };
 
+const TILE_SF: Tile = Tile {
+    title: "ShortFuse's DLSS add-on",
+    detail: "renodx-dlss.addon64 (ShortFuse) \u{00b7} nvngx_dlssnr.dll",
+    ok: |s| s.sf && s.dlssnr,
+    optional: false,
+};
+
 const TILE_REMIX_MODEL: Tile = Tile {
     title: "DLSS 5 model in .trex",
     detail: "nvngx_dlssnr.dll placed inside the RTX Remix runtime",
@@ -1355,7 +1705,7 @@ const TILE_REMIX_ON: Tile = Tile {
 };
 
 const TILE_HOST: Tile = Tile {
-    title: "host64 helper (32-bit game)",
+    title: "host64 helper (32-bit game or 64-bit DX10)",
     detail: "dlss5-feed-host64.exe + 64-bit ReShade · add-on and models live in host64\\",
     ok: |s| s.host_exe && s.host_reshade,
     optional: false,
@@ -1411,9 +1761,10 @@ fn tiles_for(
     engine: Engine,
     renodx_on: bool,
     upstream_on: bool,
+    sf_on: bool,
     mfg_on: bool,
 ) -> Vec<&'static Tile> {
-    let mut v = base_tiles(st, engine, upstream_on);
+    let mut v = base_tiles(st, engine, upstream_on, sf_on);
     // A Remix game's status is only the two Remix tiles.
     if st.is_some_and(|s| s.remix.is_some()) {
         return v;
@@ -1421,7 +1772,7 @@ fn tiles_for(
     if st.is_some_and(|s| s.re_engine) {
         v.insert(0, &TILE_REFRAMEWORK);
     }
-    if st.is_some_and(|s| s.is32()) {
+    if st.is_some_and(|s| s.uses_host()) {
         v.insert(1, &TILE_HOST);
     }
     if renodx_on || st.is_some_and(|s| s.renodx_mod.is_some()) {
@@ -1433,9 +1784,17 @@ fn tiles_for(
     v
 }
 
-fn base_tiles(st: Option<&GameStatus>, engine: Engine, upstream_on: bool) -> Vec<&'static Tile> {
+fn base_tiles(
+    st: Option<&GameStatus>,
+    engine: Engine,
+    upstream_on: bool,
+    sf_on: bool,
+) -> Vec<&'static Tile> {
     if st.is_some_and(|s| s.remix.is_some()) {
         return vec![&TILE_REMIX_MODEL, &TILE_REMIX_ON];
+    }
+    if engine == Engine::Mfg || st.is_some_and(|s| s.rtxmfg) {
+        return vec![&TILE_RTXMFG];
     }
     if engine == Engine::Aio || st.is_some_and(|s| s.aio && !s.opti) {
         return vec![&TILES_NATIVE[1], &TILE_AIO, &TILE_AIO_RUNTIME];
@@ -1445,14 +1804,17 @@ fn base_tiles(st: Option<&GameStatus>, engine: Engine, upstream_on: bool) -> Vec
             vec![&TILES_NATIVE[0], &TILE_OPTI, &TILE_OPTI_MODEL]
         }
         Some(game::Mode::Native) => {
-            let needs_bridge = st.is_some_and(|s| s.needs_bridge());
             let upstream = upstream_on || st.is_some_and(|s| s.upstream);
+            let sf = !upstream && (sf_on || st.is_some_and(|s| s.sf && !s.dlss5_addon));
+            let needs_bridge = st.is_some_and(|s| s.needs_bridge()) && !sf;
             TILES_NATIVE
                 .iter()
                 .filter(|t| t.title != "DX11 bridge" || needs_bridge)
                 .map(|t| {
                     if upstream && t.title == "DLSS 5 add-on \u{00b7} leaked" {
                         &TILE_UPSTREAM
+                    } else if sf && t.title == "DLSS 5 add-on \u{00b7} leaked" {
+                        &TILE_SF
                     } else {
                         t
                     }
@@ -1462,7 +1824,9 @@ fn base_tiles(st: Option<&GameStatus>, engine: Engine, upstream_on: bool) -> Vec
         _ => TILES_FEEDER
             .iter()
             .map(|t| {
-                if t.title == "DLSS5-Feeder" && st.is_some_and(|s| s.is32()) {
+                if t.title == "DLSS5-Feeder" && st.is_some_and(|s| s.helper) {
+                    &TILE_FEEDER_HELPER
+                } else if t.title == "DLSS5-Feeder" && st.is_some_and(|s| s.is32()) {
                     &TILE_FEEDER32
                 } else {
                     t
@@ -1799,6 +2163,19 @@ impl App {
                         self.add_game(p, ui.ctx());
                     }
                 }
+                let sort_label = if self.settings.sort_newest {
+                    "Sort: Newest"
+                } else {
+                    "Sort: A-Z"
+                };
+                if ui
+                    .add(btn(sort_label, false))
+                    .on_hover_text("Switch between alphabetical and newest install first")
+                    .clicked()
+                {
+                    self.settings.sort_newest = !self.settings.sort_newest;
+                    let _ = self.settings.save();
+                }
                 let search = egui::TextEdit::singleline(&mut self.search)
                     .font(t::plex(12.0))
                     .hint_text(RichText::new("Search").color(t::TEXT_DIM))
@@ -1813,6 +2190,7 @@ impl App {
         let mut clicked: Option<(PathBuf, usize)> = None;
         let mut forgotten: Option<PathBuf> = None;
         let mut update = false;
+        let mut update_all = false;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -1827,7 +2205,7 @@ impl App {
                 // None = "Installed by this tool", always first: the whole
                 // point is to see at a glance what has been modified and
                 // what has fallen behind.
-                let sections: [Option<Store>; 7] = [
+                let sections: [Option<Store>; 9] = [
                     None,
                     Some(Store::Manual),
                     Some(Store::Steam),
@@ -1835,9 +2213,11 @@ impl App {
                     Some(Store::Gog),
                     Some(Store::Xbox),
                     Some(Store::Lutris),
+                    Some(Store::Ea),
+                    Some(Store::Ubisoft),
                 ];
                 for section in sections {
-                    let idx: Vec<usize> = self
+                    let mut idx: Vec<usize> = self
                         .games
                         .iter()
                         .enumerate()
@@ -1856,14 +2236,28 @@ impl App {
                     if idx.is_empty() {
                         continue;
                     }
+                    if self.settings.sort_newest {
+                        idx.sort_by_cached_key(|&i| {
+                            (
+                                std::cmp::Reverse(self.games[i].installed),
+                                self.games[i].title.to_lowercase(),
+                            )
+                        });
+                    } else {
+                        idx.sort_by_cached_key(|&i| self.games[i].title.to_lowercase());
+                    }
                     let ready = idx
                         .iter()
                         .filter(|i| self.meta.get(i).is_some_and(|m| m.ready))
                         .count();
-                    let stale = idx
+                    let stale_idx: Vec<usize> = idx
                         .iter()
+                        .copied()
                         .filter(|i| self.meta.get(i).is_some_and(|m| !m.stale.is_empty()))
-                        .count();
+                        .collect();
+                    let stale = stale_idx.len();
+                    let batch_busy = self.running || !self.update_queue.is_empty();
+                    let queued = self.update_queue.len();
                     ui.horizontal(|ui| {
                         ui.set_max_width(avail);
                         ui.spacing_mut().item_spacing.x = 8.0;
@@ -1882,6 +2276,18 @@ impl App {
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if stale > 0 {
+                                let label = if queued > 0 {
+                                    format!("Updating\u{2026} {queued} more")
+                                } else {
+                                    format!("Update all ({stale})")
+                                };
+                                if ui
+                                    .add_enabled(!batch_busy, egui::Button::new(label))
+                                    .on_hover_text("Update every game listed here that is out of date, one after another")
+                                    .clicked()
+                                {
+                                    update_all = true;
+                                }
                                 ui.label(
                                     RichText::new(format!("{stale} need updating"))
                                         .font(t::plex(11.5))
@@ -1913,21 +2319,7 @@ impl App {
                             }
                             if matches!(action, CardAction::Open | CardAction::Update) {
                                 update = action == CardAction::Update;
-                                let g = &self.games[i];
-                                // The folder, so the exe finder ranks every candidate:
-                                // a store's launch exe can be a bootstrapper (Epic names
-                                // Satisfactory's FactoryGameEGS.exe, the real one is the
-                                // -Shipping.exe under Engine\Binaries\Win64, #29). The
-                                // store's exe is the fallback when nothing is found.
-                                let path = match game::resolve_target(&g.dir) {
-                                    Ok(_) => g.dir.clone(),
-                                    Err(_) => match &g.exe_hint {
-                                        Some(e) if e.is_file() && game::exe_bitness(e).is_ok() => {
-                                            e.clone()
-                                        }
-                                        _ => g.dir.clone(),
-                                    },
-                                };
+                                let path = Self::launch_path(&self.games[i]);
                                 clicked = Some((path, i));
                             }
                         }
@@ -1961,6 +2353,16 @@ impl App {
             } else {
                 self.open_game(p);
             }
+        }
+        if update_all {
+            // Every game on the page that shows an update, in the order shown.
+            self.update_queue = (0..self.games.len())
+                .filter(|i| {
+                    self.meta
+                        .get(i)
+                        .is_some_and(|m| m.installed && !m.stale.is_empty())
+                })
+                .collect();
         }
     }
 
@@ -2073,7 +2475,7 @@ impl App {
             };
             for (on, label) in [
                 (m.has_dlss, Some(dlss_label)),
-                (m.addon || m.installed, Some(m.engine_path)),
+                (m.addon || m.installed, Some(m.engine_path.as_str())),
                 (m.ready && m.stale.is_empty(), ready_label),
             ] {
                 let Some(label) = label else { continue };
@@ -2102,11 +2504,12 @@ impl App {
                 );
                 x += 11.0 + galley.size().x + 10.0;
             }
-            // Caps + warnings as tiny chips under the band (hover text carries detail).
+            // Warning mark under the DirectX chip: the Install / Re-install button
+            // sits over the bottom of the poster, and the mark used to be under it.
             if m.shaders_missing || m.wrong_folder.is_some() {
                 let warn = p.layout_no_wrap("!".to_owned(), t::plex_semibold(10.0), t::BG);
                 let badge = egui::Rect::from_min_size(
-                    egui::pos2(poster.right() - 22.0, poster.bottom() - 48.0),
+                    egui::pos2(poster.right() - 22.0, poster.top() + 34.0),
                     warn.size() + Vec2::new(10.0, 4.0),
                 );
                 p.rect_filled(badge, CornerRadius::same(6), t::WARN);
@@ -2451,18 +2854,14 @@ impl App {
                 .color(t::TEXT),
         );
         if self.knobs.is_none() {
-            if let Some(err) = &self.knobs_err {
+            if self.knobs_err.is_some() {
+                // The Install button above is the one to press; a second one
+                // here read as two different installs (#77).
                 ui.label(
-                    RichText::new(err.clone())
+                    RichText::new("These appear once DLSS5-Feeder is installed in this game.")
                         .font(t::plex(12.0))
                         .color(t::TEXT_MUTED),
                 );
-                if ui
-                    .add_enabled(!self.running, egui::Button::new("Install DLSS 5"))
-                    .clicked()
-                {
-                    self.start(None);
-                }
             } else {
                 ui.label(
                     RichText::new("Select a game first.")
@@ -2555,11 +2954,16 @@ impl App {
 }
 
 /// The stores' own marks (Simple Icons, CC0 1.0), white PNGs tinted at paint time.
-const STORE_ICON_PNG: [(Store, &[u8]); 4] = [
+const STORE_ICON_PNG: [(Store, &[u8]); 6] = [
     (Store::Steam, include_bytes!("../assets/store-steam.png")),
     (Store::Xbox, include_bytes!("../assets/store-xbox.png")),
     (Store::Epic, include_bytes!("../assets/store-epic.png")),
     (Store::Gog, include_bytes!("../assets/store-gog.png")),
+    (Store::Ea, include_bytes!("../assets/store-ea.png")),
+    (
+        Store::Ubisoft,
+        include_bytes!("../assets/store-ubisoft.png"),
+    ),
 ];
 
 fn load_store_icons(ctx: &egui::Context) -> HashMap<Store, egui::TextureHandle> {
@@ -2625,8 +3029,8 @@ fn about_page(ui: &mut egui::Ui) {
             "https://github.com/umar-afzaal/LumeniteFX",
         ),
         (
-            "RankFTW — RHI and rhi-repo",
-            "https://github.com/RankFTW/RHI",
+            "RankFTW — rhi-repo (DLSS 5 add-on and NVIDIA runtimes)",
+            "https://github.com/RankFTW/rhi-repo",
         ),
         (
             "NIGos — dlss5-bridge",
@@ -2678,14 +3082,23 @@ impl eframe::App for App {
         if let Some(i) = self.pending_refresh.take() {
             self.refresh_one(i, ui.ctx());
         }
+        self.step_update_queue();
         if let Some(rx) = &self.meta_one_rx {
             if let Ok((i, m)) = rx.try_recv() {
+                if let Some(g) = self.games.get(i) {
+                    let mut cache = load_meta_cache();
+                    cache.insert(cache_key(&g.dir), m.clone());
+                    save_meta_cache(&cache);
+                }
                 self.meta.insert(i, m);
                 self.meta_one_rx = None;
             }
         }
         self.maybe_recheck_update();
-        if self.running || matches!(self.renodx, RenodxLookup::Pending) {
+        if self.running
+            || !self.update_queue.is_empty()
+            || matches!(self.renodx, RenodxLookup::Pending)
+        {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -3286,9 +3699,9 @@ impl eframe::App for App {
                 {
                     ui.label(
                         RichText::new(
-                            "DirectX 9: Install will download dgVoodoo 2.87.3 into the game folder \
+                            "DirectX 9: Install will download dgVoodoo 2.87.5 into the game folder \
                              first (official GitHub release → d3d9.dll + dgVoodoo.conf), then continue \
-                             with ReShade / Feeder. / DirectX 9: Install сначала скачает dgVoodoo 2.87.3 \
+                             with ReShade / Feeder. / DirectX 9: Install сначала скачает dgVoodoo 2.87.5 \
                              в папку игры, затем продолжит установку.",
                         )
                         .font(t::plex(12.0))
@@ -3347,16 +3760,138 @@ impl eframe::App for App {
                         self.inspect_resolved();
                     }
                 }
-                // Driver 616.64 faults inside NGX with the current add-on build;
-                // the classic one is the way through until that is fixed (#69).
-                if self.engine == Engine::ReShade
+                // ── the setup this game gets ─────────────────────
+                // One line saying what Install will do and why; everything that
+                // could change it lives under Advanced, closed by default.
+                if let Some(g) = &ok_status {
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(
+                            RichText::new("SETUP")
+                                .font(t::plex_semibold(11.0))
+                                .color(t::TEXT_MUTED),
+                        );
+                        let hand = setup::hand_label(g);
+                        match setup::current(g) {
+                            _ if hand.is_some() => {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "chosen by hand: {}",
+                                        hand.clone().unwrap_or_default()
+                                    ))
+                                    .font(t::plex_medium(13.0))
+                                    .color(t::TEXT_SOFT),
+                                );
+                            }
+                            Some(p) if !self.advanced => {
+                                ui.label(
+                                    RichText::new(setup::label(&p))
+                                        .font(t::plex_medium(13.0))
+                                        .color(t::TEXT),
+                                );
+                                let n = setup::ladder(g).len();
+                                if n > 1 {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "option {} of {n}",
+                                            setup::level(g) + 1
+                                        ))
+                                        .font(t::plex(11.0))
+                                        .color(t::TEXT_DIM),
+                                    );
+                                }
+                            }
+                            Some(_) => {
+                                ui.label(
+                                    RichText::new("chosen by hand below (Advanced)")
+                                        .font(t::plex_medium(13.0))
+                                        .color(t::TEXT_SOFT),
+                                );
+                            }
+                            None => {
+                                ui.label(
+                                    RichText::new("none of this tool's setups fits this game")
+                                        .font(t::plex_medium(13.0))
+                                        .color(t::WARN),
+                                );
+                            }
+                        }
+                    });
+                    ui.label(
+                        RichText::new(setup::reason(g))
+                            .font(t::plex(11.0))
+                            .color(t::TEXT_DIM),
+                    );
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        // Offered once something is installed: the answer to
+                        // "it did not work" is the next rung, not a menu.
+                        if g.complete() && !self.advanced {
+                            if let Some((_, nx)) = setup::next(g) {
+                                let b = egui::Button::new(
+                                    RichText::new(format!(
+                                        "Not working? Try the next setup: {}",
+                                        setup::label(&nx)
+                                    ))
+                                    .font(t::plex_medium(12.0))
+                                    .color(t::TEXT_SOFT),
+                                )
+                                .stroke(Stroke::new(1.0, t::BORDER_STRONG))
+                                .corner_radius(CornerRadius::same(8));
+                                if ui.add_enabled(!self.running, b).clicked() {
+                                    self.try_next_setup();
+                                }
+                            }
+                        }
+                        let hand = setup::hand_chosen(g);
+                        // A real button in text the app's font can draw: the
+                        // arrow glyphs came out as empty boxes, and a frameless
+                        // grey label did not read as clickable.
+                        let adv = egui::Button::new(
+                            RichText::new(if self.advanced && !hand {
+                                "Hide advanced options (back to the automatic setup)"
+                            } else if self.advanced {
+                                "Advanced options (this setup was chosen by hand)"
+                            } else {
+                                "Show advanced options"
+                            })
+                            .font(t::plex_medium(12.0))
+                            .color(t::TEXT_SOFT),
+                        )
+                        .stroke(Stroke::new(1.0, t::BORDER_STRONG))
+                        .corner_radius(CornerRadius::same(8));
+                        // A setup picked by hand has no automatic one to go back
+                        // to: Advanced stays open for it.
+                        if ui.add_enabled(!self.running && !hand, adv).clicked() {
+                            self.advanced = !self.advanced;
+                            // Remembered for the next game and the next start (#77).
+                            self.settings.advanced_open = self.advanced;
+                            let _ = self.settings.save();
+                            if !self.advanced {
+                                // Closing Advanced returns to the picker's
+                                // setup and the game's own options.
+                                self.load_game_options();
+                                self.sync_setup(false);
+                            }
+                        }
+                    });
+                }
+                if self.advanced
+                    && self.engine == Engine::ReShade
+                    && !self.upstream_on
                     && !ok_status.as_ref().is_some_and(|s| s.remix.is_some())
+                    && (self.consumer == installer::Consumer::Dlss5
+                        || ok_status.as_ref().is_some_and(|s| s.mode == game::Mode::Feeder || s.is32()))
                 {
+                    // Driver 616.64 faults inside NGX with newer add-on builds;
+                    // the classic one is the way through there (#69).
                     let mut on = self.renodx_classic;
                     let cb = egui::Checkbox::new(
                         &mut on,
                         RichText::new(
-                            "Black screen, crash, driver reset, or worse image than before? Install the classic add-on build (4.55)",
+                            "DLSS 5 add-on: install the classic build (4.55) \u{2014} for a black screen, crash or driver reset",
                         )
                         .font(t::plex(11.5))
                         .color(t::TEXT_SOFT),
@@ -3364,13 +3899,11 @@ impl eframe::App for App {
                     if ui.add_enabled(!self.running, cb).changed() {
                         self.renodx_classic = on;
                     }
-                    // The default is 4.70; the newest rhi-repo build is the
-                    // opt-in since 5.2.1 broke four games in three days.
-                    let mut newest = self.renodx_newest;
+                    let mut steady = self.renodx_steady;
                     let cb = egui::Checkbox::new(
-                        &mut newest,
+                        &mut steady,
                         RichText::new(
-                            "Try the newest add-on build (5.2.1 or later) instead of the default 4.70 \u{2014} multi-pass sliders, new colour codec; crashes or blown-out colours reported in some games",
+                            "DLSS 5 add-on: install 4.70 instead of the newest build \u{2014} the last one with Enable Upscaling; the newer builds broke some games",
                         )
                         .font(t::plex(11.5))
                         .color(t::TEXT_SOFT),
@@ -3379,7 +3912,24 @@ impl eframe::App for App {
                         .add_enabled(!self.running && !self.renodx_classic, cb)
                         .changed()
                     {
-                        self.renodx_newest = newest;
+                        self.renodx_steady = steady;
+                    }
+                    // Saved with the settings: it applies to every game (#77).
+                    let mut stable = self.settings.renodx_stable_only;
+                    let cb = egui::Checkbox::new(
+                        &mut stable,
+                        RichText::new(
+                            "DLSS 5 add-on: stable builds only \u{2014} skip release candidates (8.5.0-rc and similar test builds) when installing or updating to the newest build",
+                        )
+                        .font(t::plex(11.5))
+                        .color(t::TEXT_SOFT),
+                    );
+                    if ui
+                        .add_enabled(!self.running && !self.renodx_classic && !self.renodx_steady, cb)
+                        .changed()
+                    {
+                        self.settings.renodx_stable_only = stable;
+                        let _ = self.settings.save();
                     }
                 }
                 // RTX 40 multi-frame generation on the ReShade route: a single
@@ -3388,7 +3938,8 @@ impl eframe::App for App {
                 // reporter's machine while this one reached 6X (#83). Offered to
                 // an RTX 40; disabled, with the reason, where it cannot work.
                 if let Some(s) = ok_status.as_ref().filter(|s| {
-                    self.engine == Engine::ReShade
+                    self.advanced
+                        && self.engine == Engine::ReShade
                         && s.remix.is_none()
                         && s.gpu.as_ref().is_some_and(|(_, t)| *t == crate::gpu::Tier::Rtx40)
                 }) {
@@ -3397,7 +3948,7 @@ impl eframe::App for App {
                     let cb = egui::Checkbox::new(
                         &mut on,
                         RichText::new(
-                            "Unlock RTX 40 multi-frame generation (3X and above, up to 6X) — the game must have frame generation of its own",
+                            "Unlock RTX 40 multi-frame generation (3X and above, up to 6X) \u{2014} the game must have frame generation of its own",
                         )
                         .font(t::plex(11.5))
                         .color(t::TEXT_SOFT),
@@ -3479,6 +4030,7 @@ impl eframe::App for App {
                     }
                 }
 
+                if self.advanced {
                 // ── engine chooser ───────────────────────────────
                 let native = ok_status.as_ref().is_some_and(|s| s.mode == game::Mode::Native);
                 if !native && self.engine == Engine::Opti {
@@ -3602,6 +4154,36 @@ impl eframe::App for App {
                         self.engine = Engine::Aio;
                     }
                 }
+                // Multi-frame generation without DLSS 5: dashdogy's RTXMFG as
+                // one DLL, no ReShade. It takes the place of the cards above.
+                let mfg_ok = ok_status
+                    .as_ref()
+                    .is_some_and(|s| !s.is32() && game::rtxmfg_proxy_name(s.api).is_some());
+                if !mfg_ok && self.engine == Engine::Mfg {
+                    self.engine = Engine::ReShade;
+                }
+                ui.add_space(6.0);
+                {
+                    let mut only = self.engine == Engine::Mfg;
+                    let cb = egui::Checkbox::new(
+                        &mut only,
+                        RichText::new(
+                            "Multi-frame generation only \u{00b7} experimental: install Universal RTXMFG (dashdogy) and nothing else, no DLSS 5 and no ReShade. The game must have DLSS Frame Generation of its own; Backspace opens its menu",
+                        )
+                        .font(t::plex(11.5))
+                        .color(t::TEXT_SOFT),
+                    );
+                    if ui.add_enabled(mfg_ok && !self.running, cb).changed() {
+                        self.engine = if only { Engine::Mfg } else { Engine::ReShade };
+                    }
+                    if !mfg_ok {
+                        ui.label(
+                            RichText::new("64-bit DirectX 11/12 and Vulkan games only.")
+                                .font(t::plex(11.0))
+                                .color(t::TEXT_DIM),
+                        );
+                    }
+                }
                 if self.engine == Engine::Opti {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
@@ -3691,6 +4273,10 @@ impl eframe::App for App {
                         );
                         if ui.add_enabled(!self.running, cb).changed() {
                             self.ampere_mfg = on;
+                            // That build flickers below 100% model resolution.
+                            if on {
+                                self.working_scale = 1.0;
+                            }
                         }
                         if self.ampere_mfg {
                             ui.label(
@@ -3750,6 +4336,20 @@ impl eframe::App for App {
                             .color(t::TEXT_DIM),
                         );
                     });
+                    // wilsjo2's pre-SR fork, and ShyVortex's build made from it,
+                    // hand the model colour at the working size but depth and
+                    // motion at full size below 100%, so the picture flickers
+                    // and keeps settling after the camera stops (DLSS5-Feeder
+                    // 1.17.0-beta.2 notes; fixed in jlrouzies-fr's v0.8.92).
+                    if self.working_scale < 0.99 && (self.opti_presr || self.ampere_mfg) {
+                        ui.label(
+                            RichText::new(
+                                "This OptiScaler build flickers and keeps settling after the camera stops at any model resolution below 100% (a known bug in the pre-SR fork it is built on). Pick 100% if you see that.",
+                            )
+                            .font(t::plex(11.0))
+                            .color(t::WARN),
+                        );
+                    }
                 }
                 if self.engine == Engine::ReShade {
                     ui.add_space(6.0);
@@ -3765,9 +4365,9 @@ impl eframe::App for App {
                         );
                         ui.label(
                             RichText::new(if native {
-                                "\u{2014} both run DLSS 5; they differ in where the network runs"
+                                "\u{2014} all of them run DLSS 5; the DLSS 5 add-on is the default for a game with its own DLSS"
                             } else {
-                                "\u{2014} only the stable add-on works in a game with no DLSS of its own"
+                                "\u{2014} only the DLSS 5 add-on works in a game with no DLSS of its own"
                             })
                             .font(t::plex(11.0))
                             .color(t::TEXT_DIM),
@@ -3776,15 +4376,47 @@ impl eframe::App for App {
                     let gap = 8.0;
                     let row_w = ui.available_width();
                     let col_w = ((row_w - gap) / 2.0).floor();
-                    let stable_title = "Stable \u{2014} RenoDX DLSS 5 add-on";
+                    // ShortFuse's add-on: the RenoDX author's own consumer, for
+                    // 64-bit games with DLSS of their own.
+                    let sf_ok = native && ok_status.as_ref().is_some_and(|s| !s.is32());
+                    if !sf_ok && self.consumer == installer::Consumer::ShortFuse {
+                        self.consumer = installer::Consumer::Dlss5;
+                    }
+                    let sf_title = "ShortFuse's DLSS add-on";
+                    let sf_lines = [
+                        "From the author of RenoDX. Hooks the game's own DLSS in DX11 and DX12, so no bridge.",
+                        "In game: Home \u{2192} Add-ons \u{2192} RenoDX DLSS.",
+                    ];
+                    let sf_note = if sf_ok {
+                        ""
+                    } else {
+                        "Needs a 64-bit game with its own DLSS."
+                    };
+                    let sf_h = engine_card_height(ui, col_w, sf_title, &sf_lines, sf_note);
+                    let (sf_row, _) =
+                        ui.allocate_exact_size(Vec2::new(row_w, sf_h), egui::Sense::hover());
+                    if engine_card(
+                        ui,
+                        egui::Rect::from_min_size(sf_row.min, Vec2::new(col_w, sf_h)),
+                        !self.upstream_on && self.consumer == installer::Consumer::ShortFuse,
+                        sf_ok,
+                        sf_title,
+                        &sf_lines,
+                        sf_note,
+                    ) {
+                        self.upstream_on = false;
+                        self.consumer = installer::Consumer::ShortFuse;
+                    }
+                    ui.add_space(gap);
+                    let stable_title = "Default \u{2014} RenoDX DLSS 5 add-on";
                     let stable_lines = [
-                        "The proven route. The network runs after the upscaler, at output resolution.",
+                        "Newest build. On 8.x it runs before the game's upscale (Render hook point), set for you.",
                         "In game: Home \u{2192} Add-ons \u{2192} DLSS 5 Neural Rendering.",
                     ];
                     let up_title = "Experimental \u{2014} Neural Upstream";
                     let up_lines = [
                         "Runs the network before the upscaler, at render resolution, so it costs less.",
-                        "Replaces the add-on on the left. Read the warning below first.",
+                        "Replaces the other add-ons. Read the warning below first.",
                     ];
                     let up_note = if native {
                         ""
@@ -3803,13 +4435,14 @@ impl eframe::App for App {
                     if engine_card(
                         ui,
                         left,
-                        !self.upstream_on,
+                        !self.upstream_on && self.consumer == installer::Consumer::Dlss5,
                         true,
                         stable_title,
                         &stable_lines,
                         "",
                     ) {
                         self.upstream_on = false;
+                        self.consumer = installer::Consumer::Dlss5;
                     }
                     if engine_card(
                         ui,
@@ -3890,6 +4523,7 @@ impl eframe::App for App {
                             });
                     }
                 }
+                }
                 // The engine card's own border ended flush against this
                 // heading, which read as the two touching (#77).
                 ui.add_space(12.0);
@@ -3904,11 +4538,22 @@ impl eframe::App for App {
                 let tile_h = 44.0;
                 let row_w = ui.available_width();
                 let col_w = ((row_w - gap) / 2.0).floor();
+                // Which consumer the tile list shows: the picked one when
+                // Advanced is closed, the chosen card when it is open.
+                let sf_on = if self.advanced {
+                    self.consumer == installer::Consumer::ShortFuse
+                } else {
+                    ok_status
+                        .as_ref()
+                        .and_then(setup::current)
+                        .is_some_and(|p| p.engine == Engine::ReShade && p.consumer == installer::Consumer::ShortFuse)
+                };
                 let tiles = tiles_for(
                     ok_status.as_ref(),
                     self.engine,
                     self.renodx_on,
-                    self.upstream_on,
+                    self.upstream_on && self.advanced,
+                    sf_on,
                     self.ada_mfg && self.engine == Engine::ReShade,
                 );
                 for row in tiles.chunks(2) {
@@ -4240,6 +4885,7 @@ impl eframe::App for App {
                 if ok_status
                     .as_ref()
                     .is_some_and(|s| s.mode == game::Mode::Feeder && s.remix.is_none())
+                    && self.engine == Engine::ReShade
                 {
                     self.knobs_panel(ui);
                 }
@@ -4517,7 +5163,7 @@ mod tests {
         st.opti = true;
         st.dlssnr = true;
         assert!(st.complete());
-        let tiles = tiles_for(Some(&st), Engine::Opti, false, false, false);
+        let tiles = tiles_for(Some(&st), Engine::Opti, false, false, false, false);
         let missing: Vec<&str> = tiles
             .iter()
             .filter(|t| !(t.ok)(&st) && !t.optional)
@@ -4533,7 +5179,7 @@ mod tests {
         let mut st = stub_status(Mode::Native, Api::Dx11);
         st.reshade = true;
         st.dlssnr = true;
-        let tiles = tiles_for(Some(&st), Engine::ReShade, false, false, false);
+        let tiles = tiles_for(Some(&st), Engine::ReShade, false, false, false, false);
         assert!(tiles
             .iter()
             .any(|t| t.title == "DLSS 5 add-on \u{00b7} leaked" && !(t.ok)(&st)));
@@ -4572,5 +5218,73 @@ mod tests {
         assert_eq!(heights.1, 74.0);
         // Nothing wraps at 1000 px.
         assert_eq!(heights.2, 74.0);
+    }
+
+    fn game_at(dir: &str) -> library::Game {
+        library::Game {
+            title: dir.to_owned(),
+            store: Store::Steam,
+            dir: PathBuf::from(dir),
+            exe_hint: None,
+            installed: std::time::SystemTime::UNIX_EPOCH,
+            poster: library::Poster::SteamCdn(0),
+        }
+    }
+
+    /// An install started from the Setup page refreshes the card of the game it
+    /// was for, found from the exe: deep exes, the deepest folder, and no
+    /// prefix-of-a-name false matches.
+    /// The saved library state survives a write and a read, so the installed
+    /// cards can be drawn before the first inspection finishes.
+    #[test]
+    fn a_game_state_round_trips_through_the_library_cache() {
+        let m = GameMeta {
+            api: "DirectX 12".into(),
+            has_dlss: true,
+            engine_path: "Native".into(),
+            addon: true,
+            ready: true,
+            installed: true,
+            stale: vec!["MFG add-on".into()],
+            rt_likely: false,
+            unreal_likely: true,
+            unity_likely: false,
+            re_engine: false,
+            shaders_missing: false,
+            wrong_folder: None,
+            exe: PathBuf::from(r"C:\Games\A\game.exe"),
+        };
+        let mut cache = HashMap::new();
+        cache.insert(cache_key(Path::new(r"C:\Games\A")), m);
+        let text = serde_json::to_string(&cache).unwrap();
+        let back: HashMap<String, GameMeta> = serde_json::from_str(&text).unwrap();
+        let got = &back[r"c:\games\a"];
+        assert!(got.installed && got.has_dlss && got.unreal_likely);
+        assert_eq!(got.api, "DirectX 12");
+        assert_eq!(got.stale, ["MFG add-on"]);
+    }
+
+    #[test]
+    fn the_card_for_an_exe_is_found_by_its_folder() {
+        let games = [
+            game_at(r"D:\SteamLibrary\steamapps\common\Game"),
+            game_at(r"D:\SteamLibrary\steamapps\common\Game Two"),
+            game_at(r"D:\SteamLibrary\steamapps\common\Game\Sub"),
+        ];
+        let at = |p: &str| card_for_exe(Path::new(p), &games);
+        assert_eq!(
+            at(r"d:\steamlibrary\steamapps\common\game\bin\win64\g.exe"),
+            Some(0)
+        );
+        assert_eq!(
+            at(r"D:\SteamLibrary\steamapps\common\Game Two\g.exe"),
+            Some(1)
+        );
+        assert_eq!(
+            at(r"D:\SteamLibrary\steamapps\common\Game\Sub\x.exe"),
+            Some(2)
+        );
+        assert_eq!(at(r"D:\SteamLibrary\steamapps\common\Gamer\g.exe"), None);
+        assert_eq!(at(r"E:\elsewhere\g.exe"), None);
     }
 }

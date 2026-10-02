@@ -241,7 +241,11 @@ pub fn ensure_d3dcompiler(
     let consumer = match engine {
         crate::installer::Engine::ReShade => crate::game::DLSS5_ADDON,
         crate::installer::Engine::Aio => crate::game::AIO_ADDON,
-        crate::installer::Engine::Opti => return A::NotApplicable,
+        // OptiScaler carries its own upscaler, and the RTXMFG route is one
+        // proxy DLL with no neural pass: neither compiles a shader here.
+        crate::installer::Engine::Opti | crate::installer::Engine::Mfg => {
+            return A::NotApplicable
+        }
     };
     if !crate::game::join_ci(game_dir, &[consumer]).is_file() {
         return A::NotApplicable;
@@ -379,6 +383,47 @@ fn steam_game(e: &GameEntry) -> steam::SteamGame {
     }
 }
 
+/// The Windows user folders a game writes its own logs to, as they exist
+/// inside this game's Proton prefix: `(AppData\LocalLow, AppData\Local)`.
+///
+/// Upstream reads `%USERPROFILE%` and `%LOCALAPPDATA%` for Unity's `Player.log`
+/// and Unreal's `Saved\Logs`, which settle the graphics API for the engines
+/// that load Direct3D at run time and so show nothing in the exe's imports.
+/// Under Proton those folders are not this user's home at all — each game has
+/// its own prefix — so without this the whole log step finds nothing on Linux
+/// and every Unity game keeps reading as "unknown, assume DX12".
+///
+/// The Steam library is read straight from the folder's own path rather than
+/// through `entry_for_path`: this runs inside `inspect`, once per game on the
+/// Games page, and a launcher scan per game would be the freeze upstream's
+/// 0.13.18 work removed.
+#[cfg(target_os = "linux")]
+pub fn prefix_appdata(game_dir: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
+    let Some(appid) = crate::renodx::steam_appid(game_dir) else {
+        return (None, None);
+    };
+    // <library>/steamapps/common/<installdir>/… → <library>/steamapps
+    let mut cur = game_dir;
+    let steamapps = loop {
+        let Some(parent) = cur.parent() else {
+            return (None, None);
+        };
+        if parent
+            .file_name()
+            .is_some_and(|n| n.eq_ignore_ascii_case("steamapps"))
+        {
+            break parent.to_path_buf();
+        }
+        cur = parent;
+    };
+    let app = steamapps
+        .join("compatdata")
+        .join(appid.to_string())
+        .join("pfx/drive_c/users/steamuser/AppData");
+    let pick = |p: PathBuf| p.is_dir().then_some(p);
+    (pick(app.join("LocalLow")), pick(app.join("Local")))
+}
+
 /// Candidate locations for the NVIDIA driver's Wine NGX DLLs across distros.
 #[cfg(target_os = "linux")]
 const NVNGX_WINE_DIRS: [&str; 4] = [
@@ -406,7 +451,11 @@ pub fn host_context(st: &crate::game::GameStatus) -> crate::diagnose::HostContex
     use crate::diagnose::HostContext;
     use launch_options as lo;
     let game_dir = st.game_dir();
-    let engine = if st.opti {
+    // Which route this game is actually on, so the advice below is about the
+    // one installed rather than whatever the Setup page last showed.
+    let engine = if st.rtxmfg {
+        crate::installer::Engine::Mfg
+    } else if st.opti {
         crate::installer::Engine::Opti
     } else if st.aio {
         crate::installer::Engine::Aio

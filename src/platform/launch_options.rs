@@ -47,6 +47,13 @@ pub fn required(game_dir: &Path, engine: Engine, proton: Option<&ProtonInfo>) ->
     if let Some(proxy) = crate::mfg::manifest_proxy(game_dir) {
         push_native(&mut req, &proxy);
     }
+    // Universal RTXMFG is one DLL loaded under a name the game already imports
+    // (winmm for The Witcher 3, dxgi elsewhere). Proton loads it over its own
+    // builtin only with an override, and the MFG-only setup installs nothing
+    // else — so without this the whole route is a file the game never opens.
+    if let Some(proxy) = crate::game::rtxmfg_proxy(game_dir) {
+        push_native(&mut req, proxy.trim_end_matches(".dll"));
+    }
     // A d3d9.dll beside the exe — dgVoodoo 2 on the DirectX 9 route, or an RTX
     // Remix bridge — is loaded over Wine's builtin (DXVK's d3d9) only with its
     // own override; without it the DX9 route installs and then silently renders
@@ -267,6 +274,26 @@ mod tests {
 
     /// dgVoodoo's d3d9.dll and REFramework's dinput8.dll load under Proton only
     /// with their own overrides; a plain game gets neither, and a dinput8.dll
+    /// Universal RTXMFG installs one DLL under a name the game imports and
+    /// nothing else; Proton needs its override or the file is never loaded.
+    #[test]
+    fn the_rtxmfg_proxy_gets_its_override() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let has = |r: &LaunchReq, n: &str| r.overrides.iter().any(|(k, _)| k == n);
+        assert!(!has(&required(d, Engine::Mfg, None), "winmm"));
+        // The manifest names the proxy on its second line, and the file is there.
+        std::fs::write(d.join("winmm.dll"), b"MZ").unwrap();
+        std::fs::write(
+            d.join(crate::game::RTXMFG_MARKER),
+            "v1.2.3\nwinmm.dll\n",
+        )
+        .unwrap();
+        let r = required(d, Engine::Mfg, None);
+        assert!(has(&r, "winmm"), "{r:?}");
+        assert_eq!(r.overrides.iter().filter(|(k, _)| k == "winmm").count(), 1);
+    }
+
     /// The standalone AIO is a ReShade add-on like the RenoDX one, so under
     /// Proton it needs the same real `d3dcompiler_47` override; OptiScaler,
     /// which compiles nothing of its own, does not.

@@ -1,4 +1,5 @@
-//! Installed-game scan: Steam, Epic, GOG, Xbox (Game Pass). Newest install first.
+//! Installed-game scan: Steam, Epic, GOG, Xbox (Game Pass), EA app, Ubisoft
+//! Connect. Newest install first.
 //!
 //! Sources (verified 2026-09-02):
 //! - Steam: `<Steam>\steamapps\libraryfolders.vdf` lists library roots; each has
@@ -12,6 +13,15 @@
 //! - Xbox: `<drive>:\.GamingRoot` = "RGBX" + u32 + UTF-16 folder name (XboxGames);
 //!   each game is `<folder>\<Game>\Content\MicrosoftGame.config` (ExecutableList,
 //!   ShellVisuals DefaultDisplayName / Square150x150Logo / StoreLogo).
+//! - EA app: `HKLM\SOFTWARE\WOW6432Node\EA Games\<game>` "Install Dir", and the
+//!   `__Installer\installerdata.xml` every EA app install carries (gameTitle).
+//!   Game Pass titles from EA install through the EA app, not into XboxGames.
+//! - Ubisoft Connect: `HKLM\SOFTWARE\WOW6432Node\Ubisoft\Launcher\Installs\<id>`
+//!   "InstallDir", and the `uplay_install.state` file in the game folder.
+//!   Game Pass titles from Ubisoft land in XboxGames with no `Content` folder.
+//! - The two marker files are also looked for one folder below each drive root,
+//!   its XboxGames folder and the launchers' default folders, so an install the
+//!   launcher no longer lists (moved drive, new PC) still shows.
 //!
 //! Install date = the game folder's creation time (every store, one rule).
 
@@ -28,6 +38,8 @@ pub enum Store {
     Gog,
     Xbox,
     Lutris,
+    Ea,
+    Ubisoft,
     /// Pointed at by hand and remembered (#28).
     Manual,
 }
@@ -40,6 +52,8 @@ impl Store {
             Store::Gog => "GOG",
             Store::Xbox => "Xbox",
             Store::Lutris => "Lutris",
+            Store::Ea => "EA app",
+            Store::Ubisoft => "Ubisoft Connect",
             Store::Manual => "Added by you",
         }
     }
@@ -397,6 +411,115 @@ fn scan_xbox(out: &mut Vec<Game>) {
     }
 }
 
+// ── EA app / Ubisoft Connect ───────────────────────────────────────
+
+const EA_MARKER: &str = r"__Installer\installerdata.xml";
+const UBI_MARKER: &str = "uplay_install.state";
+
+/// The English title from an EA `installerdata.xml` (else the first one), without
+/// the trademark signs.
+pub fn parse_ea_title(xml: &str) -> Option<String> {
+    let grab = |re: &str| {
+        Regex::new(re)
+            .unwrap()
+            .captures(xml)
+            .map(|c| c[1].to_owned())
+    };
+    let t = grab(r#"<gameTitle[^>]*locale="en_US"[^>]*>([^<]+)<"#)
+        .or_else(|| grab(r"<gameTitle[^>]*>([^<]+)<"))?;
+    let t = t.replace(['\u{2122}', '\u{00AE}'], "").trim().to_owned();
+    (!t.is_empty()).then_some(t)
+}
+
+/// EA or Ubisoft game in `dir`, known by the launcher's own marker file.
+fn launcher_game(dir: &Path) -> Option<Game> {
+    let (store, title) = if let Ok(xml) = fs::read_to_string(dir.join(EA_MARKER)) {
+        (Store::Ea, parse_ea_title(&xml))
+    } else if dir.join(UBI_MARKER).is_file() {
+        (Store::Ubisoft, None)
+    } else {
+        return None;
+    };
+    let exe = crate::game::resolve_target(dir).ok().map(|(e, _)| e);
+    // Ubisoft keeps no title on disk. A folder with spaces is a readable name
+    // ("Assassin's Creed Shadows", whose exe is ACShadows_Plus.exe); one without
+    // is not, and then the exe usually is ("The Rogue Prince of Persia.exe" in
+    // "TheRoguePrinceOfPersia").
+    let folder = dir.file_name().map(|s| s.to_string_lossy().into_owned());
+    let stem = exe
+        .as_ref()
+        .and_then(|e| e.file_stem())
+        .map(|s| s.to_string_lossy().into_owned());
+    let title = title
+        .or_else(|| folder.clone().filter(|f| f.contains(' ')))
+        .or(stem)
+        .or(folder)?;
+    Some(Game {
+        title,
+        store,
+        installed: created(dir),
+        poster: Poster::ExeIcon(exe.clone().unwrap_or_else(|| dir.to_path_buf())),
+        exe_hint: exe,
+        dir: dir.to_path_buf(),
+    })
+}
+
+/// Folders a launcher install can sit in: what the launchers' registry keys
+/// name, plus every folder one level below the places people and launchers put
+/// games on each drive.
+fn launcher_candidates() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    #[cfg(windows)]
+    {
+        for (base, value) in [
+            (r"SOFTWARE\WOW6432Node\EA Games", "Install Dir"),
+            (
+                r"SOFTWARE\WOW6432Node\Ubisoft\Launcher\Installs",
+                "InstallDir",
+            ),
+        ] {
+            for k in reg::subkeys(reg::HKLM, base) {
+                if let Some(p) = reg::read_sz(reg::HKLM, &format!(r"{base}\{k}"), value) {
+                    dirs.push(PathBuf::from(p.replace('/', "\\").trim_end_matches('\\')));
+                }
+            }
+        }
+    }
+    for letter in b'A'..=b'Z' {
+        let root = PathBuf::from(format!("{}:\\", letter as char));
+        if !root.is_dir() {
+            continue;
+        }
+        let mut parents = vec![
+            root.clone(),
+            root.join("EA Games"),
+            root.join("Games"),
+            root.join(r"Program Files\EA Games"),
+            root.join(r"Program Files (x86)\Ubisoft\Ubisoft Game Launcher\games"),
+        ];
+        if let Some(f) = fs::read(root.join(".GamingRoot"))
+            .ok()
+            .and_then(|b| parse_gaming_root(&b))
+        {
+            parents.push(root.join(f));
+        }
+        for parent in parents {
+            if let Ok(rd) = fs::read_dir(&parent) {
+                dirs.extend(rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+            }
+        }
+    }
+    dirs
+}
+
+fn scan_launchers(out: &mut Vec<Game>) {
+    out.extend(
+        launcher_candidates()
+            .iter()
+            .filter_map(|d| launcher_game(d)),
+    );
+}
+
 // ── common ─────────────────────────────────────────────────────────
 
 fn created(p: &Path) -> SystemTime {
@@ -460,6 +583,7 @@ pub fn scan() -> Vec<Game> {
     scan_epic(&mut v);
     scan_gog(&mut v);
     scan_xbox(&mut v);
+    scan_launchers(&mut v);
     scan_linux_launchers(&mut v);
     // Last: a hand-added path that a store also lists loses to the store entry
     // in sort_and_dedupe, which keeps the first of each folder.
@@ -936,5 +1060,42 @@ mod tests {
         sort_and_dedupe(&mut v);
         let titles: Vec<&str> = v.iter().map(|g| g.title.as_str()).collect();
         assert_eq!(titles, ["New", "Old"]);
+    }
+
+    #[test]
+    fn ea_title_is_the_english_one_without_trademark_signs() {
+        let xml = "<gameTitles>\n<gameTitle locale=\"fr_FR\">Dead Space\u{2122} FR</gameTitle>\n<gameTitle locale=\"en_US\">Dead Space\u{2122}</gameTitle>\n</gameTitles>";
+        assert_eq!(parse_ea_title(xml).as_deref(), Some("Dead Space"));
+        assert_eq!(
+            parse_ea_title("<gameTitle locale=\"de_DE\">Mass Effect\u{00AE}</gameTitle>")
+                .as_deref(),
+            Some("Mass Effect")
+        );
+        assert_eq!(parse_ea_title("<gameTitles></gameTitles>"), None);
+    }
+
+    /// EA and Ubisoft installs are found by the launcher's own marker file,
+    /// with no registry entry, and nothing else is taken for one.
+    #[test]
+    fn launcher_markers_are_recognised() {
+        let t = tempfile::tempdir().unwrap();
+        let ea = t.path().join("Dead Space (2023)");
+        fs::create_dir_all(ea.join("__Installer")).unwrap();
+        fs::write(
+            ea.join(EA_MARKER),
+            "<gameTitle locale=\"en_US\">Dead Space\u{2122}</gameTitle>",
+        )
+        .unwrap();
+        let g = launcher_game(&ea).unwrap();
+        assert_eq!((g.store, g.title.as_str()), (Store::Ea, "Dead Space"));
+
+        let ubi = t.path().join("TheRoguePrinceOfPersia");
+        fs::create_dir_all(&ubi).unwrap();
+        fs::write(ubi.join(UBI_MARKER), b"x").unwrap();
+        assert_eq!(launcher_game(&ubi).unwrap().store, Store::Ubisoft);
+
+        let plain = t.path().join("Something");
+        fs::create_dir_all(&plain).unwrap();
+        assert!(launcher_game(&plain).is_none());
     }
 }

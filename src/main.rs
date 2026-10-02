@@ -14,6 +14,7 @@ mod logo;
 mod mfg;
 mod net;
 mod ngx;
+mod pcgw;
 mod platform;
 mod quality_preset;
 mod remix;
@@ -21,6 +22,7 @@ mod renodx;
 mod report;
 mod reshade_ini;
 mod settings;
+mod setup;
 mod text;
 mod theme;
 mod update;
@@ -29,8 +31,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// `dlss5oneclick <GAME.exe | game folder | game name | appid> [--remove | --remove-all |
-/// --check | --diagnose | --report | --engine=opti|aio | --renodx | --mfg | --ampere-mfg |
-/// --upstream | --fg | --model-res=25..100 | --addon=latest|4.55|<tag> | --opti-tag=<tag> |
+/// --check | --diagnose | --report | --next-setup | --engine=opti|aio|mfg | --consumer=sf|dlss5 |
+/// --renodx | --mfg | --ampere-mfg | --upstream | --fg | --model-res=25..100 |
+/// --addon=latest|rc|stable|4.55|<tag> | --opti-tag=<tag> |
 /// --remix-swap | --install-remix-mod | --remove-remix-mod | --imports |
 /// --ignore-anticheat | --mode=feeder|native | --api=dx11|dx12 | --bridge |
 /// --launch-options | --revert-launch-options] | --list-games | --remix-list | --update | --version` runs headless;
@@ -172,8 +175,22 @@ error: {e:#}"
     if args.iter().any(|a| a == "--bridge") {
         std::env::set_var(game::BRIDGE_ENV, "1");
     }
-    if let Some(a) = args.iter().find_map(|a| a.strip_prefix("--addon=")) {
-        // "latest" lifts the 4.70 default; a bare number becomes a tag.
+    // The newest DLSS 5 add-on build includes release candidates unless the
+    // user asked for stable builds only, here or in the GUI's advanced options.
+    // `--addon=rc` asks for the candidates whatever the settings say.
+    if args.iter().any(|a| a == "--addon=rc") {
+        std::env::remove_var(installer::RENODX_STABLE_ENV);
+    } else if args.iter().any(|a| a == "--addon=stable")
+        || crate::settings::Settings::load().renodx_stable_only
+    {
+        std::env::set_var(installer::RENODX_STABLE_ENV, "1");
+    }
+    if let Some(a) = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--addon="))
+        .filter(|a| *a != "rc" && *a != "stable")
+    {
+        // "latest" is the newest stable build; a bare number becomes a tag.
         let v = if a.eq_ignore_ascii_case("latest") || a.starts_with("renodx-dlss5-") {
             a.to_owned()
         } else {
@@ -181,12 +198,44 @@ error: {e:#}"
         };
         std::env::set_var(installer::RENODX_TAG_ENV, v);
     }
+    if let Some(c) = args.iter().find_map(|a| a.strip_prefix("--consumer=")) {
+        if !["sf", "shortfuse", "dlss5"]
+            .iter()
+            .any(|v| c.eq_ignore_ascii_case(v))
+        {
+            eprintln!("error: --consumer must be sf or dlss5");
+            std::process::exit(1);
+        }
+        std::env::set_var(installer::CONSUMER_ENV, c);
+    }
     if let Some(a) = args.iter().find_map(|a| a.strip_prefix("--api=")) {
         std::env::set_var(game::API_ENV, a);
         if game::api_override().is_none() {
             eprintln!("error: --api must be dx11 or dx12");
             std::process::exit(1);
         }
+    }
+    if args.iter().any(|a| a == "--next-setup")
+        && args.iter().any(|a| {
+            a.starts_with("--engine=")
+                || a == "--opti"
+                || a == "--aio"
+                || a == "--upstream"
+                || a.starts_with("--addon=")
+                || a.starts_with("--consumer=")
+                || a == "--check"
+                || a == "--remove"
+                || a == "--remove-all"
+                || a == "--diagnose"
+                || a == "--report"
+        })
+        || args.iter().any(|a| a == "--next-setup")
+            && (std::env::var_os(installer::RENODX_TAG_ENV).is_some()
+                || std::env::var_os(installer::CONSUMER_ENV).is_some())
+    {
+        attach_parent_console();
+        eprintln!("error: --next-setup picks the setup itself; drop --engine=, --consumer=, --addon=, --upstream, --check, --remove, --diagnose and --report, and unset DLSS5ONECLICK_RENODX_TAG / DLSS5ONECLICK_CONSUMER.");
+        std::process::exit(1);
     }
     if let Some(first) = args.first().filter(|a| !a.starts_with('-')) {
         attach_parent_console();
@@ -222,6 +271,11 @@ error: {e:#}"
                     installer::Engine::Opti
                 } else if args.iter().any(|a| a == "--engine=aio" || a == "--aio") {
                     installer::Engine::Aio
+                } else if args
+                    .iter()
+                    .any(|a| a == "--engine=mfg" || a == "--mfg-only")
+                {
+                    installer::Engine::Mfg
                 } else {
                     installer::Engine::ReShade
                 },
@@ -234,6 +288,18 @@ error: {e:#}"
                     .find_map(|a| a.strip_prefix("--model-res="))
                     .and_then(parse_model_res),
                 remix_swap: args.iter().any(|a| a == "--remix-swap"),
+                // Any explicit route choice turns the picker off, including a
+                // build or consumer set in the environment.
+                auto: !args.iter().any(|a| {
+                    a.starts_with("--engine=")
+                        || a == "--opti"
+                        || a == "--aio"
+                        || a == "--upstream"
+                        || a.starts_with("--addon=")
+                        || a.starts_with("--consumer=")
+                }) && std::env::var_os(installer::RENODX_TAG_ENV).is_none()
+                    && std::env::var_os(installer::CONSUMER_ENV).is_none(),
+                next: args.iter().any(|a| a == "--next-setup"),
             },
             if args.iter().any(|a| a == "--revert-launch-options") {
                 Some(true)
@@ -546,6 +612,10 @@ struct Choice {
     with_fg: bool,
     model_scale: Option<f32>,
     remix_swap: bool,
+    /// Nothing about the route was asked for: the setup picker decides.
+    auto: bool,
+    /// `--next-setup`: move this game one rung down its ladder and install that.
+    next: bool,
 }
 
 /// `--model-res=N` (N a percent, 25–100) → the `WorkingScale` fraction the
@@ -583,29 +653,9 @@ fn cli(target: PathBuf, actions: Actions, choice: Choice, launch_only: Option<bo
         with_fg,
         model_scale,
         remix_swap,
+        auto,
+        next,
     } = choice;
-    let extras = installer::Extras {
-        with_renodx,
-        upstream,
-        with_fg,
-        model_scale,
-        remix_swap,
-        // Upstream's knobs for scripted installs, read once here: the steps
-        // take them from Extras, and nothing writes the environment.
-        // (DLSS5ONECLICK_RENODX_TAG names an add-on build directly.)
-        opti_presr: installer::opti_presr_from_env(),
-        classic_addon: false,
-        // --addon=latest travels in RENODX_TAG_ENV, which rhi_env_pinned reads
-        // directly; the tick is the GUI's way to the same place.
-        newest_addon: false,
-        ada_mfg: ada_mfg || installer::ada_mfg_from_env(),
-        ampere_mfg: installer::ampere_mfg_from_env(),
-        upstream_preset: if upstream {
-            installer::upstream_preset_from_env()
-        } else {
-            0
-        },
-    };
     let (exe, candidates) = match game::resolve_target(&target) {
         Ok(v) => v,
         Err(e) => {
@@ -631,6 +681,130 @@ fn cli(target: PathBuf, actions: Actions, choice: Choice, launch_only: Option<bo
     } else if !candidates.is_empty() {
         println!("using {}", exe.display());
     }
+    // The setup picker: the rung matching what is in the folder (the top one
+    // when nothing is), or the next one down.
+    let mut engine = engine;
+    let mut upstream = upstream;
+    let mut rung: Option<(usize, usize)> = None;
+    let mut switching_engine = false;
+    let mut chosen: Option<(setup::Setup, bool)> = None;
+    let mut with_renodx = with_renodx;
+    if auto && !remove && !remove_all && !diagnose_only && !report {
+        if let Ok(st) = game::inspect(&exe) {
+            // The setup in force and whether the picker chose it (a soft build
+            // pin) rather than the user (a pin that holds).
+            let ladder = setup::ladder(&st);
+            if setup::hand_chosen(&st) {
+                if next {
+                    eprintln!(
+                        "error: this game's setup was chosen by hand (Neural Upstream, the AIO, or a build its list does not carry); pick the next one with --engine= / --consumer= / --addon=."
+                    );
+                    return 1;
+                }
+                // Refresh what is there rather than replace it.
+                if st.upstream {
+                    upstream = true;
+                } else if st.rtxmfg {
+                    engine = installer::Engine::Mfg;
+                } else if st.aio && !st.opti {
+                    engine = installer::Engine::Aio;
+                } else if let Some(s) = setup::installed(&st) {
+                    engine = s.engine;
+                    // Refreshing a hand-chosen install: its build is the user's pin.
+                    chosen = Some((s, false));
+                }
+                println!(
+                    "setup: {} (chosen by hand, kept)",
+                    setup::hand_label(&st).unwrap_or_default()
+                );
+            } else if ladder.is_empty() {
+                chosen = None;
+                if next {
+                    eprintln!("error: none of this tool's setups fits this game.");
+                    return 1;
+                }
+            }
+            if next && !setup::hand_chosen(&st) && setup::installed(&st).is_none() {
+                eprintln!(
+                    "error: nothing from this tool is installed in this game yet; run it without --next-setup first."
+                );
+                return 1;
+            }
+            let pick = if setup::hand_chosen(&st) {
+                None
+            } else if next {
+                match setup::next(&st) {
+                    Some(p) => Some(p),
+                    None => {
+                        eprintln!(
+                            "error: this game is on the last setup there is ({}); nothing further to try.",
+                            setup::current(&st).map(|s| setup::label(&s)).unwrap_or_default()
+                        );
+                        return 1;
+                    }
+                }
+            } else {
+                setup::current(&st).map(|s| (setup::level(&st), s))
+            };
+            if let Some((n, s)) = pick {
+                let was = setup::current(&st).map(|c| c.engine);
+                switching_engine = next && was != Some(s.engine);
+                if switching_engine {
+                    // Refuse before anything is removed: taking ReShade out
+                    // would strip add-ons this tool did not put there.
+                    let foreign = installer::foreign_addons(st.game_dir());
+                    if !foreign.is_empty() {
+                        eprintln!(
+                            "error: the next setup is {}, a different engine, and switching takes ReShade out of this game, but it has ReShade add-ons this tool did not install ({}). Remove those first, or pick a setup with --engine= / --consumer=.",
+                            setup::label(&s),
+                            foreign.join(", ")
+                        );
+                        return 1;
+                    }
+                    // The switch takes the RenoDX HDR mod out; it goes back in.
+                    with_renodx = with_renodx || st.renodx_mod.is_some();
+                }
+                engine = s.engine;
+                chosen = Some((s, true));
+                rung = Some((n, ladder.len()));
+                println!(
+                    "setup: {} (step {} of {}) - {}",
+                    setup::label(&s),
+                    n + 1,
+                    ladder.len(),
+                    setup::reason(&st)
+                );
+            }
+        }
+    }
+    let extras = installer::Extras {
+        with_renodx,
+        upstream,
+        with_fg,
+        model_scale,
+        remix_swap,
+        // Upstream's knobs for scripted installs, read once here: the steps
+        // take them from Extras, and nothing writes the environment.
+        // (DLSS5ONECLICK_RENODX_TAG names an add-on build directly.)
+        opti_presr: installer::opti_presr_from_env(),
+        // --addon= travels in RENODX_TAG_ENV, which rhi_env_pinned reads
+        // directly; the GUI's ticks are the other way to the same place.
+        classic_addon: false,
+        steady_addon: false,
+        stable_only: false,
+        consumer: chosen
+            .map(|(s, _): (setup::Setup, bool)| s.consumer)
+            .unwrap_or_else(installer::consumer_from_env),
+        // Only the picker's own pin is soft.
+        picker_tag: chosen.and_then(|(s, picked)| picked.then_some(s.addon_tag).flatten()),
+        ada_mfg: ada_mfg || installer::ada_mfg_from_env(),
+        ampere_mfg: installer::ampere_mfg_from_env(),
+        upstream_preset: if upstream {
+            installer::upstream_preset_from_env()
+        } else {
+            0
+        },
+    };
     if report {
         return match report::write_bundle(&exe) {
             Ok(p) => {
@@ -683,6 +857,7 @@ Attach that zip to the GitHub issue.",
         };
     }
     if check {
+        pcgw::warm(&exe);
         return match game::inspect(&exe) {
             Ok(st) => {
                 println!(
@@ -697,10 +872,18 @@ Attach that zip to the GitHub issue.",
                 for p in &st.problems {
                     println!("  ! {}", text::tidy(p));
                 }
-                // No engine asked for: the plan follows what is in the folder.
+                // No engine asked for and no pick: the plan follows what is in
+                // the folder.
                 let engine = match engine {
-                    installer::Engine::ReShade if st.opti => installer::Engine::Opti,
-                    installer::Engine::ReShade if st.aio => installer::Engine::Aio,
+                    installer::Engine::ReShade if rung.is_none() && st.opti => {
+                        installer::Engine::Opti
+                    }
+                    installer::Engine::ReShade if rung.is_none() && st.aio => {
+                        installer::Engine::Aio
+                    }
+                    installer::Engine::ReShade if rung.is_none() && st.rtxmfg => {
+                        installer::Engine::Mfg
+                    }
                     e => e,
                 };
                 let names: Vec<&str> =
@@ -753,7 +936,7 @@ Attach that zip to the GitHub issue.",
                     let latest = net::client()
                         .map(|c| installer::Latest::fetch(&c))
                         .unwrap_or_default();
-                    match installer::stale_components(st.game_dir(), &latest).as_slice() {
+                    match setup::stale(&st, &latest).as_slice() {
                         [] => println!("  installed by this tool · everything current"),
                         stale => {
                             println!("  installed by this tool · out of date:");
@@ -850,6 +1033,16 @@ Attach that zip to the GitHub issue.",
             Error => println!("\n      FAILED: {detail}"),
         }
     };
+    if switching_engine {
+        // ReShade and OptiScaler both load as dxgi.dll: the old one goes first.
+        match installer::uninstall_all(&exe) {
+            Ok((list, _)) => println!("removed the previous setup: {}", list.join(", ")),
+            Err(e) => {
+                eprintln!("error: could not remove the previous setup: {e:#}");
+                return 1;
+            }
+        }
+    }
     let s = settings::Settings::load();
     match installer::run_all_with(
         &exe,
@@ -868,11 +1061,21 @@ Attach that zip to the GitHub issue.",
                     "
 Done. In game: Insert opens the OptiScaler overlay -> enable Neural Rendering (off by default)."
                 );
+            } else if engine == installer::Engine::Mfg {
+                println!(
+                    "
+Done. In game: turn on the game's own DLSS Frame Generation; Backspace opens the RTXMFG menu."
+                );
             } else if engine == installer::Engine::Aio {
                 println!(
                     "
 Done. In game: turn the game's own upscaling, anti-aliasing and frame generation off, run windowed; Home opens ReShade -> Add-ons tab -> Standalone DLSS-NR + SR."
                 );
+            } else if installer::consumer() == installer::Consumer::ShortFuse
+                && game::inspect(&exe).is_ok_and(|s| s.sf)
+            {
+                println!("
+Done. In game: Home opens ReShade -> Add-ons tab -> RenoDX DLSS -> turn Neural Rendering on. (Home tab saying no effect files is normal on games with their own DLSS.)");
             } else {
                 println!("
 Done. In game: Home opens ReShade -> Add-ons tab -> DLSS 5 Neural Rendering -> enable. (Home tab saying no effect files is normal on games with their own DLSS.)");
@@ -888,6 +1091,9 @@ Done. In game: Home opens ReShade -> Add-ons tab -> DLSS 5 Neural Rendering -> e
         }
         Err(e) => {
             eprintln!("\nerror: {e:#}");
+            if switching_engine {
+                eprintln!("The previous setup was already taken out, so this game has none now. Run the same command without --next-setup to set it up again from the top of its list.");
+            }
             1
         }
     }

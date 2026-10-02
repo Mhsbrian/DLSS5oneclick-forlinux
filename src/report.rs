@@ -10,7 +10,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Files worth carrying, relative to the game folder. Absent ones are skipped.
-const FILES: [&str; 19] = [
+const FILES: [&str; 20] = [
     "ReShade.log",
     "ReShade.log1",
     "ReShade.log2",
@@ -22,6 +22,8 @@ const FILES: [&str; 19] = [
     "OptiScaler.log",
     "OptiScaler.ini",
     "re2_framework_log.txt",
+    // The DLSS 5 add-on writes this when it crashes the game (#118).
+    "RenoDX-DLSS5-crash.log",
     "nrpre-ring.txt",
     "dgVoodoo.conf",
     "host64/ReShade.log",
