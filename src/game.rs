@@ -1869,6 +1869,67 @@ pub fn rtxmfg_proxy_name(api: Api) -> Option<&'static str> {
     }
 }
 
+/// The names the RTXMFG release says it can be loaded under (its README's list,
+/// less the two Bink names, which need the game's own DLL kept beside them).
+const RTXMFG_NAMES: [&str; 15] = [
+    "version.dll",
+    "dinput8.dll",
+    "winmm.dll",
+    "d3d9.dll",
+    "d3d10.dll",
+    "d3d11.dll",
+    "d3d12.dll",
+    "dxgi.dll",
+    "dsound.dll",
+    "wininet.dll",
+    "winhttp.dll",
+    "xinput1_1.dll",
+    "xinput1_3.dll",
+    "xinput1_4.dll",
+    "xinput9_1_0.dll",
+];
+
+/// The name RTXMFG goes in as for this game: `winmm.dll` for The Witcher 3 on
+/// DirectX (its README asks for that name there, and the hair support needs
+/// it), else the API's default.
+pub fn rtxmfg_proxy_for(exe: &Path, api: Api) -> Option<&'static str> {
+    let base = rtxmfg_proxy_name(api)?;
+    let witcher = exe
+        .file_stem()
+        .is_some_and(|s| s.eq_ignore_ascii_case("witcher3"));
+    Some(if witcher && api != Api::Vulkan {
+        "winmm.dll"
+    } else {
+        base
+    })
+}
+
+/// True for an RTXMFG DLL, whoever placed it and whatever it is called: the
+/// release carries its own name as a wide string.
+pub fn is_rtxmfg_dll(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() < (1 << 20) || meta.len() > (64 << 20) {
+        return false;
+    }
+    let needle: Vec<u8> = "RTXMFG-Universal"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    fs::read(path).is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle.as_slice()))
+}
+
+/// An RTXMFG DLL already in the game folder under one of its supported names:
+/// one the user placed or renamed, which Install then updates in place instead
+/// of putting a second copy beside it.
+pub fn find_rtxmfg_copy(dir: &Path) -> Option<String> {
+    RTXMFG_NAMES
+        .iter()
+        .find(|n| is_rtxmfg_dll(&dir.join(n)))
+        .map(|n| (*n).to_owned())
+}
+
 /// The RTXMFG proxy this tool placed in `dir`: its marker's second line, when
 /// that file is still there.
 pub fn rtxmfg_proxy(dir: &Path) -> Option<String> {

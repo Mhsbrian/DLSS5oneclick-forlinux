@@ -2721,16 +2721,25 @@ fn step_rtxmfg(
     progress: Progress,
 ) -> Result<Vec<String>> {
     let d = st.game_dir();
-    let proxy = game::rtxmfg_proxy_name(st.api)
+    let want = game::rtxmfg_proxy_for(&st.exe, st.api)
         .ok_or_else(|| anyhow!("Universal RTXMFG does not cover {}", st.api.label()))?;
-    let dest = d.join(proxy);
     let marker = d.join(game::RTXMFG_MARKER);
     let mine = fs::read_to_string(&marker).ok();
     let mine_proxy = mine
         .as_deref()
         .and_then(|t| t.lines().nth(1))
-        .map(str::trim);
-    if dest.is_file() && mine_proxy != Some(proxy) {
+        .map(|l| l.trim().to_owned());
+    // Where this game's RTXMFG is now: where this tool put it, else a copy
+    // under any name it supports (renamed by hand, say winmm.dll), which is
+    // updated in place rather than copied again under another name.
+    let proxy: String = mine_proxy
+        .clone()
+        .filter(|p| d.join(p).is_file())
+        .or_else(|| game::find_rtxmfg_copy(d))
+        .unwrap_or_else(|| want.to_owned());
+    let proxy = proxy.as_str();
+    let dest = d.join(proxy);
+    if dest.is_file() && mine_proxy.as_deref() != Some(proxy) && !game::is_rtxmfg_dll(&dest) {
         bail!(
             "{proxy} already exists in this game and was not placed by this tool (ReShade, OptiScaler, DXVK or another mod), and RTXMFG has to take that name. Remove the other one first."
         );
@@ -2738,6 +2747,7 @@ fn step_rtxmfg(
     progress(0, "Looking up Universal RTXMFG");
     let tag = net::latest_tag(client, RTXMFG_REPO)?;
     if dest.is_file()
+        && mine_proxy.as_deref() == Some(proxy)
         && mine
             .as_deref()
             .and_then(|t| t.lines().next())
@@ -5414,6 +5424,37 @@ RestoreComputeSignature=true
         uninstall(&exe).unwrap();
         assert!(d.join("dxgi.dll").exists());
         assert!(!d.join(game::RTXMFG_MARKER).exists());
+    }
+
+    /// An RTXMFG the user renamed (The Witcher 3 wants winmm.dll) is found by
+    /// its contents and updated where it is; The Witcher 3 gets that name by
+    /// default.
+    #[test]
+    fn a_renamed_rtxmfg_is_found_by_its_contents() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        assert_eq!(game::find_rtxmfg_copy(d), None);
+        let mut body = vec![0u8; 2 << 20];
+        let sig: Vec<u8> = "RTXMFG-Universal"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        body.splice(1000..1000 + sig.len(), sig);
+        fs::write(d.join("winmm.dll"), &body).unwrap();
+        fs::write(d.join("dxgi.dll"), vec![0u8; 2 << 20]).unwrap();
+        assert_eq!(game::find_rtxmfg_copy(d).as_deref(), Some("winmm.dll"));
+        assert!(!game::is_rtxmfg_dll(&d.join("dxgi.dll")));
+        assert_eq!(
+            game::rtxmfg_proxy_for(
+                Path::new(r"C:\g\bin\x64_dx12\witcher3.exe"),
+                game::Api::Dx12
+            ),
+            Some("winmm.dll")
+        );
+        assert_eq!(
+            game::rtxmfg_proxy_for(Path::new(r"C:\g\game.exe"), game::Api::Dx12),
+            Some("dxgi.dll")
+        );
     }
 
     #[test]
