@@ -2096,11 +2096,12 @@ impl App {
                 );
                 x += 11.0 + galley.size().x + 10.0;
             }
-            // Caps + warnings as tiny chips under the band (hover text carries detail).
+            // Warning mark under the DirectX chip: the Install / Re-install button
+            // sits over the bottom of the poster, and the mark used to be under it.
             if m.shaders_missing || m.wrong_folder.is_some() {
                 let warn = p.layout_no_wrap("!".to_owned(), t::plex_semibold(10.0), t::BG);
                 let badge = egui::Rect::from_min_size(
-                    egui::pos2(poster.right() - 22.0, poster.bottom() - 48.0),
+                    egui::pos2(poster.right() - 22.0, poster.top() + 34.0),
                     warn.size() + Vec2::new(10.0, 4.0),
                 );
                 p.rect_filled(badge, CornerRadius::same(6), t::WARN);
