@@ -1089,7 +1089,15 @@ impl App {
         if let Some(r) = finished {
             self.rx = None;
             self.running = false;
-            if let Some(i) = self.updating.take() {
+            // The card to re-read: the one the install was started from, else
+            // the one for the game on the Setup page (an install or Remove
+            // started there used to leave its card showing the old setup until
+            // a full rescan).
+            let current = match &self.status {
+                Some(Ok(st)) => card_for_exe(&st.exe, &self.games),
+                _ => None,
+            };
+            if let Some(i) = self.updating.take().or(current) {
                 self.pending_refresh = Some(i);
             }
             match r {
@@ -1107,6 +1115,24 @@ impl App {
             self.refresh();
         }
     }
+}
+
+/// The library card a game exe belongs to: the one whose folder holds it, and
+/// the deepest such folder when one library folder sits inside another.
+fn card_for_exe(exe: &Path, games: &[library::Game]) -> Option<usize> {
+    let norm = |p: &Path| p.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+    let e = norm(exe);
+    games
+        .iter()
+        .enumerate()
+        .filter_map(|(i, g)| {
+            let d = norm(&g.dir);
+            let d = d.trim_end_matches('/');
+            (e.len() > d.len() && e.starts_with(d) && e.as_bytes()[d.len()] == b'/')
+                .then_some((d.len(), i))
+        })
+        .max()
+        .map(|(_, i)| i)
 }
 
 struct Tile {
@@ -4415,5 +4441,43 @@ mod tests {
         assert_eq!(heights.1, 74.0);
         // Nothing wraps at 1000 px.
         assert_eq!(heights.2, 74.0);
+    }
+
+    fn game_at(dir: &str) -> library::Game {
+        library::Game {
+            title: dir.to_owned(),
+            store: Store::Steam,
+            dir: PathBuf::from(dir),
+            exe_hint: None,
+            installed: std::time::SystemTime::UNIX_EPOCH,
+            poster: library::Poster::SteamCdn(0),
+        }
+    }
+
+    /// An install started from the Setup page refreshes the card of the game it
+    /// was for, found from the exe: deep exes, the deepest folder, and no
+    /// prefix-of-a-name false matches.
+    #[test]
+    fn the_card_for_an_exe_is_found_by_its_folder() {
+        let games = [
+            game_at(r"D:\SteamLibrary\steamapps\common\Game"),
+            game_at(r"D:\SteamLibrary\steamapps\common\Game Two"),
+            game_at(r"D:\SteamLibrary\steamapps\common\Game\Sub"),
+        ];
+        let at = |p: &str| card_for_exe(Path::new(p), &games);
+        assert_eq!(
+            at(r"d:\steamlibrary\steamapps\common\game\bin\win64\g.exe"),
+            Some(0)
+        );
+        assert_eq!(
+            at(r"D:\SteamLibrary\steamapps\common\Game Two\g.exe"),
+            Some(1)
+        );
+        assert_eq!(
+            at(r"D:\SteamLibrary\steamapps\common\Game\Sub\x.exe"),
+            Some(2)
+        );
+        assert_eq!(at(r"D:\SteamLibrary\steamapps\common\Gamer\g.exe"), None);
+        assert_eq!(at(r"E:\elsewhere\g.exe"), None);
     }
 }
