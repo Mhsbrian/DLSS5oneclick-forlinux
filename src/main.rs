@@ -25,7 +25,7 @@ mod update;
 use std::io::Write;
 use std::path::PathBuf;
 
-/// `dlss5oneclick <GAME.exe | game folder> [--remove | --remove-all | --check | --diagnose | --report | --engine=opti|aio | --renodx | --upstream | --imports | --ignore-anticheat | --mode=feeder|native | --api=dx11|dx12 | --addon=latest|rc|stable|4.55|<tag> | --ampere-mfg | --opti-tag=<tag>] | --update` runs headless; no args opens the GUI.
+/// `dlss5oneclick <GAME.exe | game folder> [--remove | --remove-all | --check | --diagnose | --report | --engine=opti|aio|mfg | --renodx | --upstream | --imports | --ignore-anticheat | --mode=feeder|native | --api=dx11|dx12 | --addon=latest|rc|stable|4.55|<tag> | --ampere-mfg | --opti-tag=<tag>] | --update` runs headless; no args opens the GUI.
 /// Read by the NVIDIA and AMD drivers from this exe's export table to choose
 /// the discrete GPU for the whole process. Exported by the linker flags in
 /// build.rs; the values themselves are what the drivers read (#32).
@@ -239,6 +239,11 @@ error: {e:#}"
                     installer::Engine::Opti
                 } else if args.iter().any(|a| a == "--engine=aio" || a == "--aio") {
                     installer::Engine::Aio
+                } else if args
+                    .iter()
+                    .any(|a| a == "--engine=mfg" || a == "--mfg-only")
+                {
+                    installer::Engine::Mfg
                 } else {
                     installer::Engine::ReShade
                 },
@@ -384,6 +389,8 @@ fn cli(
                 // Refresh what is there rather than replace it.
                 if st.upstream {
                     upstream = true;
+                } else if st.rtxmfg {
+                    engine = installer::Engine::Mfg;
                 } else if st.aio && !st.opti {
                     engine = installer::Engine::Aio;
                 } else if let Some(s) = setup::installed(&st) {
@@ -515,6 +522,9 @@ Attach that zip to the GitHub issue.",
                     }
                     installer::Engine::ReShade if rung.is_none() && st.aio => {
                         installer::Engine::Aio
+                    }
+                    installer::Engine::ReShade if rung.is_none() && st.rtxmfg => {
+                        installer::Engine::Mfg
                     }
                     e => e,
                 };
@@ -663,6 +673,11 @@ Attach that zip to the GitHub issue.",
                 println!(
                     "
 Done. In game: Insert opens the OptiScaler overlay -> enable Neural Rendering (off by default)."
+                );
+            } else if engine == installer::Engine::Mfg {
+                println!(
+                    "
+Done. In game: turn on the game's own DLSS Frame Generation; Backspace opens the RTXMFG menu."
                 );
             } else if engine == installer::Engine::Aio {
                 println!(

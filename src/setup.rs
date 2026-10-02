@@ -153,7 +153,7 @@ pub fn installed(st: &GameStatus) -> Option<Setup> {
 /// this game's ladder (4.55 on a profile that does not list it, say). Those
 /// are shown under Advanced and left as they are.
 pub fn hand_chosen(st: &GameStatus) -> bool {
-    if st.upstream || (st.aio && !st.opti) {
+    if st.upstream || (st.aio && !st.opti) || st.rtxmfg {
         return true;
     }
     installed(st).is_some_and(|s| !ladder(st).contains(&s))
@@ -206,7 +206,9 @@ pub fn hand_label(st: &GameStatus) -> Option<String> {
     if !hand_chosen(st) {
         return None;
     }
-    Some(if st.upstream {
+    Some(if st.rtxmfg {
+        "Universal RTXMFG only (no DLSS 5)".to_owned()
+    } else if st.upstream {
         "ReShade + Neural Upstream".to_owned()
     } else if st.aio && !st.opti {
         "ReShade + standalone AIO".to_owned()
@@ -275,6 +277,7 @@ pub fn label(s: &Setup) -> String {
     match (s.engine, s.consumer, s.addon_tag) {
         (Engine::Opti, ..) => "OptiScaler with its built-in neural rendering pass".to_owned(),
         (Engine::Aio, ..) => "ReShade + standalone AIO".to_owned(),
+        (Engine::Mfg, ..) => "Universal RTXMFG only (no DLSS 5)".to_owned(),
         (_, Consumer::ShortFuse, _) => "ReShade + ShortFuse's DLSS add-on".to_owned(),
         (_, Consumer::Dlss5, None) => "ReShade + DLSS 5 add-on (newest build)".to_owned(),
         (_, Consumer::Dlss5, Some(t)) => format!(

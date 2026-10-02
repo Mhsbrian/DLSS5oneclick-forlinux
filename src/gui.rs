@@ -471,7 +471,9 @@ impl App {
             self.advanced = true;
             self.upstream_on = st.upstream;
             self.consumer = installer::Consumer::Dlss5;
-            self.engine = if st.opti {
+            self.engine = if st.rtxmfg {
+                Engine::Mfg
+            } else if st.opti {
                 Engine::Opti
             } else if st.aio {
                 Engine::Aio
@@ -769,7 +771,9 @@ impl App {
                     },
                 )
                 .map(|_| {
-                    if engine == Engine::Opti {
+                    if engine == Engine::Mfg {
+                        "Done. In game: turn on the game's own DLSS Frame Generation; Backspace opens the RTXMFG menu.".to_owned()
+                    } else if engine == Engine::Opti {
                         "Done. In game: Insert opens the OptiScaler overlay → enable Neural Rendering.".to_owned()
                     } else if sf_route {
                         "Done. In game: Home opens ReShade → Add-ons tab → RenoDX DLSS → turn Neural Rendering on.".to_owned()
@@ -945,7 +949,9 @@ impl App {
                 self.page = Page::Setup;
                 return false;
             }
-            self.engine = if st.opti {
+            self.engine = if st.rtxmfg {
+                Engine::Mfg
+            } else if st.opti {
                 Engine::Opti
             } else if st.aio {
                 Engine::Aio
@@ -1251,6 +1257,13 @@ const TILE_AIO: Tile = Tile {
     optional: false,
 };
 
+const TILE_RTXMFG: Tile = Tile {
+    title: "Universal RTXMFG \u{00b7} experimental",
+    detail: "RTXMFG.dll (dashdogy) under the game's proxy name \u{00b7} no ReShade, no DLSS 5",
+    ok: |s| s.rtxmfg,
+    optional: false,
+};
+
 const TILE_AIO_RUNTIME: Tile = Tile {
     title: "NVIDIA runtimes",
     detail: "nvngx_dlss.dll \u{00b7} nvngx_dlssg.dll for frame generation",
@@ -1387,6 +1400,9 @@ fn base_tiles(
     upstream_on: bool,
     sf_on: bool,
 ) -> Vec<&'static Tile> {
+    if engine == Engine::Mfg || st.is_some_and(|s| s.rtxmfg) {
+        return vec![&TILE_RTXMFG];
+    }
     if engine == Engine::Aio || st.is_some_and(|s| s.aio && !s.opti) {
         return vec![&TILES_NATIVE[1], &TILE_AIO, &TILE_AIO_RUNTIME];
     }
@@ -3665,6 +3681,36 @@ impl eframe::App for App {
                         aio_note,
                     ) {
                         self.engine = Engine::Aio;
+                    }
+                }
+                // Multi-frame generation without DLSS 5: dashdogy's RTXMFG as
+                // one DLL, no ReShade. It takes the place of the cards above.
+                let mfg_ok = ok_status
+                    .as_ref()
+                    .is_some_and(|s| !s.is32() && game::rtxmfg_proxy_name(s.api).is_some());
+                if !mfg_ok && self.engine == Engine::Mfg {
+                    self.engine = Engine::ReShade;
+                }
+                ui.add_space(6.0);
+                {
+                    let mut only = self.engine == Engine::Mfg;
+                    let cb = egui::Checkbox::new(
+                        &mut only,
+                        RichText::new(
+                            "Multi-frame generation only \u{00b7} experimental: install Universal RTXMFG (dashdogy) and nothing else, no DLSS 5 and no ReShade. The game must have DLSS Frame Generation of its own; Backspace opens its menu",
+                        )
+                        .font(t::plex(11.5))
+                        .color(t::TEXT_SOFT),
+                    );
+                    if ui.add_enabled(mfg_ok && !self.running, cb).changed() {
+                        self.engine = if only { Engine::Mfg } else { Engine::ReShade };
+                    }
+                    if !mfg_ok {
+                        ui.label(
+                            RichText::new("64-bit DirectX 11/12 and Vulkan games only.")
+                                .font(t::plex(11.0))
+                                .color(t::TEXT_DIM),
+                        );
                     }
                 }
                 if self.engine == Engine::Opti {

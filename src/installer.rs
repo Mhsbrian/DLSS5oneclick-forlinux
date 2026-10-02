@@ -285,7 +285,22 @@ pub enum Engine {
     /// resolution and frame generation from one add-on, in games with no DLSS
     /// of their own. 64-bit games only here.
     Aio,
+    /// dashdogy's Universal RTXMFG alone, as one proxy DLL: multi-frame
+    /// generation for a game that has Streamline frame generation, with no
+    /// ReShade and no DLSS 5.
+    Mfg,
 }
+
+const RTXMFG_REPO: &str = "dashdogy/RTX40MFG-Unlock";
+
+const STEP_RTXMFG: Step = Step {
+    name: "Universal RTXMFG (multi-frame generation only)",
+    run: step_rtxmfg,
+};
+const STEP_RTXMFG_CLEANUP: Step = Step {
+    name: "Remove Universal RTXMFG (this route takes over)",
+    run: step_rtxmfg_cleanup,
+};
 
 const STEP_AIO: Step = Step {
     name: "DLSS5 ReShade AIO (standalone add-on)",
@@ -329,6 +344,8 @@ pub struct Latest {
     pub dlss: Option<String>,
     pub dlssnr: Option<String>,
     pub aio: Option<String>,
+    /// Newest Universal RTXMFG release.
+    pub rtxmfg: Option<String>,
     /// Newest stable ShortFuse add-on and RenoDX DLSS 5 add-on builds.
     pub sf: Option<String>,
     pub dlss5: Option<String>,
@@ -375,6 +392,7 @@ impl Latest {
                 .map(|(t, _)| t),
             mfg_len: net::remote_len(client, MFG_DOWNLOAD).ok().flatten(),
             bridge_len: net::remote_len(client, BRIDGE_DOWNLOAD).ok().flatten(),
+            rtxmfg: net::latest_tag(client, RTXMFG_REPO).ok(),
         }
     }
 }
@@ -383,6 +401,10 @@ impl Latest {
 /// Used so the UI never says "Everything is in place" on a partial copy.
 pub fn missing_install_files(st: &GameStatus) -> Vec<String> {
     let mut missing = Vec::new();
+    // RTXMFG alone is the one proxy DLL, which `rtxmfg` already says is there.
+    if st.rtxmfg {
+        return missing;
+    }
     if st.aio && !st.opti {
         if !st.reshade {
             missing.push(format!("{} (ReShade)", game::RESHADE_PROXY));
@@ -474,6 +496,13 @@ pub fn stale_components(dir: &Path, latest: &Latest) -> Vec<String> {
     );
     if let Ok(m) = fs::read_to_string(dir.join(game::AIO_MANIFEST)) {
         check("DLSS5 ReShade AIO", manifest_tag(&m), &latest.aio);
+    }
+    if let Some(m) = mine(game::RTXMFG_MARKER) {
+        check(
+            "Universal RTXMFG",
+            m.lines().next().map(str::to_owned),
+            &latest.rtxmfg,
+        );
     }
     if dir.join(game::SF_ADDON).is_file() {
         check(
@@ -1381,6 +1410,9 @@ fn step_renodx(
 /// the OptiScaler engine that needs ReShade too, loaded by OptiScaler as
 /// `ReShade64.dll`. RE Engine games get REFramework first on either engine.
 pub fn plan_with(st: &GameStatus, engine: Engine, with_renodx: bool, upstream: bool) -> Vec<Step> {
+    if engine == Engine::Mfg {
+        return vec![STEP_RTXMFG, STEP_GPU_PREF];
+    }
     let mut v = if engine == Engine::Aio {
         // The AIO is the whole consumer: ReShade to load it, the model and
         // NVIDIA's runtimes beside it. No Feeder, no RenoDX add-on.
@@ -1420,6 +1452,10 @@ pub fn plan_with(st: &GameStatus, engine: Engine, with_renodx: bool, upstream: b
     }
     if st.re_engine {
         v.insert(0, STEP_REFRAMEWORK);
+    }
+    // RTXMFG sits in the name ReShade and OptiScaler need.
+    if st.rtxmfg {
+        v.insert(0, STEP_RTXMFG_CLEANUP);
     }
     // DX9 never loads dxgi.dll; dgVoodoo must sit in the game folder first.
     // Always run on Dx9 (even when the DLL is already present) so Install can
@@ -2674,6 +2710,95 @@ fn step_dlssnr_only(
 /// in a manifest, tag in the header, for refresh and Remove. Any other neural
 /// consumer this tool placed goes first: two of them in one ReShade would each
 /// create NGX features on the same frame.
+/// Universal RTXMFG: the release's one DLL, renamed to the proxy name the game
+/// loads. Install and Update are the same step: a copy this tool placed is
+/// replaced when the release tag moved. A file of that name that is not ours
+/// (ReShade, OptiScaler, DXVK, another mod) is never overwritten.
+fn step_rtxmfg(
+    client: &Client,
+    st: &GameStatus,
+    work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    let d = st.game_dir();
+    let proxy = game::rtxmfg_proxy_name(st.api)
+        .ok_or_else(|| anyhow!("Universal RTXMFG does not cover {}", st.api.label()))?;
+    let dest = d.join(proxy);
+    let marker = d.join(game::RTXMFG_MARKER);
+    let mine = fs::read_to_string(&marker).ok();
+    let mine_proxy = mine
+        .as_deref()
+        .and_then(|t| t.lines().nth(1))
+        .map(str::trim);
+    if dest.is_file() && mine_proxy != Some(proxy) {
+        bail!(
+            "{proxy} already exists in this game and was not placed by this tool (ReShade, OptiScaler, DXVK or another mod), and RTXMFG has to take that name. Remove the other one first."
+        );
+    }
+    progress(0, "Looking up Universal RTXMFG");
+    let tag = net::latest_tag(client, RTXMFG_REPO)?;
+    if dest.is_file()
+        && mine
+            .as_deref()
+            .and_then(|t| t.lines().next())
+            .map(str::trim)
+            == Some(tag.as_str())
+    {
+        return Ok(vec![format!("{proxy} already current (RTXMFG {tag})")]);
+    }
+    let url = net::github_asset_url_html(client, RTXMFG_REPO, &tag, r#"RTXMFG-[^"]+\.zip"#)?;
+    let zip_path = work.join("rtxmfg.zip");
+    net::download(client, &url, &zip_path, "Universal RTXMFG", progress)?;
+    let f = fs::File::open(&zip_path)?;
+    let mut zip = zip::ZipArchive::new(f).context("RTXMFG download is not a valid zip")?;
+    let member = zip
+        .file_names()
+        .find(|n| net::file_name(n).eq_ignore_ascii_case("RTXMFG.dll"))
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("the RTXMFG release has no RTXMFG.dll - layout changed upstream"))?;
+    net::extract_member(&mut zip, &member, &dest)?;
+    let len = fs::metadata(&dest)?.len();
+    fs::write(&marker, format!("{tag}\n{proxy}\n{len}"))?;
+    Ok(vec![format!("{proxy} (RTXMFG {tag})")])
+}
+
+fn step_rtxmfg_cleanup(
+    _client: &Client,
+    st: &GameStatus,
+    _work: &Path,
+    _progress: Progress,
+) -> Result<Vec<String>> {
+    Ok(remove_rtxmfg(st.game_dir()))
+}
+
+/// Take out the RTXMFG this tool placed. The file goes only when it is still
+/// the size that was written: a copy someone swapped for another mod by hand
+/// is theirs.
+fn remove_rtxmfg(d: &Path) -> Vec<String> {
+    let marker = d.join(game::RTXMFG_MARKER);
+    let text = fs::read_to_string(&marker).unwrap_or_default();
+    let wrote: Option<u64> = text.lines().nth(2).and_then(|l| l.trim().parse().ok());
+    let Some(name) = text
+        .lines()
+        .nth(1)
+        .map(|l| l.trim().to_owned())
+        .filter(|n| !n.is_empty() && !n.contains(['/', '\\']))
+    else {
+        let _ = fs::remove_file(&marker);
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let p = d.join(&name);
+    let same = wrote.is_none_or(|w| fs::metadata(&p).is_ok_and(|m| m.len() == w));
+    if p.is_file() && same && fs::remove_file(&p).is_ok() {
+        out.push(name);
+    }
+    if fs::remove_file(&marker).is_ok() {
+        out.push(game::RTXMFG_MARKER.to_owned());
+    }
+    out
+}
+
 fn step_aio(
     client: &Client,
     st: &GameStatus,
@@ -3481,7 +3606,17 @@ pub fn run_all_with(
     if !st.problems.is_empty() {
         bail!("{}", st.problems.join("\n"));
     }
-    if engine != Engine::Opti {
+    if engine == Engine::Mfg {
+        if st.is32() {
+            bail!("Universal RTXMFG is 64-bit only.");
+        }
+        if game::rtxmfg_proxy_name(st.api).is_none() {
+            bail!(
+                "Universal RTXMFG needs a DirectX 11, DirectX 12 or Vulkan game with Streamline frame generation; this one is {}.",
+                st.api.label()
+            );
+        }
+    } else if engine != Engine::Opti {
         if let Some(p) = st.reshade_engine_problem() {
             bail!("{p}");
         }
@@ -3708,6 +3843,7 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
         targets.push(d.join(game::REFRAMEWORK_MARKER));
     }
     let mut removed = Vec::new();
+    removed.extend(remove_rtxmfg(d));
     uninstall_opti(d, &mut removed)?;
     uninstall_aio(d, &mut removed)?;
     for t in targets {
@@ -4911,10 +5047,18 @@ RestoreComputeSignature=true
             dlss5: None,
             dlss5_pre: None,
             aio: None,
+            rtxmfg: Some("v1.4.1".into()),
             mfg_len: None,
             bridge_len: None,
         };
         assert!(stale_components(d, &latest).is_empty());
+        fs::write(d.join(game::RTXMFG_MARKER), "v1.4.0\ndxgi.dll\n6").unwrap();
+        assert!(stale_components(d, &latest)
+            .iter()
+            .any(|l| l.contains("RTXMFG") && l.contains("v1.4.1")));
+        fs::write(d.join(game::RTXMFG_MARKER), "v1.4.1\ndxgi.dll\n6").unwrap();
+        assert!(stale_components(d, &latest).is_empty());
+        fs::remove_file(d.join(game::RTXMFG_MARKER)).unwrap();
 
         fs::write(d.join(game::FEEDER_MARKER), "v0.12.0").unwrap();
         fs::write(d.join(game::DLSS_MARKER), "dlss-310.9.0").unwrap();
@@ -4959,6 +5103,7 @@ RestoreComputeSignature=true
             dlss5: None,
             dlss5_pre: None,
             aio: None,
+            rtxmfg: None,
             mfg_len: None,
             bridge_len: None,
         };
@@ -5224,6 +5369,72 @@ RestoreComputeSignature=true
         assert!(!d.join("dxgi.dll").exists());
         assert!(!d.join("OptiScaler").exists());
         assert!(!d.join(game::OPTI_MANIFEST).exists());
+    }
+
+    /// RTXMFG alone is one DLL under the game's own proxy name: no ReShade, no
+    /// add-ons. Remove takes out the copy this tool placed and leaves a ReShade
+    /// that someone put in its place.
+    #[test]
+    fn rtxmfg_route_is_one_dll_and_remove_keeps_a_foreign_reshade() {
+        let st = game::stub_status(game::Mode::Feeder, game::Api::Dx12);
+        let names: Vec<&str> = plan_with(&st, Engine::Mfg, true, false)
+            .iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, vec![STEP_RTXMFG.name, STEP_GPU_PREF.name]);
+        let mut on = game::stub_status(game::Mode::Feeder, game::Api::Dx12);
+        on.rtxmfg = true;
+        assert_eq!(
+            plan_with(&on, Engine::ReShade, false, false)[0].name,
+            STEP_RTXMFG_CLEANUP.name
+        );
+        assert_eq!(game::rtxmfg_proxy_name(game::Api::Dx12), Some("dxgi.dll"));
+        assert_eq!(
+            game::rtxmfg_proxy_name(game::Api::Vulkan),
+            Some("version.dll")
+        );
+        assert_eq!(game::rtxmfg_proxy_name(game::Api::Dx9), None);
+
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe(&d.join("game.exe"), game::PE_X64);
+        fs::write(d.join("dxgi.dll"), b"rtxmfg").unwrap();
+        fs::write(d.join(game::RTXMFG_MARKER), "v1.4.1\ndxgi.dll\n6").unwrap();
+        assert_eq!(game::rtxmfg_proxy(d).as_deref(), Some("dxgi.dll"));
+        assert!(game::installed_by_tool(d));
+        let removed = uninstall(&exe).unwrap();
+        assert!(removed.iter().any(|r| r == "dxgi.dll"));
+        assert!(!d.join("dxgi.dll").exists());
+        assert!(!d.join(game::RTXMFG_MARKER).exists());
+
+        // Another DLL swapped in by hand (here a ReShade): the marker goes,
+        // the file stays.
+        make_reshade_dll(&d.join("dxgi.dll"));
+        fs::write(d.join(game::RTXMFG_MARKER), "v1.4.1\ndxgi.dll\n6").unwrap();
+        uninstall(&exe).unwrap();
+        assert!(d.join("dxgi.dll").exists());
+        assert!(!d.join(game::RTXMFG_MARKER).exists());
+    }
+
+    #[test]
+    fn rtxmfg_is_refused_on_32bit_and_dx9_before_network() {
+        let opts = || InstallOpts {
+            quality: QualityChoice::Auto,
+            overrides: QualityOverrides::default(),
+        };
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe(&t.path().join("game.exe"), game::PE_X86);
+        let err = run_all_with(
+            &exe,
+            Engine::Mfg,
+            false,
+            false,
+            opts(),
+            &|_, _| {},
+            &|_, _, _, _, _| {},
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("64-bit only"));
     }
 
     #[test]

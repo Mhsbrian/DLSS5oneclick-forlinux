@@ -70,6 +70,10 @@ pub const UPSTREAM_ADDON: &str = "nvngx.dll.addon64";
 pub const AIO_ADDON: &str = "standalone-dlssnr.addon64";
 /// Files this tool wrote for an AIO install, one path per line, tag in the header.
 pub const AIO_MANIFEST: &str = ".dlss5oneclick-aio-manifest";
+/// dashdogy's Universal RTXMFG placed as a proxy DLL. Two lines: the release
+/// tag, the file name it was given in the game folder (`dxgi.dll`, or
+/// `version.dll` in a Vulkan game), and the size of that file as written.
+pub const RTXMFG_MARKER: &str = "RTXMFG.dll.dlss5oneclick";
 /// Files this tool wrote for an OptiScaler install, one path per line.
 pub const OPTI_MANIFEST: &str = ".dlss5oneclick-optiscaler-manifest";
 /// Sidecar written next to an `nvngx_dlss.dll` this tool placed, so it is never mistaken for the game's own.
@@ -1146,6 +1150,8 @@ pub struct GameStatus {
     pub upstream: bool,
     /// kibblerz's standalone AIO add-on is in the folder.
     pub aio: bool,
+    /// Universal RTXMFG alone: no ReShade, no DLSS 5 (the "MFG only" setup).
+    pub rtxmfg: bool,
     /// The RTX 40 multi-frame-generation add-on is already beside the game.
     pub mfg: bool,
     /// Unreal-style layout / Shipping exe (heuristic).
@@ -1197,6 +1203,7 @@ pub(crate) fn stub_status(mode: Mode, api: Api) -> GameStatus {
         reframework: false,
         upstream: false,
         aio: false,
+        rtxmfg: false,
         mfg: false,
         unreal_likely: false,
         unity_likely: false,
@@ -1355,6 +1362,10 @@ impl GameStatus {
         // add-on, the model, and NVIDIA's DLSS runtime beside it.
         if self.aio && !self.opti {
             return self.reshade && self.dlssnr && self.dlss;
+        }
+        // Nothing else belongs to this setup: the one DLL is all of it.
+        if self.rtxmfg {
+            return true;
         }
         match self.mode {
             Mode::Feeder => {
@@ -1553,11 +1564,16 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         opti: d.join(OPTI_MANIFEST).is_file(),
         upstream: d.join(UPSTREAM_ADDON).is_file(),
         aio: d.join(AIO_ADDON).is_file(),
+        rtxmfg: rtxmfg_proxy(d).is_some(),
         mfg: d.join(MFG_ADDON).is_file(),
         gpu,
         exe: exe.to_path_buf(),
         bitness,
-        reshade: !d.join(OPTI_MANIFEST).is_file() && is_reshade_dll(&d.join(RESHADE_PROXY)),
+        // RTXMFG's DLL carries ReShade's name inside it, so a proxy this tool
+        // placed from that release is not a ReShade.
+        reshade: !d.join(OPTI_MANIFEST).is_file()
+            && rtxmfg_proxy(d).as_deref() != Some(RESHADE_PROXY)
+            && is_reshade_dll(&d.join(RESHADE_PROXY)),
         headers: RESHADE_HEADERS.iter().all(|h| shaders.join(h).is_file()),
         feeder,
         lumenite: shaders.join(LUMENITE_KERNEL_FX).is_file()
@@ -1841,11 +1857,32 @@ pub fn shaders_missing(game_dir: &Path) -> bool {
         && game_dir.join(RESHADE_PROXY).is_file()
 }
 
+/// The file name RTXMFG goes in as, by graphics API: a DirectX 11/12 game loads
+/// `dxgi.dll` from its folder; a Vulkan game does not, so `version.dll` there.
+/// `None` for the APIs RTXMFG does not cover (it needs Streamline frame
+/// generation, which DirectX 9/10 games do not have).
+pub fn rtxmfg_proxy_name(api: Api) -> Option<&'static str> {
+    match api {
+        Api::Dx11 | Api::Dx12 | Api::Unknown => Some("dxgi.dll"),
+        Api::Vulkan => Some("version.dll"),
+        Api::Dx9 | Api::Dx10 => None,
+    }
+}
+
+/// The RTXMFG proxy this tool placed in `dir`: its marker's second line, when
+/// that file is still there.
+pub fn rtxmfg_proxy(dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(dir.join(RTXMFG_MARKER)).ok()?;
+    let name = text.lines().nth(1)?.trim().to_owned();
+    (!name.is_empty() && !name.contains(['/', '\\']) && dir.join(&name).is_file()).then_some(name)
+}
+
 /// Sidecar markers this tool leaves so Install / Update / Remove know the folder.
 pub fn installed_by_tool(dir: &Path) -> bool {
     [
         OPTI_MANIFEST,
         AIO_MANIFEST,
+        RTXMFG_MARKER,
         RENODX_MANIFEST,
         REFRAMEWORK_MARKER,
         DLSS_MARKER,
