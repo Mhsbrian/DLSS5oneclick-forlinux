@@ -3476,6 +3476,7 @@ pub fn run_all_with(
     progress: Progress,
     step_cb: &(dyn Fn(usize, usize, &str, StepState, &str) + Sync),
 ) -> Result<Vec<(String, Vec<String>)>> {
+    crate::pcgw::warm(exe);
     let mut st = game::inspect(exe)?;
     if !st.problems.is_empty() {
         bail!("{}", st.problems.join("\n"));

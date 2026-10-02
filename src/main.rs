@@ -11,6 +11,7 @@ mod library;
 mod logo;
 mod net;
 mod ngx;
+mod pcgw;
 mod quality_preset;
 mod renodx;
 mod report;
@@ -491,6 +492,7 @@ Attach that zip to the GitHub issue.",
         };
     }
     if check {
+        pcgw::warm(&exe);
         return match game::inspect(&exe) {
             Ok(st) => {
                 println!(

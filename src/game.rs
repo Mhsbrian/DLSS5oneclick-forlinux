@@ -544,7 +544,11 @@ pub fn detect_api(exe: &Path) -> Api {
     if a != Api::Unknown {
         return a;
     }
-    api_from_last_run(exe).unwrap_or(Api::Unknown)
+    // Last, what PCGamingWiki says for a Steam game (cached; the lookup itself
+    // runs on a background thread or the command line, never here).
+    api_from_last_run(exe)
+        .or_else(|| crate::pcgw::cached_api(exe))
+        .unwrap_or(Api::Unknown)
 }
 
 /// Start of a log, as lossy text.

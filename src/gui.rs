@@ -793,6 +793,7 @@ impl App {
                 .unwrap_or_default();
             for (i, g) in g2.iter().enumerate() {
                 let meta = game::resolve_target(&g.dir)
+                    .inspect(|(exe, _)| crate::pcgw::warm(exe))
                     .and_then(|(exe, _)| game::inspect(&exe))
                     .ok()
                     .map(|st| meta_from_status(&st, &latest));
@@ -955,6 +956,7 @@ impl App {
                 .map(|c| installer::Latest::fetch(&c))
                 .unwrap_or_default();
             if let Some(m) = game::resolve_target(&g.dir)
+                .inspect(|(exe, _)| crate::pcgw::warm(exe))
                 .and_then(|(exe, _)| game::inspect(&exe))
                 .ok()
                 .map(|st| meta_from_status(&st, &latest))
