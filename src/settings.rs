@@ -31,6 +31,9 @@ pub struct Settings {
     /// the release candidates too; the 0.14.1 opt-in key is no longer read.
     #[serde(default)]
     pub renodx_stable_only: bool,
+    /// Games page order: newest install first. Off = alphabetical.
+    #[serde(default)]
+    pub sort_newest: bool,
 }
 
 fn default_quality() -> String {
@@ -92,6 +95,7 @@ impl Default for Settings {
             overlay: OverlayDefaults::default(),
             advanced_open: false,
             renodx_stable_only: false,
+            sort_newest: false,
         }
     }
 }
@@ -133,6 +137,7 @@ impl Settings {
             },
             advanced_open: false,
             renodx_stable_only: false,
+            sort_newest: false,
         }
     }
 
@@ -140,10 +145,15 @@ impl Settings {
     pub fn reset_to_feeder_defaults(&mut self) {
         // Only the Feeder values: whether advanced options are shown is a
         // window preference, not a Feeder default.
-        let (advanced_open, renodx_stable_only) = (self.advanced_open, self.renodx_stable_only);
+        let (advanced_open, renodx_stable_only, sort_newest) = (
+            self.advanced_open,
+            self.renodx_stable_only,
+            self.sort_newest,
+        );
         *self = Self::feeder_stock();
         self.advanced_open = advanced_open;
         self.renodx_stable_only = renodx_stable_only;
+        self.sort_newest = sort_newest;
     }
 
     pub fn path() -> PathBuf {

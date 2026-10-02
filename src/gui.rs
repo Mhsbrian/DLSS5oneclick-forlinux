@@ -19,6 +19,7 @@ use crate::update;
 use eframe::egui::{
     self, Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, Stroke, StrokeKind, Vec2,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -169,13 +170,13 @@ enum CardAction {
 }
 
 /// What the tool knows about an installed game without touching it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct GameMeta {
-    api: &'static str,
+    api: String,
     /// Game ships its own DLSS (Mode::Native).
     has_dlss: bool,
     /// Feeder / Native / Opti path label.
-    engine_path: &'static str,
+    engine_path: String,
     addon: bool,
     ready: bool,
     /// This tool installed into that folder.
@@ -202,7 +203,8 @@ fn meta_from_status(st: &GameStatus, latest: &installer::Latest) -> GameMeta {
             game::Api::Dx11 => "DirectX 11",
             game::Api::Dx12 => "DirectX 12",
             game::Api::Unknown => "DirectX 12?",
-        },
+        }
+        .into(),
         has_dlss: st.mode == game::Mode::Native,
         engine_path: if st.opti {
             "Opti"
@@ -210,7 +212,8 @@ fn meta_from_status(st: &GameStatus, latest: &installer::Latest) -> GameMeta {
             "Native"
         } else {
             "Feeder"
-        },
+        }
+        .into(),
         addon: st.dlss5_addon || st.opti,
         ready: st.complete(),
         installed: game::installed_by_tool(dir),
@@ -222,6 +225,34 @@ fn meta_from_status(st: &GameStatus, latest: &installer::Latest) -> GameMeta {
         shaders_missing: game::shaders_missing(dir),
         wrong_folder: game::install_folder_mismatch(&st.exe),
         exe: st.exe.clone(),
+    }
+}
+
+/// Last known state of every game, kept on disk so the cards (above all
+/// "Installed by this tool") show the moment the window opens instead of after
+/// a full re-inspection of the library.
+fn meta_cache_path() -> PathBuf {
+    library::poster_cache_dir().with_file_name("library-cache.json")
+}
+
+fn cache_key(dir: &Path) -> String {
+    dir.to_string_lossy().to_ascii_lowercase()
+}
+
+fn load_meta_cache() -> HashMap<String, GameMeta> {
+    std::fs::read_to_string(meta_cache_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_meta_cache(m: &HashMap<String, GameMeta>) {
+    let p = meta_cache_path();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(t) = serde_json::to_string(m) {
+        let _ = std::fs::write(p, t);
     }
 }
 
@@ -785,25 +816,43 @@ impl App {
         self.meta_rx = Some(mrx);
         let ctx2 = ctx.clone();
         let g2 = games.clone();
+        let cached = load_meta_cache();
+        for (i, g) in games.iter().enumerate() {
+            if let Some(m) = cached.get(&cache_key(&g.dir)) {
+                self.meta.insert(i, m.clone());
+            }
+        }
         thread::spawn(move || {
             // One lookup for the whole scan; every game is then compared
             // against it by reading the markers this tool wrote.
             let latest = net::client()
                 .map(|c| installer::Latest::fetch(&c))
                 .unwrap_or_default();
-            for (i, g) in g2.iter().enumerate() {
+            // Games this tool changed last time go first, so their state is
+            // re-read before the long tail of untouched ones.
+            let mut order: Vec<usize> = (0..g2.len()).collect();
+            order.sort_by_key(|&i| {
+                !cached
+                    .get(&cache_key(&g2[i].dir))
+                    .is_some_and(|m| m.installed)
+            });
+            let mut fresh = HashMap::new();
+            for (n, i) in order.into_iter().enumerate() {
+                let g = &g2[i];
                 let meta = game::resolve_target(&g.dir)
                     .inspect(|(exe, _)| crate::pcgw::warm(exe))
                     .and_then(|(exe, _)| game::inspect(&exe))
                     .ok()
                     .map(|st| meta_from_status(&st, &latest));
                 if let Some(m) = meta {
+                    fresh.insert(cache_key(&g.dir), m.clone());
                     let _ = mtx.send((i, m));
                 }
-                if i % 8 == 7 {
+                if n % 8 == 7 {
                     ctx2.request_repaint();
                 }
             }
+            save_meta_cache(&fresh);
             ctx2.request_repaint();
         });
         let ctx3 = ctx.clone();
@@ -1705,6 +1754,19 @@ impl App {
                         self.add_game(p, ui.ctx());
                     }
                 }
+                let sort_label = if self.settings.sort_newest {
+                    "Sort: Newest"
+                } else {
+                    "Sort: A-Z"
+                };
+                if ui
+                    .add(btn(sort_label, false))
+                    .on_hover_text("Switch between alphabetical and newest install first")
+                    .clicked()
+                {
+                    self.settings.sort_newest = !self.settings.sort_newest;
+                    let _ = self.settings.save();
+                }
                 let search = egui::TextEdit::singleline(&mut self.search)
                     .font(t::plex(12.0))
                     .hint_text(RichText::new("Search").color(t::TEXT_DIM))
@@ -1745,7 +1807,7 @@ impl App {
                     Some(Store::Ubisoft),
                 ];
                 for section in sections {
-                    let idx: Vec<usize> = self
+                    let mut idx: Vec<usize> = self
                         .games
                         .iter()
                         .enumerate()
@@ -1763,6 +1825,16 @@ impl App {
                         .collect();
                     if idx.is_empty() {
                         continue;
+                    }
+                    if self.settings.sort_newest {
+                        idx.sort_by_cached_key(|&i| {
+                            (
+                                std::cmp::Reverse(self.games[i].installed),
+                                self.games[i].title.to_lowercase(),
+                            )
+                        });
+                    } else {
+                        idx.sort_by_cached_key(|&i| self.games[i].title.to_lowercase());
                     }
                     let ready = idx
                         .iter()
@@ -1995,7 +2067,7 @@ impl App {
             };
             for (on, label) in [
                 (m.has_dlss, Some(dlss_label)),
-                (m.addon || m.installed, Some(m.engine_path)),
+                (m.addon || m.installed, Some(m.engine_path.as_str())),
                 (m.ready && m.stale.is_empty(), ready_label),
             ] {
                 let Some(label) = label else { continue };
@@ -2594,6 +2666,11 @@ impl eframe::App for App {
         self.step_update_queue();
         if let Some(rx) = &self.meta_one_rx {
             if let Ok((i, m)) = rx.try_recv() {
+                if let Some(g) = self.games.get(i) {
+                    let mut cache = load_meta_cache();
+                    cache.insert(cache_key(&g.dir), m.clone());
+                    save_meta_cache(&cache);
+                }
                 self.meta.insert(i, m);
                 self.meta_one_rx = None;
             }
@@ -4457,6 +4534,36 @@ mod tests {
     /// An install started from the Setup page refreshes the card of the game it
     /// was for, found from the exe: deep exes, the deepest folder, and no
     /// prefix-of-a-name false matches.
+    /// The saved library state survives a write and a read, so the installed
+    /// cards can be drawn before the first inspection finishes.
+    #[test]
+    fn a_game_state_round_trips_through_the_library_cache() {
+        let m = GameMeta {
+            api: "DirectX 12".into(),
+            has_dlss: true,
+            engine_path: "Native".into(),
+            addon: true,
+            ready: true,
+            installed: true,
+            stale: vec!["MFG add-on".into()],
+            rt_likely: false,
+            unreal_likely: true,
+            unity_likely: false,
+            re_engine: false,
+            shaders_missing: false,
+            wrong_folder: None,
+            exe: PathBuf::from(r"C:\Games\A\game.exe"),
+        };
+        let mut cache = HashMap::new();
+        cache.insert(cache_key(Path::new(r"C:\Games\A")), m);
+        let text = serde_json::to_string(&cache).unwrap();
+        let back: HashMap<String, GameMeta> = serde_json::from_str(&text).unwrap();
+        let got = &back[r"c:\games\a"];
+        assert!(got.installed && got.has_dlss && got.unreal_likely);
+        assert_eq!(got.api, "DirectX 12");
+        assert_eq!(got.stale, ["MFG add-on"]);
+    }
+
     #[test]
     fn the_card_for_an_exe_is_found_by_its_folder() {
         let games = [
