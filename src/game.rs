@@ -534,7 +534,185 @@ fn d3d9_is_the_renderer(pe: &Path) -> bool {
     fns.is_empty() || fns.iter().any(|f| !f.starts_with("d3dperf_"))
 }
 
+/// The API from static imports, else from what the game itself logged the last
+/// time it ran (Unity's `Player.log`, Unreal's `Saved\\Logs`): Unity and Unreal
+/// load Direct3D at run time, so the exe shows nothing, and an unknown API was
+/// assumed to be DirectX 12, which Unity's own logs on one machine said it
+/// mostly was not (22 of 26 ran Direct3D 11).
 pub fn detect_api(exe: &Path) -> Api {
+    let a = detect_api_static(exe);
+    if a != Api::Unknown {
+        return a;
+    }
+    api_from_last_run(exe).unwrap_or(Api::Unknown)
+}
+
+/// Start of a log, as lossy text.
+fn read_log_head(p: &Path, max: u64) -> Option<String> {
+    let f = fs::File::open(p).ok()?;
+    let mut buf = Vec::new();
+    f.take(max).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+fn slash_lower(s: &str) -> String {
+    s.replace('\\', "/").to_ascii_lowercase()
+}
+
+fn api_from_last_run(exe: &Path) -> Option<Api> {
+    let dir = exe.parent()?;
+    let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    let unity = fs::read_dir(dir).ok().is_some_and(|rd| {
+        rd.flatten().any(|e| {
+            let n = e.file_name().to_string_lossy().to_ascii_lowercase();
+            n == "unityplayer.dll" || n.ends_with("_data")
+        })
+    });
+    if unity {
+        if let Some(a) = home
+            .as_ref()
+            .and_then(|h| unity_logged_api(dir, &h.join("AppData").join("LocalLow")))
+        {
+            return Some(a);
+        }
+    }
+    local.and_then(|l| unreal_logged_api(exe, &l))
+}
+
+/// `Direct3D 11` / `Direct3D 12` / `Vulkan` from the "Version:" line of Unity's
+/// graphics section ("Direct3D:\n    Version:  Direct3D 11.0 [level 11.1]").
+fn unity_api_in(log: &str) -> Option<Api> {
+    log.lines().find_map(|l| {
+        let v = l.trim().strip_prefix("Version:")?.trim();
+        if v.starts_with("Direct3D 12") {
+            Some(Api::Dx12)
+        } else if v.starts_with("Direct3D 11") {
+            Some(Api::Dx11)
+        } else if v.starts_with("Vulkan") {
+            Some(Api::Vulkan)
+        } else {
+            None
+        }
+    })
+}
+
+/// The Unity log of this install: `LocalLow\<company>\<product>\Player.log`,
+/// told from another install of the same game by the install path on its first
+/// line (`Mono path[0] = '<dir>/<name>_Data/Managed'`).
+fn unity_logged_api(exe_dir: &Path, locallow: &Path) -> Option<Api> {
+    let want = slash_lower(&exe_dir.to_string_lossy());
+    let want = want.trim_end_matches('/');
+    for company in fs::read_dir(locallow).ok()?.flatten() {
+        let Ok(products) = fs::read_dir(company.path()) else {
+            continue;
+        };
+        for product in products.flatten() {
+            for name in ["Player.log", "Player-prev.log"] {
+                let Some(txt) = read_log_head(&product.path().join(name), 128 * 1024) else {
+                    continue;
+                };
+                if slash_lower(&txt).contains(want) {
+                    if let Some(a) = unity_api_in(&txt) {
+                        return Some(a);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The RHI an Unreal log says the game ran on: the plug-in's "selected dynamic
+/// RHI" line, else the last RHI module loaded (a failed Direct3D 12 falls back
+/// to Direct3D 11 and loads it second), else the default it announced.
+fn unreal_api_in(log: &str) -> Option<Api> {
+    let map = |n: &str| {
+        if n.starts_with("D3D12") {
+            Some(Api::Dx12)
+        } else if n.starts_with("D3D11") {
+            Some(Api::Dx11)
+        } else if n.starts_with("Vulkan") {
+            Some(Api::Vulkan)
+        } else {
+            None
+        }
+    };
+    let last = |key: &str| {
+        log.lines()
+            .filter_map(|l| l.find(key).map(|i| l[i + key.len()..].trim()))
+            .filter_map(map)
+            .next_back()
+    };
+    last("GetSelectedDynamicRHIModuleName = ")
+        .or_else(|| last("Loading RHI module "))
+        .or_else(|| last("Using Default RHI: "))
+}
+
+/// The Unreal log of this install: `%LOCALAPPDATA%\<Project>\Saved\Logs\<Project>.log`,
+/// where the project is read from the exe (`<Project>-Win64-Shipping.exe`, or
+/// the folder above `Binaries`) and the log is confirmed by its "Base
+/// Directory" line being inside the exe's folder.
+fn unreal_logged_api(exe: &Path, local: &Path) -> Option<Api> {
+    let dir = exe.parent()?;
+    let stem = exe.file_stem()?.to_string_lossy().into_owned();
+    let mut names = vec![stem
+        .split("-Win64-")
+        .next()
+        .unwrap_or(&stem)
+        .split("-WinGDK-")
+        .next()
+        .unwrap_or(&stem)
+        .to_owned()];
+    // <Project>\Binaries\Win64\x.exe
+    if let Some(p) = dir
+        .ancestors()
+        .find(|a| {
+            a.file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("binaries"))
+        })
+        .and_then(|b| b.parent())
+        .and_then(|p| p.file_name())
+    {
+        names.push(p.to_string_lossy().into_owned());
+    }
+    let names: Vec<String> = names
+        .iter()
+        .map(|n| norm(n))
+        .filter(|n| n.len() >= 4)
+        .collect();
+    let want = slash_lower(&dir.to_string_lossy());
+    let want = want.trim_end_matches('/');
+    for e in fs::read_dir(local).ok()?.flatten() {
+        let folder = e.file_name().to_string_lossy().into_owned();
+        let f = norm(&folder);
+        // The project folder is named after the project; a store suffix on the
+        // exe ("CrimsonMoonNGSteam" for "CrimsonMoonNG") makes it a prefix.
+        if !names.iter().any(|n| {
+            *n == f || (f.len() >= 5 && n.starts_with(&f)) || (n.len() >= 5 && f.starts_with(n))
+        }) {
+            continue;
+        }
+        let logs = e.path().join("Saved").join("Logs");
+        for name in [format!("{folder}.log"), format!("{folder}-backup.log")] {
+            let Some(txt) = read_log_head(&logs.join(&name), 2 * 1024 * 1024) else {
+                continue;
+            };
+            let in_dir = txt
+                .lines()
+                .find(|l| l.contains("Base Directory:"))
+                .is_some_and(|l| slash_lower(l).contains(want));
+            if in_dir {
+                if let Some(a) = unreal_api_in(&txt) {
+                    return Some(a);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn detect_api_static(exe: &Path) -> Api {
     use classify_imports as classify;
     let mut api = classify(&pe_imports(exe));
     if api == Api::Dx9 && !d3d9_is_the_renderer(exe) {
@@ -1210,6 +1388,22 @@ pub fn game_pass_content_dir(d: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// What to tell the user about a Game Pass copy Windows has locked.
+fn game_pass_locked_message(content: &Path) -> String {
+    let native = if game_pass_ships_dlss(content) {
+        "The game itself ships DLSS (nvngx_dlss.dll is in its folder), so it supports DLSS natively; only this install cannot be modified."
+    } else {
+        "No nvngx_dlss.dll anywhere in its folder, so this game has no DLSS of its own either."
+    };
+    format!(
+        "Game Pass / Microsoft Store copy ({}): Windows protects this install — the \
+         executable is locked or the folder refuses writes — so DLSS 5 cannot be \
+         installed on this copy. Some Store games are installed unprotected and work; \
+         this one is not. The same game from Steam, Epic or GOG works. {native}",
+        content.display()
+    )
+}
+
 /// Whether a file can be created in `d`: the one test that separates a
 /// protected Store install from one that takes mods.
 fn dir_writable(d: &Path) -> bool {
@@ -1262,18 +1456,7 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     if let Some(content) = game_pass_content_dir(d) {
         let locked = fs::File::open(exe).is_err() || !dir_writable(d);
         if locked {
-            let native = if game_pass_ships_dlss(&content) {
-                "The game itself ships DLSS (nvngx_dlss.dll is in its folder), so it supports DLSS natively; only this install cannot be modified."
-            } else {
-                "No nvngx_dlss.dll anywhere in its folder, so this game has no DLSS of its own either."
-            };
-            bail!(
-                "Game Pass / Microsoft Store copy ({}): Windows protects this install — the \
-                 executable is locked or the folder refuses writes — so DLSS 5 cannot be \
-                 installed on this copy. Some Store games are installed unprotected and work; \
-                 this one is not. The same game from Steam, Epic or GOG works. {native}",
-                content.display()
-            );
+            bail!("{}", game_pass_locked_message(&content));
         }
     }
     let bitness = exe_bitness(exe)?;
@@ -1397,7 +1580,7 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
 }
 
 /// Helper/launcher executables that are never the game.
-const NOT_GAME: [&str; 17] = [
+const NOT_GAME: [&str; 18] = [
     "unitycrashhandler",
     "unrealcefsubprocess",
     "crashreportclient",
@@ -1417,6 +1600,11 @@ const NOT_GAME: [&str; 17] = [
     "install",
     // Rockstar's 64-bit PlayGTAIV.exe launcher outranked the 32-bit game (#94).
     "playgtaiv",
+    // Game Pass's launch stub. It is the one readable exe in a protected
+    // install, so it was picked as "the game", read as an unknown API, and let a
+    // protected copy past the lock check: the real exe under WinGDK is the one
+    // Windows locks.
+    "gamelaunchhelper",
 ];
 
 fn is_helper_name(stem_lower: &str) -> bool {
@@ -1590,7 +1778,14 @@ pub fn resolve_target(input: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
         let c = find_game_exes(input);
         return match c.first() {
             Some(first) => Ok((first.clone(), c)),
-            None => bail!("no 64-bit game executable found in {}", input.display()),
+            None => {
+                // A Game Pass folder whose real exe is locked has nothing
+                // readable but the launch stub, which is skipped: say why.
+                if let Some(content) = game_pass_content_dir(input) {
+                    bail!("{}", game_pass_locked_message(&content));
+                }
+                bail!("no 64-bit game executable found in {}", input.display())
+            }
         };
     }
     bail!("not found: {}", input.display())
@@ -2660,5 +2855,102 @@ mod tests {
         let exe2 = make_pe(&d2.join("game.exe"), PE_X64);
         make_pe_with_imports(&d2.join("helper.dll"), PE_X64, &["d3d10.dll"]);
         assert_eq!(detect_api(&exe2), Api::Unknown);
+    }
+
+    /// Unity says its API on the "Version:" line of its graphics section, and
+    /// Unreal in its RHI lines; only the log of this install counts (#api).
+    #[test]
+    fn the_games_own_log_names_an_api_the_exe_hides() {
+        let unity = "Mono path[0] = 'F:/Games/Fell/Fell_Data/Managed'\nDirect3D:\n    Version:  Direct3D 11.0 [level 11.1]\n";
+        assert_eq!(unity_api_in(unity), Some(Api::Dx11));
+        assert_eq!(
+            unity_api_in(
+                "Direct3D:\n    Version:         Direct3D 12 [level 12.1]\nVulkan PSO LRU decision"
+            ),
+            Some(Api::Dx12)
+        );
+        assert_eq!(unity_api_in("nothing"), None);
+        // A Direct3D 11 RHI that enumerates Direct3D 12 adapters for DLSS is not Direct3D 12.
+        let ue4 = "LogD3D11RHI: D3D11 adapters:\nLogDLSSNGXVulkanRHIPreInit: GetSelectedDynamicRHIModuleName = D3D11RHI\nLogD3D12RHI: Found D3D12 adapter 0: X";
+        assert_eq!(unreal_api_in(ue4), Some(Api::Dx11));
+        let ue5 = "LogRHI: Using Default RHI: D3D12\nLogRHI: Loading RHI module D3D12RHI\nLogRHI: Loading RHI module D3D11RHI\n";
+        assert_eq!(unreal_api_in(ue5), Some(Api::Dx11));
+        assert_eq!(
+            unreal_api_in("LogRHI: Using Default RHI: D3D12\n"),
+            Some(Api::Dx12)
+        );
+
+        let t = tempfile::tempdir().unwrap();
+        let game = t.path().join("Games").join("Fell");
+        fs::create_dir_all(game.join("Fell_Data")).unwrap();
+        let ll = t.path().join("LocalLow");
+        let prod = ll.join("Studio").join("Fell");
+        fs::create_dir_all(&prod).unwrap();
+        let other = ll.join("Studio").join("Other");
+        fs::create_dir_all(&other).unwrap();
+        let line = format!(
+            "Mono path[0] = '{}/Fell_Data/Managed'\nDirect3D:\n    Version:  Direct3D 11.0 [level 11.1]\n",
+            game.to_string_lossy().replace('\\', "/")
+        );
+        fs::write(prod.join("Player.log"), line).unwrap();
+        fs::write(
+            other.join("Player.log"),
+            "Mono path[0] = 'Z:/elsewhere/Other_Data/Managed'\nDirect3D:\n    Version:  Direct3D 12 [level 12.1]\n",
+        )
+        .unwrap();
+        assert_eq!(unity_logged_api(&game, &ll), Some(Api::Dx11));
+        assert_eq!(
+            unity_logged_api(&t.path().join("Games").join("Else"), &ll),
+            None
+        );
+
+        let bin = t
+            .path()
+            .join("Steam")
+            .join("Proj")
+            .join("Binaries")
+            .join("Win64");
+        fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("Proj-Win64-Shipping.exe");
+        let local = t.path().join("Local");
+        let logs = local.join("Proj").join("Saved").join("Logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(
+            logs.join("Proj.log"),
+            format!(
+                "LogInit: Base Directory: {}/\nLogRHI: Loading RHI module D3D12RHI\n",
+                bin.to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        assert_eq!(unreal_logged_api(&exe, &local), Some(Api::Dx12));
+        // The same project installed somewhere else is not this one.
+        let elsewhere = t
+            .path()
+            .join("Other")
+            .join("Proj")
+            .join("Binaries")
+            .join("Win64");
+        fs::create_dir_all(&elsewhere).unwrap();
+        assert_eq!(
+            unreal_logged_api(&elsewhere.join("Proj-Win64-Shipping.exe"), &local),
+            None
+        );
+    }
+
+    /// The Game Pass launch stub is never the game (it was the only readable exe
+    /// in a protected install), and a folder with nothing else says why.
+    #[test]
+    fn the_game_pass_launch_stub_is_not_a_game() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("Content");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("MicrosoftGame.config"), "<Game/>").unwrap();
+        make_pe(&d.join("gamelaunchhelper.exe"), PE_X64);
+        assert!(find_game_exes(&d).is_empty());
+        let err = resolve_target(&d).unwrap_err().to_string();
+        assert!(err.contains("Game Pass"), "{err}");
+        make_pe(&d.join("RealGame.exe"), PE_X64);
+        assert_eq!(find_game_exes(&d).len(), 1);
     }
 }
